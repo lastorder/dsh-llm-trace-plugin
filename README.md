@@ -17,7 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 Pin an exact version:
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.3
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.4
 ```
 
 Or install straight from git:
@@ -30,7 +30,7 @@ Pin a branch or tag with a fragment:
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.3
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.4
 ```
 
 For local development, link a checkout (a relative path is anchored to the directory you ran `dsh` from, not the profile directory):
@@ -59,13 +59,14 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 
 | Key | Default | Meaning |
 |---|---|---|
-| `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. |
-| `maxBodyChars` | `1000000` | Per-field character cap before a body is truncated. Sized to hold a whole agent request; a body cut mid-JSON cannot be parsed, so the viewer can only show it as text. |
+| `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. Bodies are held in memory too, so lower this if you routinely send very large requests. |
+| `maxBodyChars` | `8000000` | Per-field character cap before a body is truncated. Sized to hold a full 1M-token context (~4M characters) with 2x headroom; a body cut mid-JSON cannot be parsed, so the viewer can only show it as text. |
 | `routePrefix` | `/llm-wire-trace` | Prefix for the plugin's own HTTP routes. |
 | `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
-| `maxPersistedRecords` | `500` | Retained record files; the oldest are deleted past this. |
+| `maxPersistedRecords` | `300` | Retained record files; the oldest are deleted past this. |
 | `historyPageLimit` | `50` | Max record files read to build one list page from disk. |
+| `prettyBodyLimit` | `500000` | Above this size, the readability copy of a body is not written to disk. |
 
 ```yaml
 - insert:
@@ -115,7 +116,9 @@ Files are written indented, and each body is stored twice: the verbatim `bodyTex
 
 ### Disk footprint
 
-A real agent request carrying file contents and tool history runs to a few hundred thousand characters, and each body is stored twice (verbatim plus parsed). So a large record is roughly 1MB, and the 500-record default bounds the directory at a few hundred MB in the worst case — typically far less, since most calls are much smaller. Lower `maxPersistedRecords`, `maxBodyChars`, or both if that matters on your machine.
+Bodies are sized for a 1M-token context, so a record can be large. Two things keep the directory bounded: the 300-record cap, and `prettyBodyLimit` — past 500k characters the parsed readability copy is skipped, since no editor renders a multi-megabyte body usefully anyway and writing it would double the bytes for nothing. The viewer is unaffected either way: it re-parses from `bodyText`.
+
+In practice a typical request (a few hundred thousand characters) lands around 250MB across 300 records. The worst case — 300 consecutive full 1M-token requests — is roughly 1.3GB. Lower `maxPersistedRecords`, `maxBodyChars`, or both if that matters on your machine.
 
 ### The cost, stated plainly
 

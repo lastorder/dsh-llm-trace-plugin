@@ -133,12 +133,16 @@ const DEFAULT_MAX_RECORDS = 200
 /**
  * Per-field body cap.
  *
- * Sized to hold a whole real request rather than a fragment: an agent turn
- * carrying file contents and tool history runs well past 200k characters, and
- * a body cut mid-JSON is unparseable — which is what made the viewer fall
- * back to a bare `__raw__` blob instead of a browsable request.
+ * Sized against the context window rather than a round number: a 1M-token
+ * request is roughly 4M characters (~4 chars/token for English and code, less
+ * for CJK), so 8M holds a full 1M-token context with 2x headroom for
+ * mixed-language content and future growth.
+ *
+ * Getting this wrong is not a cosmetic problem. A body cut mid-JSON cannot be
+ * parsed at all, so the viewer loses the entire structure and can only show
+ * raw text — which is exactly what a 200k cap did to every real agent request.
  */
-const DEFAULT_MAX_BODY_CHARS = 1000000
+const DEFAULT_MAX_BODY_CHARS = 8000000
 
 /**
  * Clip a string to a character budget, reporting whether it was cut.
@@ -793,7 +797,7 @@ export const inject = ['webServer']
 
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ maxRecords?: number, maxBodyChars?: number, routePrefix?: string, persist?: boolean, traceDir?: string, maxPersistedRecords?: number, historyPageLimit?: number }} [config]
+ * @param {{ maxRecords?: number, maxBodyChars?: number, routePrefix?: string, persist?: boolean, traceDir?: string, maxPersistedRecords?: number, historyPageLimit?: number, prettyBodyLimit?: number }} [config]
  */
 export function apply(ctx, config) {
   const settings = config ?? {}
@@ -811,6 +815,7 @@ export function apply(ctx, config) {
     dir: settings.traceDir,
     maxRecords: settings.maxPersistedRecords,
     pageLimit: settings.historyPageLimit,
+    prettyBodyLimit: settings.prettyBodyLimit,
     onError: (error) => console.warn('llm-wire-trace: persistence error:', error.message),
   })
 

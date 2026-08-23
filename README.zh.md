@@ -17,7 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 指定精确版本：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.3
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.4
 ```
 
 或者直接从 git 安装：
@@ -30,7 +30,7 @@ dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plug
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.3
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.4
 ```
 
 本地开发时可以链接一份 checkout（相对路径会锚定到你运行 `dsh` 的目录，而不是 profile 目录）：
@@ -59,13 +59,14 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 
 | 配置项 | 默认值 | 含义 |
 |---|---|---|
-| `maxRecords` | `200` | 内存环形缓冲区大小；只在内存中保留最近的 N 条记录。 |
-| `maxBodyChars` | `1000000` | 单个字段被截断前的字符上限。该值足以容纳一个完整的 agent 请求；从中间被截断的 JSON 无法解析，查看器只能按原文显示。 |
+| `maxRecords` | `200` | 内存环形缓冲区大小；只在内存中保留最近的 N 条记录。body 同样驻留在内存中，如果你经常发送非常大的请求，可以调低该值。 |
+| `maxBodyChars` | `8000000` | 单个字段被截断前的字符上限。该值足以容纳完整的 1M token 上下文（约 400 万字符）并留有 2 倍余量；从中间被截断的 JSON 无法解析，查看器只能按原文显示。 |
 | `routePrefix` | `/llm-wire-trace` | 本插件自身 HTTP 路由的前缀。 |
 | `persist` | `true` | 将记录写入磁盘，使其在重启后依然存在。设为 `false` 则只保留在内存中。 |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | 记录文件的存放目录。 |
-| `maxPersistedRecords` | `500` | 磁盘上保留的记录数；超出后删除最旧的。 |
+| `maxPersistedRecords` | `300` | 磁盘上保留的记录数；超出后删除最旧的。 |
 | `historyPageLimit` | `50` | 从磁盘构建一页列表时最多读取的文件数。 |
+| `prettyBodyLimit` | `500000` | 超过该大小的 body 不再写入可读副本。 |
 
 ```yaml
 - insert:
@@ -115,7 +116,9 @@ $DSH_HOME/llm-wire-trace/records/<startedAt 毫秒>-<毫秒内序号>-<随机串
 
 ### 磁盘占用
 
-一个真实的 agent 请求会携带文件内容和工具历史，体积可达几十万字符，而每个 body 都会存两份（原文 + 解析后）。因此一条大记录约 1MB，在默认保留 500 条的上限下，最坏情况下该目录约为几百 MB —— 实际通常远小于此，因为多数调用要小得多。如果这对你的机器有影响，可以调低 `maxPersistedRecords`、`maxBodyChars`，或两者都调。
+body 的上限是按 1M token 上下文来定的，因此单条记录可能很大。有两件事在约束目录体积：300 条的保留上限，以及 `prettyBodyLimit` —— 超过 50 万字符后就不再写入解析后的可读副本，因为再大的 body 任何编辑器也无法好好显示，写它只会白白让字节数翻倍。这对查看器没有任何影响：它始终从 `bodyText` 重新解析。
+
+实际情况下，一个典型请求（几十万字符）在 300 条上限下约占 250MB。最坏情况 —— 连续 300 条完整的 1M token 请求 —— 约为 1.3GB。如果这对你的机器有影响，可以调低 `maxPersistedRecords`、`maxBodyChars`，或两者都调。
 
 ### 代价，明说
 

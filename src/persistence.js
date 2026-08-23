@@ -49,8 +49,23 @@ import {
   writeFile,
 } from 'node:fs/promises'
 
-/** Retained record files. Still well above the in-memory ring, which stays small. */
-export const DEFAULT_MAX_PERSISTED = 500
+/**
+ * Retained record files.
+ *
+ * Balanced against `maxBodyChars`: bodies large enough to matter make each
+ * record heavy, so the count is what keeps the directory bounded.
+ */
+export const DEFAULT_MAX_PERSISTED = 300
+
+/**
+ * Above this body size, the readability copy (`bodyJson`) is not written.
+ *
+ * That copy exists so a stored record is browsable in a text editor — but no
+ * editor renders a multi-megabyte body usefully anyway, so past this point it
+ * buys nothing while still doubling the bytes on disk. Small bodies, which are
+ * the ones actually worth opening by hand, keep it.
+ */
+export const DEFAULT_PRETTY_BODY_LIMIT = 500000
 
 /**
  * How many files a single listing page may read. Listing is one read per
@@ -157,6 +172,15 @@ function parseForDisplay(text) {
   }
 }
 
+/**
+ * Whether a body is too large for the readability copy to be worth its bytes.
+ * @param {string | null | undefined} text
+ * @param {number} limit
+ */
+function tooBigToPrettify(text, limit) {
+  return typeof text === 'string' && text.length > limit
+}
+
 /** Wrap a parsed body so an absent parse contributes no key at all. */
 function withBodyJson(value) {
   return value === null ? {} : { bodyJson: value }
@@ -187,9 +211,10 @@ function isEventStream(contentType) {
  * @param {object} record - a live in-memory record.
  * @returns {object} an owned, serializable copy.
  */
-export function toPersisted(record) {
+export function toPersisted(record, prettyLimit) {
   const request = record.request ?? {}
   const response = record.response ?? null
+  const limit = typeof prettyLimit === 'number' ? prettyLimit : DEFAULT_PRETTY_BODY_LIMIT
   return {
     v: 1,
     id: record.id,
@@ -214,7 +239,7 @@ export function toPersisted(record) {
       bodyTruncated: request.bodyTruncated === true,
       // Readability copy; see toPersisted's note. Omitted when it would not
       // help (unparseable, truncated mid-JSON, or not a container).
-      ...(request.bodyTruncated === true
+      ...(request.bodyTruncated === true || tooBigToPrettify(request.bodyText, limit)
         ? {}
         : withBodyJson(parseForDisplay(request.bodyText))),
     },
@@ -228,7 +253,9 @@ export function toPersisted(record) {
       bodyTruncated: response.bodyTruncated === true,
       // An SSE body is a sequence of frames, not one JSON value, so it is
       // never parsed as a whole — matching the capture-time rule exactly.
-      ...(response.bodyTruncated === true || isEventStream(response.contentType)
+      ...(response.bodyTruncated === true
+        || isEventStream(response.contentType)
+        || tooBigToPrettify(response.bodyText, limit)
         ? {}
         : withBodyJson(parseForDisplay(response.bodyText))),
     },
@@ -278,13 +305,14 @@ export function fromPersisted(stored, parseJson) {
  * convenience layered under a debugging tool, and must never be able to break
  * capture or the viewer. Failures are counted and surfaced via `stats()`.
  *
- * @param {{ dir?: string, maxRecords?: number, pageLimit?: number, onError?: (error: Error) => void }} [options]
+ * @param {{ dir?: string, maxRecords?: number, pageLimit?: number, prettyBodyLimit?: number, onError?: (error: Error) => void }} [options]
  */
 export function createRecordArchive(options) {
   const settings = options ?? {}
   const dir = resolveTraceDir(settings.dir)
   const maxRecords = settings.maxRecords ?? DEFAULT_MAX_PERSISTED
   const pageLimit = settings.pageLimit ?? DEFAULT_PAGE_LIMIT
+  const prettyLimit = settings.prettyBodyLimit ?? DEFAULT_PRETTY_BODY_LIMIT
   const onError = typeof settings.onError === 'function' ? settings.onError : () => {}
 
   let ready = null
@@ -400,7 +428,7 @@ export function createRecordArchive(options) {
       try {
         // Indented so the file is readable when opened in an editor. The
         // extra whitespace is cheap next to the bodies themselves.
-        await writeFile(temp, JSON.stringify(toPersisted(record), null, 2), 'utf8')
+        await writeFile(temp, JSON.stringify(toPersisted(record, prettyLimit), null, 2), 'utf8')
         await rename(temp, target)
         writes += 1
         sinceSweep += 1
