@@ -17,7 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 指定精确版本：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.2
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.3
 ```
 
 或者直接从 git 安装：
@@ -30,7 +30,7 @@ dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plug
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.2
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.3
 ```
 
 本地开发时可以链接一份 checkout（相对路径会锚定到你运行 `dsh` 的目录，而不是 profile 目录）：
@@ -110,6 +110,8 @@ $DSH_HOME/llm-wire-trace/records/<startedAt 毫秒>-<毫秒内序号>-<随机串
 文件以缩进格式写入，并且每个 body 都存两份：线路上逐字捕获的 `bodyText`，以及紧挨着它的、已解析的 `bodyJson`。只有 `bodyText` 是不够的 —— 它本身是一个 JSON **字符串**，落到磁盘上就是一行超长的转义文本（`\"role\":\"user\"`），任何编辑器都没法好好显示；有了解析副本，`messages`、工具定义和响应对象就能以真正的嵌套 JSON 展开。
 
 `bodyJson` 只是派生出来的便利副本，绝不是事实来源：读取时永远从 `bodyText` 重新解析，因此磁盘上一份过期的、甚至被手工改过的解析结果，都不可能影响查看器显示的内容。在它帮不上忙的情况下会被省略 —— body 被截断、值不是对象或数组，以及 SSE 响应（它是帧序列，不是单个 JSON 值，这与捕获时的规则完全一致）。代价是 body 的字节数大约翻倍。
+
+> **从 0.1.2 升级。** 该版本的 body 上限是 20 万字符，而真实的 agent 请求会超过这个数，因此它存下来的 body 是从 JSON 中间截断的 —— 查看器只能把这类 body 按原文显示。已经以这种方式写入的记录仍然是截断的（缺失的那部分从未被捕获）；升级之后发生的调用会被完整保存。
 
 ### 磁盘占用
 

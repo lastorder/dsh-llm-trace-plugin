@@ -17,7 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 Pin an exact version:
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.2
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.3
 ```
 
 Or install straight from git:
@@ -30,7 +30,7 @@ Pin a branch or tag with a fragment:
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.2
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.3
 ```
 
 For local development, link a checkout (a relative path is anchored to the directory you ran `dsh` from, not the profile directory):
@@ -110,6 +110,8 @@ The filename carries the timestamp so ordering and retention are pure **name** o
 Files are written indented, and each body is stored twice: the verbatim `bodyText` from the wire, plus a parsed `bodyJson` beside it. `bodyText` alone is a JSON *string*, so on disk it is one long escaped line (`\"role\":\"user\"`) that no editor renders usefully — the parsed copy lets `messages`, tool definitions, and the response object expand as real nested JSON.
 
 `bodyJson` is a derived convenience copy, never the source of truth: reading always re-derives it from `bodyText`, so a stale or hand-edited parse on disk cannot change what the viewer shows. It is omitted where it would add nothing — a truncated body, a non-container value, or an SSE response (a frame sequence, never one JSON value, matching the capture-time rule). The cost is roughly double the body bytes.
+
+> **Upgrading from 0.1.2.** That release capped bodies at 200k characters, which a real agent request exceeds, so it stored them cut mid-JSON — the viewer could only show such a body as raw text. Records already written that way stay truncated (the missing bytes were never captured); calls made after upgrading are stored whole.
 
 ### Disk footprint
 
