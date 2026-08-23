@@ -8,7 +8,19 @@
 
 ## 安装
 
-直接从 git 安装：
+直接从 npm 安装：
+
+```sh
+dsh plugin --profile web add dsh-llm-trace-plugin
+```
+
+指定精确版本：
+
+```sh
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.1
+```
+
+或者直接从 git 安装：
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git
@@ -18,7 +30,7 @@ dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plug
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.0
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.1
 ```
 
 本地开发时可以链接一份 checkout（相对路径会锚定到你运行 `dsh` 的目录，而不是 profile 目录）：
