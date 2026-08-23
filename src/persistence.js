@@ -49,15 +49,15 @@ import {
   writeFile,
 } from 'node:fs/promises'
 
-/** Retained record files. Far above the in-memory ring, which stays small. */
-export const DEFAULT_MAX_PERSISTED = 5000
+/** Retained record files. Still well above the in-memory ring, which stays small. */
+export const DEFAULT_MAX_PERSISTED = 500
 
 /**
  * How many files a single listing page may read. Listing is one read per
  * shown record, so this bounds the cost of any one request regardless of how
  * many records are retained.
  */
-export const DEFAULT_PAGE_LIMIT = 200
+export const DEFAULT_PAGE_LIMIT = 50
 
 /**
  * Only files this module wrote are ever read or deleted.
@@ -142,13 +142,47 @@ function idFromName(name) {
 }
 
 /**
+ * Best-effort parse used only to make a stored body readable. Never throws.
+ * @param {string | null | undefined} text - candidate JSON text.
+ */
+function parseForDisplay(text) {
+  if (typeof text !== 'string' || text.length === 0) return null
+  try {
+    const value = JSON.parse(text)
+    // Only a container is worth expanding; a bare string or number would just
+    // duplicate `bodyText` with no readability gain.
+    return value !== null && typeof value === 'object' ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** Wrap a parsed body so an absent parse contributes no key at all. */
+function withBodyJson(value) {
+  return value === null ? {} : { bodyJson: value }
+}
+
+/** @param {string | null | undefined} contentType */
+function isEventStream(contentType) {
+  return typeof contentType === 'string' && contentType.includes('event-stream')
+}
+
+/**
  * Strip a record down to what is worth persisting, and — critically — to
  * plain owned data.
  *
- * `bodyJson` is dropped deliberately: it is a redundant parse of `bodyText`,
- * it can be huge, and it is the one field liable to hold something that does
- * not survive a JSON round-trip. It is re-derived on read from the text,
- * which is the authoritative form.
+ * `bodyText` is the authoritative form: the literal bytes on the wire, which
+ * is the whole point of this plugin. But it is a JSON *string*, so on disk it
+ * is one long escaped line that no editor can render usefully. So a parsed
+ * `bodyJson` is written ALONGSIDE it, purely so the file is readable — the
+ * request's `messages`, tools, and the response object expand as real nested
+ * JSON instead of `\"role\":\"user\"` noise.
+ *
+ * It is a derived convenience copy, never the source of truth: reading
+ * re-derives `bodyJson` from `bodyText` regardless, so a stored parse that is
+ * absent, stale, or malformed cannot corrupt what the viewer shows. The cost
+ * is roughly double the body bytes on disk, which is why `bodyJson` is
+ * omitted whenever it would add nothing.
  *
  * @param {object} record - a live in-memory record.
  * @returns {object} an owned, serializable copy.
@@ -178,6 +212,11 @@ export function toPersisted(record) {
       bodyText: request.bodyText ?? null,
       bodyChars: request.bodyChars ?? 0,
       bodyTruncated: request.bodyTruncated === true,
+      // Readability copy; see toPersisted's note. Omitted when it would not
+      // help (unparseable, truncated mid-JSON, or not a container).
+      ...(request.bodyTruncated === true
+        ? {}
+        : withBodyJson(parseForDisplay(request.bodyText))),
     },
     response: response === null ? null : {
       status: response.status ?? null,
@@ -187,6 +226,11 @@ export function toPersisted(record) {
       bodyText: response.bodyText ?? null,
       bodyChars: response.bodyChars ?? 0,
       bodyTruncated: response.bodyTruncated === true,
+      // An SSE body is a sequence of frames, not one JSON value, so it is
+      // never parsed as a whole — matching the capture-time rule exactly.
+      ...(response.bodyTruncated === true || isEventStream(response.contentType)
+        ? {}
+        : withBodyJson(parseForDisplay(response.bodyText))),
     },
     error: record.error ?? null,
     recorderError: record.recorderError ?? null,
@@ -210,6 +254,10 @@ export function fromPersisted(stored, parseJson) {
     persisted: true,
     request: {
       ...stored.request,
+      // Always re-derived from `bodyText`, which OVERWRITES any `bodyJson`
+      // spread in from the file. That copy exists only to make the file
+      // readable; the wire text stays the single source of truth, so a stale
+      // or hand-edited parse on disk can never change what the viewer shows.
       bodyJson: parseJson(stored.request ? stored.request.bodyText : null),
     },
     response: response === null ? null : {
@@ -350,7 +398,9 @@ export function createRecordArchive(options) {
       const target = join(dir, name)
       const temp = `${target}.${randomBytes(4).toString('hex')}.tmp`
       try {
-        await writeFile(temp, JSON.stringify(toPersisted(record)), 'utf8')
+        // Indented so the file is readable when opened in an editor. The
+        // extra whitespace is cheap next to the bodies themselves.
+        await writeFile(temp, JSON.stringify(toPersisted(record), null, 2), 'utf8')
         await rename(temp, target)
         writes += 1
         sinceSweep += 1

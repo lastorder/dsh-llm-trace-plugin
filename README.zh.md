@@ -64,8 +64,8 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 | `routePrefix` | `/llm-wire-trace` | 本插件自身 HTTP 路由的前缀。 |
 | `persist` | `true` | 将记录写入磁盘，使其在重启后依然存在。设为 `false` 则只保留在内存中。 |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | 记录文件的存放目录。 |
-| `maxPersistedRecords` | `5000` | 磁盘上保留的记录数；超出后删除最旧的。 |
-| `historyPageLimit` | `200` | 构建一页历史记录时最多读取的文件数。 |
+| `maxPersistedRecords` | `500` | 磁盘上保留的记录数；超出后删除最旧的。 |
+| `historyPageLimit` | `50` | 从磁盘构建一页列表时最多读取的文件数。 |
 
 ```yaml
 - insert:
@@ -74,7 +74,7 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
       config:
         maxRecords: 500
         maxBodyChars: 500000
-        maxPersistedRecords: 20000
+        maxPersistedRecords: 5000
 ```
 
 ## 持久化
@@ -104,6 +104,12 @@ $DSH_HOME/llm-wire-trace/records/<startedAt 毫秒>-<毫秒内序号>-<随机串
 > 记录 id 同时用作文件名，因此它是一个可排序的字符串，而不再是原来的进程内计数器（`w1`、`w2`……）。计数器会让两个 harness 进程撞上同一个文件名并静默覆盖彼此的记录 —— 那等于把这套布局本来要消除的问题，以数据丢失的形式又请了回来。
 >
 > 只用毫秒作为排序键并不够：一次突发可能在同一毫秒内发起多次调用，此时纯随机后缀会让它们的顺序变得**完全随意** —— 恰恰在调用最密集的时候丢掉真实顺序（这个问题在测试中被实际观察到并已修复）。毫秒内序号恢复了同一毫秒内的顺序，随机尾巴则保证跨进程的唯一性 —— 这是单靠计数器做不到的。在该序号出现之前写入的文件仍然可以被读取，因此升级不会丢掉你已有的历史记录。
+
+### 磁盘上是可读的
+
+文件以缩进格式写入，并且每个 body 都存两份：线路上逐字捕获的 `bodyText`，以及紧挨着它的、已解析的 `bodyJson`。只有 `bodyText` 是不够的 —— 它本身是一个 JSON **字符串**，落到磁盘上就是一行超长的转义文本（`\"role\":\"user\"`），任何编辑器都没法好好显示；有了解析副本，`messages`、工具定义和响应对象就能以真正的嵌套 JSON 展开。
+
+`bodyJson` 只是派生出来的便利副本，绝不是事实来源：读取时永远从 `bodyText` 重新解析，因此磁盘上一份过期的、甚至被手工改过的解析结果，都不可能影响查看器显示的内容。在它帮不上忙的情况下会被省略 —— body 被截断、值不是对象或数组，以及 SSE 响应（它是帧序列，不是单个 JSON 值，这与捕获时的规则完全一致）。代价是 body 的字节数大约翻倍。
 
 ### 代价，明说
 

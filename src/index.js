@@ -485,7 +485,15 @@ export function createWireTraceStore(options) {
       for (const record of memory.page) merged.set(record.id, record)
 
       // Chronological, oldest first — the order summarizePage expects.
-      const ordered = [...merged.values()].sort((a, b) => a.startedAt - b.startedAt)
+      // Sort by id, not by `startedAt` alone: many calls can start within one
+      // millisecond, and a millisecond-only comparison leaves their order
+      // arbitrary — which showed up as the newest row simply being wrong.
+      // The id is `<ms>-<ordinal>-<random>`, built precisely to sort
+      // chronologically, so it settles ties the timestamp cannot.
+      const ordered = [...merged.values()].sort((a, b) => {
+        if (a.startedAt !== b.startedAt) return a.startedAt - b.startedAt
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+      })
       const cap = capacity(settings.limit)
       const windowed = ordered.slice(Math.max(0, ordered.length - cap))
 

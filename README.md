@@ -64,8 +64,8 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 | `routePrefix` | `/llm-wire-trace` | Prefix for the plugin's own HTTP routes. |
 | `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
-| `maxPersistedRecords` | `5000` | Retained record files; the oldest are deleted past this. |
-| `historyPageLimit` | `200` | Max record files read to build one history page. |
+| `maxPersistedRecords` | `500` | Retained record files; the oldest are deleted past this. |
+| `historyPageLimit` | `50` | Max record files read to build one list page from disk. |
 
 ```yaml
 - insert:
@@ -74,7 +74,7 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
       config:
         maxRecords: 500
         maxBodyChars: 500000
-        maxPersistedRecords: 20000
+        maxPersistedRecords: 5000
 ```
 
 ## Persistence
@@ -104,6 +104,12 @@ The filename carries the timestamp so ordering and retention are pure **name** o
 > The record id doubles as the filename, so it is a sortable string rather than the old per-process counter (`w1`, `w2`, …). A counter would make two harness processes collide on the same filename and silently overwrite each other's records — reintroducing as data loss the very problem this layout removes.
 >
 > The millisecond alone is not a sufficient key: a burst can start many calls inside one millisecond, and a purely random suffix would then order them **arbitrarily** — losing real ordering exactly when calls are densest (observed, and fixed, during testing). The intra-ms ordinal restores order within a millisecond; the random tail keeps names unique across processes, which a counter alone cannot do. Files written before the ordinal existed are still read, so upgrading keeps your existing history.
+
+### Readable on disk
+
+Files are written indented, and each body is stored twice: the verbatim `bodyText` from the wire, plus a parsed `bodyJson` beside it. `bodyText` alone is a JSON *string*, so on disk it is one long escaped line (`\"role\":\"user\"`) that no editor renders usefully — the parsed copy lets `messages`, tool definitions, and the response object expand as real nested JSON.
+
+`bodyJson` is a derived convenience copy, never the source of truth: reading always re-derives it from `bodyText`, so a stale or hand-edited parse on disk cannot change what the viewer shows. It is omitted where it would add nothing — a truncated body, a non-container value, or an SSE response (a frame sequence, never one JSON value, matching the capture-time rule). The cost is roughly double the body bytes.
 
 ### The cost, stated plainly
 
