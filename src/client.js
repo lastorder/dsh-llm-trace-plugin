@@ -643,6 +643,15 @@ window.__ModuleLoader__.load({
         const [autoFellBack, setAutoFellBack] = React.useState(false)
         const fallbackUsed = React.useRef(false)
 
+        // Durable history. The default view stays the live in-memory ring —
+        // the thing you watch while working — and history is an explicit
+        // second mode that reads records back off disk, including ones from
+        // before the last restart. `persisted` reports whether the host is
+        // persisting at all, so the toggle can explain itself when it is off.
+        const [history, setHistory] = React.useState(false)
+        const [persisted, setPersisted] = React.useState(true)
+        const [truncated, setTruncated] = React.useState(false)
+
         // A missing session id (shouldn't happen in a session-scoped slot)
         // degrades to the unfiltered list rather than filtering against
         // nothing and showing a permanently empty tab.
@@ -650,16 +659,23 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           let alive = true
-          apiGet('list', { limit: 300, sessionId: filtering ? currentSessionId : undefined }).then(
+          apiGet(history ? 'history' : 'list', {
+            limit: 300,
+            sessionId: filtering ? currentSessionId : undefined,
+          }).then(
             (result) => {
               if (!alive) return
               const nextItems = (result && result.items) || []
+              if (history) {
+                setPersisted(result ? result.persistence !== false : true)
+                setTruncated(result ? result.truncated === true : false)
+              }
               const nextMatched = result && typeof result.matched === 'number' ? result.matched : 0
               const nextUnattributed = result && typeof result.unattributed === 'number' ? result.unattributed : 0
               // Nothing of our own, but traffic exists that simply never
               // carried a session id: filtering is useless here, so show
               // everything instead of an empty tab.
-              if (filtering && !fallbackUsed.current && nextMatched === 0 && nextUnattributed > 0) {
+              if (!history && filtering && !fallbackUsed.current && nextMatched === 0 && nextUnattributed > 0) {
                 fallbackUsed.current = true
                 setAutoFellBack(true)
                 setOnlySession(false)
@@ -676,12 +692,15 @@ window.__ModuleLoader__.load({
             (reason) => { if (alive) setError(String((reason && reason.message) || reason)) },
           )
           return () => { alive = false }
-        }, [tick, filtering, currentSessionId])
+        }, [tick, filtering, currentSessionId, history])
 
         React.useEffect(() => {
-          if (!auto) return undefined
+          // History is a static, disk-backed view: polling it would re-read a
+          // page of files every couple of seconds to redraw the same rows.
+          // Only the live ring is worth refreshing on a timer.
+          if (!auto || history) return undefined
           return ctx.interval(() => { setTick((n) => n + 1) }, 2000)
-        }, [auto])
+        }, [auto, history])
 
         const selectedStatus = React.useMemo(() => {
           const found = items.find((item) => item.id === selected)
@@ -916,8 +935,22 @@ window.__ModuleLoader__.load({
               }, filtering ? '当前 Session' : '全部 Session'),
               h('button', {
                 className: 'wt-btn',
+                key: 'history',
+                'data-on': history ? '1' : '0',
+                title: history
+                  ? '当前显示磁盘上的历史记录（含重启前）。点击回到内存中的实时记录。'
+                  : '当前显示内存中的实时记录，重启后会清空。点击查看磁盘上的历史记录（含重启前）。',
+                onClick: () => {
+                  setSelected(null)
+                  setHistory(!history)
+                },
+              }, history ? '历史记录' : '实时'),
+              h('button', {
+                className: 'wt-btn',
                 key: 'clear',
-                title: '清空全部记录（不区分 session）。',
+                title: history
+                  ? '清空全部记录，包括磁盘上的历史记录。'
+                  : '清空全部记录（不区分 session），磁盘上的历史记录也会一并删除。',
                 onClick: () => {
                   apiPost('clear', {}).then(() => {
                     setSelected(null)
@@ -928,7 +961,9 @@ window.__ModuleLoader__.load({
               h('span', {
                 className: 'wt-meta',
                 key: 'meta',
-                title: filtering ? '本 session 命中数 / 全部记录数' : '已加载 / 全部记录数',
+                title: history
+                  ? (filtering ? '本 session 命中数 / 磁盘上的记录总数' : '已加载 / 磁盘上的记录总数')
+                  : (filtering ? '本 session 命中数 / 全部记录数' : '已加载 / 全部记录数'),
               }, (filtering ? matched : items.length) + ' / ' + total
                 + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
                 + (auxiliary > 0 ? ' · ' + auxiliary + ' 辅助' : '')),
@@ -936,9 +971,15 @@ window.__ModuleLoader__.load({
             error === null ? null : h('div', { className: 'wt-err', key: 'err' }, error),
             h('div', { className: 'wt-list', key: 'list' },
               items.length === 0
-                ? h('div', { className: 'wt-empty' }, filtering
-                  ? '本 session 尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。'
-                  : '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。')
+                ? h('div', { className: 'wt-empty' }, history
+                  ? (persisted
+                    ? (filtering
+                      ? '磁盘上没有本 session 的历史记录。点击「全部 Session」可以查看其他 session 的历史。'
+                      : '磁盘上还没有历史记录。')
+                    : '持久化已关闭（persist: false），所以没有历史记录。记录只保留在内存中，重启后会丢失。')
+                  : (filtering
+                    ? '本 session 尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。'
+                    : '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。'))
                 : [
                   ...groupedRows,
                   // The provider never stamped a session id, so the default
@@ -952,6 +993,12 @@ window.__ModuleLoader__.load({
                   filtering && unattributed > 0
                     ? h('div', { className: 'wt-jnotice', key: '#unattributed' },
                       '另有 ' + fmtCount(unattributed) + ' 条无归属记录（没有经过 ctx.llm 的请求），点击「全部 Session」查看。')
+                    : null,
+                  // Say so rather than implying the page showed everything:
+                  // a filtered history read stops at a bounded scan budget.
+                  history && truncated
+                    ? h('div', { className: 'wt-jnotice', key: '#truncated' },
+                      '磁盘上还有更早的记录未被扫描（单次查询有读取上限）。')
                     : null,
                 ].filter(Boolean)),
           ].filter(Boolean)),

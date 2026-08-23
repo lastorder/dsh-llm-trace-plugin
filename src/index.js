@@ -48,6 +48,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { buildRecordName, createRecordArchive } from './persistence.js'
 
 /** Marks every provider request via dsh-llm's attributionHeaders(); see APP_IDENTITY.product. */
 const USER_AGENT_PREFIX = 'deepseek-harness/'
@@ -231,12 +232,34 @@ function tryParseJson(text) {
 export function createWireTraceStore(options) {
   const maxRecords = (options && options.maxRecords) || DEFAULT_MAX_RECORDS
   const maxBodyChars = (options && options.maxBodyChars) || DEFAULT_MAX_BODY_CHARS
+  // Optional durable half. When absent the store behaves exactly as before:
+  // an in-memory ring that dies with the process.
+  const archive = (options && options.archive) || null
   const records = []
-  let seq = 0
 
   function push(record) {
     records.push(record)
     while (records.length > maxRecords) records.shift()
+  }
+
+  /**
+   * Stamp a record's end time and hand it to the archive.
+   *
+   * Persistence happens ONCE, here, at the record's final state — never at
+   * push time. A record is mutated after it is pushed (the response body is
+   * mirrored asynchronously), so writing on push would persist a record whose
+   * body is still empty, and the file-per-record layout deliberately has no
+   * rewrite step that could later fix it up.
+   *
+   * Never awaited by the caller: capturing must not add latency to a model
+   * call, and a failing disk must not fail a request.
+   *
+   * @param {object} record - the record to close out.
+   */
+  function finalize(record) {
+    record.endedAt = Date.now()
+    record.durationMs = record.endedAt - record.startedAt
+    if (archive !== null) void archive.save(record)
   }
 
   function summary(record) {
@@ -274,7 +297,6 @@ export function createWireTraceStore(options) {
       const ua = outgoingUserAgent(input, init)
       if (!ua.startsWith(USER_AGENT_PREFIX)) return real(input, init)
 
-      seq += 1
       const info = describeRequest(input, init)
       const bodyClip = clip(info.bodyText || '', maxBodyChars)
       // Harness identity of the call this fetch belongs to. Present for every
@@ -282,9 +304,14 @@ export function createWireTraceStore(options) {
       // honestly recorded as unattributed rather than guessed at.
       const call = callContext.getStore() ?? null
       const headerSessionId = info.headers[SESSION_HEADER] ?? null
+      const startedAt = Date.now()
       const record = {
-        id: `w${seq}`,
-        startedAt: Date.now(),
+        // Globally unique and chronologically sortable, because it doubles as
+        // the storage file name. A per-process counter (`w1`, `w2`, ...) would
+        // make two harness processes collide on the same file and silently
+        // overwrite each other's records.
+        id: buildRecordName(startedAt).slice(0, -'.json'.length),
+        startedAt,
         endedAt: null,
         durationMs: null,
         status: 'streaming',
@@ -325,8 +352,7 @@ export function createWireTraceStore(options) {
       } catch (error) {
         record.status = 'transport-error'
         record.error = { name: String(error && error.name), message: String((error && error.message) || error) }
-        record.endedAt = Date.now()
-        record.durationMs = record.endedAt - record.startedAt
+        finalize(record)
         throw error
       }
 
@@ -349,8 +375,7 @@ export function createWireTraceStore(options) {
         mirror = response.clone()
       } catch (error) {
         record.recorderError = 'clone failed: ' + String((error && error.message) || error)
-        record.endedAt = Date.now()
-        record.durationMs = record.endedAt - record.startedAt
+        finalize(record)
         return response
       }
 
@@ -371,8 +396,7 @@ export function createWireTraceStore(options) {
           record.recorderError = 'mirror read failed: ' + String((error && error.message) || error)
           record.status = response.ok ? 'ok' : 'http-error'
         } finally {
-          record.endedAt = Date.now()
-          record.durationMs = record.endedAt - record.startedAt
+          finalize(record)
         }
       })()
 
@@ -436,16 +460,121 @@ export function createWireTraceStore(options) {
 
       return { items, total: records.length, matched: matching.length, unattributed, turns, auxiliary }
     },
-    get(id) {
-      for (let i = records.length - 1; i >= 0; i -= 1) if (records[i].id === id) return records[i]
-      return null
+    /**
+     * List record summaries from DISK, newest first — the durable history
+     * that outlives this process.
+     *
+     * Kept separate from `list()` rather than folded into it: the in-memory
+     * ring is small, hot, and synchronous, while history is bounded by a
+     * per-page read budget and is necessarily async. Merging them would make
+     * the common path pay for the rare one, and would double-count the newest
+     * records, which live in both places.
+     *
+     * @param {{ limit?: number, sessionId?: string }} [options]
+     */
+    async history(options) {
+      if (archive === null) return { items: [], total: 0, matched: 0, unattributed: 0, turns: [], auxiliary: 0, persistence: false }
+      const settings = options ?? {}
+      const page = await archive.list({
+        limit: settings.limit,
+        sessionId: settings.sessionId,
+        parseJson: tryParseJson,
+      })
+      // `page.records` is already newest-first and already filtered.
+      const grouped = summarizePage(page.records.slice().reverse(), summary)
+      return {
+        ...grouped,
+        total: page.total,
+        matched: page.records.length,
+        persistence: true,
+        truncated: page.truncated,
+        scanned: page.scanned,
+      }
     },
-    clear() {
+
+    /**
+     * Repopulate the in-memory ring from disk at startup, so a restart shows
+     * the recent past instead of an empty list. Records already in memory win:
+     * this only ever fills the space ahead of them.
+     */
+    async restore() {
+      if (archive === null) return { restored: 0 }
+      const loaded = await archive.restore({ limit: maxRecords, parseJson: tryParseJson })
+      const known = new Set(records.map((record) => record.id))
+      const fresh = loaded.filter((record) => !known.has(record.id))
+      // Oldest first, and never more than the ring can hold.
+      const room = Math.max(0, maxRecords - records.length)
+      const admitted = fresh.slice(Math.max(0, fresh.length - room))
+      records.unshift(...admitted)
+      return { restored: admitted.length }
+    },
+
+    async stats() {
+      if (archive === null) return { persistence: false, memory: records.length }
+      return { persistence: true, memory: records.length, ...(await archive.stats()) }
+    },
+
+    /**
+     * Look up one record: memory first, then disk. The disk fallback is what
+     * makes a restored row's detail view, and its curl command, keep working
+     * after the record has aged out of the ring.
+     */
+    async get(id) {
+      for (let i = records.length - 1; i >= 0; i -= 1) if (records[i].id === id) return records[i]
+      if (archive === null) return null
+      return archive.get(id, tryParseJson)
+    },
+
+    /**
+     * Clear memory, and by default the persisted copies too — otherwise
+     * "clear" would visibly un-clear itself on the next restart.
+     * @param {{ keepPersisted?: boolean }} [options]
+     */
+    async clear(options) {
       const removed = records.length
       records.length = 0
-      return { removed }
+      let removedFiles = 0
+      if (archive !== null && !(options && options.keepPersisted)) {
+        removedFiles = await archive.clear()
+      }
+      return { removed, removedFiles }
     },
   }
+}
+
+/**
+ * Group an oldest-first page of records into the viewer's list payload.
+ *
+ * Shared by the in-memory and on-disk list paths so both label turns, count
+ * auxiliary calls, and report unattributed records by exactly the same rules.
+ *
+ * @param {object[]} page - records, oldest first.
+ * @param {(record: object) => object} summarize - record-to-summary mapper.
+ */
+function summarizePage(page, summarize) {
+  const items = []
+  for (let i = page.length - 1; i >= 0; i -= 1) items.push(summarize(page[i]))
+
+  let unattributed = 0
+  for (const record of page) if (record.sessionId === null) unattributed += 1
+
+  const turnMap = new Map()
+  let auxiliary = 0
+  for (const record of page) {
+    if (record.turn === null) {
+      if (record.purpose !== null) auxiliary += 1
+      continue
+    }
+    const entry = turnMap.get(record.turn) ?? { turn: record.turn, calls: 0, steps: new Set() }
+    entry.calls += 1
+    if (record.step !== null) entry.steps.add(record.step)
+    turnMap.set(record.turn, entry)
+  }
+  const turns = [...turnMap.values()]
+    .sort((a, b) => b.turn - a.turn)
+    .map((entry) => ({ turn: entry.turn, calls: entry.calls, steps: entry.steps.size }))
+
+  return { items, unattributed, turns, auxiliary }
 }
 
 /** Module-level guard so re-activating the plugin cannot double-wrap an already-patched fetch. */
@@ -648,12 +777,41 @@ export const inject = ['webServer']
 
 /**
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ maxRecords?: number, maxBodyChars?: number, routePrefix?: string }} [config]
+ * @param {{ maxRecords?: number, maxBodyChars?: number, routePrefix?: string, persist?: boolean, traceDir?: string, maxPersistedRecords?: number, historyPageLimit?: number }} [config]
  */
 export function apply(ctx, config) {
   const settings = config ?? {}
   const routePrefix = typeof settings.routePrefix === 'string' ? settings.routePrefix : '/llm-wire-trace'
-  const store = createWireTraceStore(settings)
+
+  // Durable half. On by default — surviving a restart is the entire point —
+  // but fully switchable off with `persist: false`, which returns the plugin
+  // to a pure in-memory ring that writes nothing to disk.
+  //
+  // NOTE: request and response bodies are stored VERBATIM, so prompts, code,
+  // and any file contents in context land in plaintext files under this
+  // directory. That is inherent to persisting full bodies; `persist: false`
+  // or a shorter `maxPersistedRecords` are the levers.
+  const archive = settings.persist === false ? null : createRecordArchive({
+    dir: settings.traceDir,
+    maxRecords: settings.maxPersistedRecords,
+    pageLimit: settings.historyPageLimit,
+    onError: (error) => console.warn('llm-wire-trace: persistence error:', error.message),
+  })
+
+  const store = createWireTraceStore({ ...settings, archive })
+
+  // Repopulate the in-memory ring from disk so a restart opens on the recent
+  // past rather than an empty list. Not awaited: capture must start
+  // immediately, and a slow or failing disk must not delay the fetch patch.
+  if (archive !== null) {
+    void store.restore()
+      .then((result) => {
+        if (result.restored > 0) {
+          console.log(`llm-wire-trace: restored ${result.restored} record(s) from ${archive.dir}`)
+        }
+      })
+      .catch((error) => console.warn('llm-wire-trace: restore failed:', error.message))
+  }
 
   ctx.effect(() => installFetchPatch(store), 'llm-wire-trace: fetch patch')
 
@@ -757,12 +915,25 @@ export function apply(ctx, config) {
             }))
             return
           }
+          if (method === 'history') {
+            const limitRaw = Number(url.searchParams.get('limit'))
+            const sessionId = url.searchParams.get('sessionId') ?? ''
+            sendJson(res, 200, await store.history({
+              limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+              sessionId,
+            }))
+            return
+          }
+          if (method === 'stats') {
+            sendJson(res, 200, await store.stats())
+            return
+          }
           if (method === 'get') {
-            sendJson(res, 200, store.get(url.searchParams.get('id') ?? ''))
+            sendJson(res, 200, await store.get(url.searchParams.get('id') ?? ''))
             return
           }
           if (method === 'curl') {
-            const record = store.get(url.searchParams.get('id') ?? '')
+            const record = await store.get(url.searchParams.get('id') ?? '')
             if (record === null) {
               sendJson(res, 404, { error: 'no such record' })
               return
@@ -779,8 +950,8 @@ export function apply(ctx, config) {
             return
           }
           if (method === 'clear') {
-            await readJsonBody(req)
-            sendJson(res, 200, store.clear())
+            const body = await readJsonBody(req)
+            sendJson(res, 200, await store.clear({ keepPersisted: body.keepPersisted === true }))
             return
           }
           sendJson(res, 404, { error: `unknown llm-wire-trace method "${method}"` })

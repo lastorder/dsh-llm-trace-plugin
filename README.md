@@ -55,13 +55,17 @@ Notes:
 
 ## Configuration
 
-The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes three optional keys:
+The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these optional keys:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `maxRecords` | `200` | Ring-buffer size; only the most recent N records are kept. |
+| `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. |
 | `maxBodyChars` | `200000` | Per-field character cap before a body is truncated. |
 | `routePrefix` | `/llm-wire-trace` | Prefix for the plugin's own HTTP routes. |
+| `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
+| `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
+| `maxPersistedRecords` | `5000` | Retained record files; the oldest are deleted past this. |
+| `historyPageLimit` | `200` | Max record files read to build one history page. |
 
 ```yaml
 - insert:
@@ -70,7 +74,48 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes three opt
       config:
         maxRecords: 500
         maxBodyChars: 500000
+        maxPersistedRecords: 20000
 ```
+
+## Persistence
+
+The in-memory ring dies with the process, which is backwards for a debugging tool: the traces you most want are the ones from the run that just crashed. So records are also written to disk, and the viewer gains a 实时 / 历史记录 (live / history) toggle — live reads the ring, history reads the disk, including records from before the last restart.
+
+### One file per record, and why
+
+Every record is a single self-contained JSON file, written once and never rewritten:
+
+```
+$DSH_HOME/llm-wire-trace/records/<startedAt-ms>-<intra-ms ordinal>-<random>.json
+```
+
+That one choice removes concurrency control entirely. The obvious alternative — one appended JSONL file — is safe for the *appends* (line-sized writes land intact) but **not** for the periodic rewrite that enforces the retention cap: two harness processes compacting one file can drop each other's records. With a file per record there is nothing to compact:
+
+- **Writing** is `write temp` + `rename`, atomic on POSIX. A reader sees a complete file or no file, never a half-written one.
+- **Retention** is `unlink` of the oldest names. Two processes racing to delete the same file is harmless — the loser gets `ENOENT`, ignored. No lock, no per-process files, no merge-on-read.
+- **A hard kill** leaves at worst an orphan `.tmp` file, swept at next start. There is no truncated trailing line to detect and skip, and a torn file is skipped rather than failing the whole load.
+
+Verified by four processes writing 600 records into one directory concurrently with retention sweeps racing throughout: zero corrupt files, zero id collisions, zero temp leftovers, and the cap landed exactly.
+
+The filename carries the timestamp so ordering and retention are pure **name** operations — listing the newest page is a `readdir` + sort + slice that opens no files. Only records actually shown get read.
+
+> The record id doubles as the filename, so it is a sortable string rather than the old per-process counter (`w1`, `w2`, …). A counter would make two harness processes collide on the same filename and silently overwrite each other's records — reintroducing as data loss the very problem this layout removes.
+>
+> The millisecond alone is not a sufficient key: a burst can start many calls inside one millisecond, and a purely random suffix would then order them **arbitrarily** — losing real ordering exactly when calls are densest (observed, and fixed, during testing). The intra-ms ordinal restores order within a millisecond; the random tail keeps names unique across processes, which a counter alone cannot do. Files written before the ordinal existed are still read, so upgrading keeps your existing history.
+
+### The cost, stated plainly
+
+There is no index, so building a history page costs one file read per record *on that page* (bounded by `historyPageLimit`), not per record retained. A filtered history scan stops at a bounded budget and the viewer says so rather than implying it showed everything. This is the deliberate trade: a bounded per-page cost in exchange for never reintroducing shared mutable state.
+
+### Startup
+
+The newest records are loaded back into the ring on `apply`, so a restart opens on the recent past instead of an empty list. The load is never awaited — capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET <routePrefix>/stats`, never thrown into the capture path.
+
+### Privacy: bodies are stored verbatim
+
+`authorization` headers are redacted on disk exactly as in memory. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
+
+Clearing from the viewer deletes the persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
 
 ## Why this must be an installed package, not a dynamic Cordis plugin
 
@@ -101,7 +146,8 @@ Each record:
 
 ```
 {
-  id, startedAt, endedAt, durationMs,
+  id,                            // '<ms>-<ordinal>-<random>'; doubles as the storage filename
+  startedAt, endedAt, durationMs,
   status: 'ok' | 'http-error' | 'transport-error' | 'streaming',
   model,                          // best-effort, read from the parsed request body
   sessionId,                      // owning session, or null when unattributable
@@ -117,7 +163,7 @@ Each record:
 
 - `bodyText` is always the raw string (SSE frames verbatim, or a JSON error body). `bodyJson` is a best-effort parse for the JSON view; SSE bodies are never JSON-parsed as a whole (they're a frame sequence, not one JSON value).
 - `sessionId` / `turn` / `step` / `purpose` are **not read off the wire** — the wire barely carries them. They are attached by observing two harness channels; see [Harness coordinates](#harness-coordinates-turn--step).
-- Body fields are capped and the ring buffer holds only the most recent records; both are configurable (see [Configuration](#configuration)).
+- Body fields are capped and the ring buffer holds only the most recent records; both are configurable (see [Configuration](#configuration)). Records also outlive the process on disk — see [Persistence](#persistence).
 
 ## The viewer
 
@@ -232,6 +278,7 @@ This plugin depends on the implementation detail that every current provider ada
 
 ```
 src/index.js       host half — the fetch patch, record store, and HTTP routes
+src/persistence.js durable store — one JSON file per record, retention, restore
 src/client.js      browser half — the Wire Trace tab, hand-authored bundle format
 cordis.patch.yml   the host composition row (dsh.bundle.patch)
 package.json       dsh.bundle + dsh.client declarations
