@@ -670,49 +670,149 @@ window.__ModuleLoader__.load({
         // live-vs-history distinction to expose here: `truncated` only tells
         // us whether even older records exist beyond the read budget.
         const [truncated, setTruncated] = React.useState(false)
+        // True while the on-disk history for the current filter has not been
+        // folded in yet. The live records are already on screen at that
+        // point, so this drives a quiet hint rather than a blocking spinner.
+        const [historyLoading, setHistoryLoading] = React.useState(false)
+        // Bumped to request a fresh history read: mount, manual refresh, or a
+        // filter change. Polling deliberately does NOT bump it.
+        const [historyTick, setHistoryTick] = React.useState(0)
+        // True once a history payload has landed for the CURRENT filter.
+        //
+        // The two reads race by design: the memory read is fast and the
+        // history read is slow, so a poll's memory response can land after
+        // history has already arrived. Without this guard that late response
+        // would replace the full list with a memory-only one and the older
+        // records would visibly disappear. Reset on every filter change,
+        // because history for the new filter has not arrived yet.
+        const historyLanded = React.useRef(false)
+        // Guards against request pile-up: when a poll is still in flight the
+        // next tick is skipped instead of queueing another fetch behind it.
+        const inFlight = React.useRef(false)
 
         // A missing session id (shouldn't happen in a session-scoped slot)
         // degrades to the unfiltered list rather than filtering against
         // nothing and showing a permanently empty tab.
         const filtering = onlySession && currentSessionId !== null
 
+        /**
+         * Apply one list payload to state.
+         *
+         * Shared by the fast in-memory read and the full history read so both
+         * land identically — including the one-shot fallback for providers
+         * that never stamp a session id on the wire.
+         *
+         * @returns {boolean} false when the payload triggered the fallback and
+         *   should therefore not be rendered.
+         */
+        const applyPage = React.useCallback((result, opts) => {
+          const nextItems = (result && result.items) || []
+          const nextMatched = result && typeof result.matched === 'number' ? result.matched : 0
+          const nextUnattributed = result && typeof result.unattributed === 'number' ? result.unattributed : 0
+          // Nothing of our own, but traffic exists that simply never carried
+          // a session id: filtering is useless here, so show everything
+          // instead of an empty tab. Only a payload that actually consulted
+          // disk can prove this — an in-memory page may just not have reached
+          // this session's records yet.
+          const decisive = !(result && result.historyPending === true)
+          if (opts.filtering && decisive && !fallbackUsed.current
+            && nextMatched === 0 && nextUnattributed > 0) {
+            fallbackUsed.current = true
+            setAutoFellBack(true)
+            setOnlySession(false)
+            return false
+          }
+          // A memory-only page is a partial view of the truth: it holds the
+          // live records but none of the history. Once history has landed,
+          // fold live rows INTO the existing list (by id, live copy winning)
+          // instead of replacing it — otherwise a poll would erase history.
+          if (opts.memoryOnly && historyLanded.current) {
+            setItems((prev) => {
+              const byId = new Map()
+              for (const row of prev) byId.set(row.id, row)
+              for (const row of nextItems) byId.set(row.id, row)
+              return [...byId.values()].sort((a, b) => {
+                if (a.startedAt !== b.startedAt) return b.startedAt - a.startedAt
+                return a.id < b.id ? 1 : a.id > b.id ? -1 : 0
+              })
+            })
+            setError(null)
+            return true
+          }
+
+          if (!opts.memoryOnly) historyLanded.current = true
+          setItems(nextItems)
+          setTruncated(result ? result.truncated === true : false)
+          setTotal(result ? result.total : 0)
+          setMatched(nextMatched)
+          setUnattributed(nextUnattributed)
+          setTurns((result && result.turns) || [])
+          setAuxiliary(result && typeof result.auxiliary === 'number' ? result.auxiliary : 0)
+          setError(null)
+          return true
+        }, [])
+
+        // Fast path. Reads the host's in-memory ring only — no file is opened,
+        // so this stays cheap enough to run on every poll without ever
+        // stalling the event loop the rest of the UI shares.
+        React.useEffect(() => {
+          if (inFlight.current) return undefined
+          let alive = true
+          inFlight.current = true
+          apiGet('list', {
+            limit: 100,
+            source: 'memory',
+            sessionId: filtering ? currentSessionId : undefined,
+          }).then(
+            (result) => {
+              inFlight.current = false
+              if (!alive) return
+              applyPage(result, { filtering, memoryOnly: true })
+            },
+            (reason) => {
+              inFlight.current = false
+              if (alive) setError(String((reason && reason.message) || reason))
+            },
+          )
+          return () => { alive = false }
+        }, [tick, filtering, currentSessionId, applyPage])
+
+        // Slow path, run only when the visible history could actually change:
+        // opening the tab, changing the filter, or an explicit refresh. This
+        // is the one that touches disk, and it is deliberately kept out of
+        // the polling loop.
         React.useEffect(() => {
           let alive = true
+          // History for this filter has not arrived yet, so a memory page is
+          // once again allowed to define the list.
+          historyLanded.current = false
+          setHistoryLoading(true)
           apiGet('list', {
-            limit: 300,
+            limit: 100,
             sessionId: filtering ? currentSessionId : undefined,
           }).then(
             (result) => {
               if (!alive) return
-              const nextItems = (result && result.items) || []
-              setTruncated(result ? result.truncated === true : false)
-              const nextMatched = result && typeof result.matched === 'number' ? result.matched : 0
-              const nextUnattributed = result && typeof result.unattributed === 'number' ? result.unattributed : 0
-              // Nothing of our own, but traffic exists that simply never
-              // carried a session id: filtering is useless here, so show
-              // everything instead of an empty tab.
-              if (filtering && !fallbackUsed.current && nextMatched === 0 && nextUnattributed > 0) {
-                fallbackUsed.current = true
-                setAutoFellBack(true)
-                setOnlySession(false)
-                return
-              }
-              setItems(nextItems)
-              setTotal(result ? result.total : 0)
-              setMatched(nextMatched)
-              setUnattributed(nextUnattributed)
-              setTurns((result && result.turns) || [])
-              setAuxiliary(result && typeof result.auxiliary === 'number' ? result.auxiliary : 0)
-              setError(null)
+              setHistoryLoading(false)
+              applyPage(result, { filtering, memoryOnly: false })
             },
-            (reason) => { if (alive) setError(String((reason && reason.message) || reason)) },
+            (reason) => {
+              if (!alive) return
+              setHistoryLoading(false)
+              setError(String((reason && reason.message) || reason))
+            },
           )
           return () => { alive = false }
-        }, [tick, filtering, currentSessionId])
+        }, [historyTick, filtering, currentSessionId, applyPage])
 
         React.useEffect(() => {
           if (!auto) return undefined
-          return ctx.interval(() => { setTick((n) => n + 1) }, 2000)
+          return ctx.interval(() => {
+            // A hidden tab has no reader, so polling it only burns work on a
+            // shared event loop.
+            if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+            setTick((n) => n + 1)
+          }, 3000)
         }, [auto])
 
         const selectedStatus = React.useMemo(() => {
@@ -944,11 +1044,16 @@ window.__ModuleLoader__.load({
                 className: 'wt-btn',
                 key: 'auto',
                 'data-on': auto ? '1' : '0',
-                title: auto ? '每 2 秒自动刷新。点击暂停。' : '已暂停刷新。点击恢复并立即刷新一次。',
+                title: auto ? '每 3 秒自动刷新（只读内存中的实时记录，不扫描磁盘）。点击暂停。' : '已暂停刷新。点击恢复并立即刷新一次。',
                 onClick: () => {
                   const next = !auto
                   setAuto(next)
-                  if (next) setTick((n) => n + 1)
+                  // A manual resume is the user asking to see everything now,
+                  // so it re-reads history too, not just the live ring.
+                  if (next) {
+                    setTick((n) => n + 1)
+                    setHistoryTick((n) => n + 1)
+                  }
                 },
               }, auto ? '自动刷新' : '已暂停'),
               h('button', {
@@ -977,6 +1082,9 @@ window.__ModuleLoader__.load({
                   apiPost('clear', {}).then(() => {
                     setSelected(null)
                     setTick((n) => n + 1)
+                    // Clearing deletes files, so the history half must be
+                    // re-read or the removed records would linger on screen.
+                    setHistoryTick((n) => n + 1)
                   }, (reason) => setError(String(reason)))
                 },
               }, '清空'),
@@ -996,6 +1104,12 @@ window.__ModuleLoader__.load({
                   : '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。')
                 : [
                   ...groupedRows,
+                  // Live records are already on screen; the disk half is
+                  // still arriving. Say so, so an incomplete list is never
+                  // mistaken for the whole history.
+                  historyLoading
+                    ? h('div', { className: 'wt-jnotice', key: '#history' }, '正在后台载入磁盘历史记录…')
+                    : null,
                   // The provider never stamped a session id, so the default
                   // filter was dropped. Explain it where it was noticed.
                   autoFellBack

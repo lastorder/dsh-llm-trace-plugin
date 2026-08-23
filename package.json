@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-trace-plugin",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Capture the literal HTTP request/response of every LLM provider call (by patching globalThis.fetch) and show them in a Wire Trace session tab",
   "license": "MIT",
   "type": "module",

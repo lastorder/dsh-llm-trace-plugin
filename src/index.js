@@ -318,6 +318,49 @@ export function createWireTraceStore(options) {
   }
 
   /**
+   * Read a page from the archive, collapsing repeat reads within a short
+   * window onto one disk scan.
+   *
+   * Two callers make this worth having: a viewer that refreshes, and several
+   * browser tabs watching at once. Both otherwise re-scan the same files
+   * seconds apart for a result that cannot have meaningfully changed.
+   *
+   * Only the ARCHIVE half is cached, never the merged page. In-flight
+   * records live in memory and are re-collected on every call, then layered
+   * over this result, so a streaming response still updates at full speed —
+   * the cache can only ever delay a record already finalised and written.
+   *
+   * The promise is cached rather than its value, so concurrent callers share
+   * one scan instead of each starting their own.
+   */
+  const ARCHIVE_TTL_MS = 1000
+  let archiveCache = null
+
+  function listArchive(settings) {
+    const key = `${settings.sessionId ?? ''}|${capacity(settings.limit)}`
+    const now = Date.now()
+    if (archiveCache !== null && archiveCache.key === key && now - archiveCache.at < ARCHIVE_TTL_MS) {
+      return archiveCache.promise
+    }
+    const promise = archive.list({
+      limit: settings.limit,
+      sessionId: settings.sessionId,
+      parseJson: tryParseJson,
+    }).catch((error) => {
+      // Never serve one failure for the rest of the TTL.
+      if (archiveCache !== null && archiveCache.promise === promise) archiveCache = null
+      throw error
+    })
+    archiveCache = { key, at: now, promise }
+    return promise
+  }
+
+  /** Drop the cached page so the next read sees disk as it is now. */
+  function invalidateArchiveCache() {
+    archiveCache = null
+  }
+
+  /**
    * Wrap the real `fetch` so only provider calls (identified by the
    * `deepseek-harness/` user-agent every adapter sends) are recorded; every
    * other call passes through completely untouched — same arguments, same
@@ -475,22 +518,33 @@ export function createWireTraceStore(options) {
      * the in-memory copy wins: it is the same record, but it is the one still
      * being mutated as its response body streams in.
      *
-     * @param {{ limit?: number, sessionId?: string }} [options]
+     * `memoryOnly` serves the viewer's fast path. Reading the ring touches no
+     * disk at all, so the tab can paint immediately and poll cheaply, then
+     * fold in history from a second, slower call. `persistence` still
+     * reports whether an archive exists, so a caller can tell "history has
+     * not arrived yet" apart from "persistence is off" instead of showing an
+     * empty history as if it were complete.
+     *
+     * @param {{ limit?: number, sessionId?: string, memoryOnly?: boolean }} [options]
      */
     async listAll(options) {
       const settings = options ?? {}
       const memory = collectMemory(settings)
 
-      if (archive === null) {
+      if (archive === null || settings.memoryOnly === true) {
         const grouped = summarizePage(memory.page, summary)
-        return { ...grouped, total: records.length, matched: memory.matched, persistence: false, truncated: false }
+        return {
+          ...grouped,
+          total: records.length,
+          matched: memory.matched,
+          persistence: archive !== null,
+          // The ring is the whole world here, so nothing was skipped.
+          truncated: false,
+          historyPending: archive !== null,
+        }
       }
 
-      const page = await archive.list({
-        limit: settings.limit,
-        sessionId: settings.sessionId,
-        parseJson: tryParseJson,
-      })
+      const page = await listArchive(settings)
 
       // Disk first so the live copy of a shared id overwrites the stored one.
       const merged = new Map()
@@ -518,6 +572,7 @@ export function createWireTraceStore(options) {
         matched: merged.size,
         persistence: true,
         truncated: page.truncated,
+        historyPending: false,
       }
     },
 
@@ -549,6 +604,9 @@ export function createWireTraceStore(options) {
       if (archive !== null && !(options && options.keepPersisted)) {
         removedFiles = await archive.clear()
       }
+      // A cached page would otherwise keep serving records that no longer
+      // exist, making "clear" look like it silently failed.
+      invalidateArchiveCache()
       return { removed, removedFiles }
     },
   }
@@ -559,7 +617,7 @@ export function createWireTraceStore(options) {
  * @param {number | undefined} limit - requested size.
  */
 function capacity(limit) {
-  return typeof limit === 'number' && limit > 0 ? Math.min(limit, 1000) : 300
+  return typeof limit === 'number' && limit > 0 ? Math.min(limit, 300) : 300
 }
 
 /**
@@ -925,11 +983,17 @@ export function apply(ctx, config) {
             // that has no session id yet degrades to the full list rather
             // than silently matching nothing.
             const sessionId = url.searchParams.get('sessionId') ?? ''
+            // `source=memory` is the viewer's fast path: the in-memory ring
+            // only, reading no files at all. The tab uses it to paint
+            // immediately and to poll, so neither opening the tab nor
+            // watching it live costs a disk scan on the shared event loop.
+            const memoryOnly = url.searchParams.get('source') === 'memory'
             // Memory and disk as one page: where a record is stored is an
             // implementation detail the viewer should never have to expose.
             sendJson(res, 200, await store.listAll({
               limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
               sessionId,
+              memoryOnly,
             }))
             return
           }

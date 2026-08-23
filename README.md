@@ -122,11 +122,15 @@ In practice a typical request (a few hundred thousand characters) lands around 2
 
 ### The cost, stated plainly
 
-There is no index, so building a history page costs one file read per record *on that page* (bounded by `historyPageLimit`), not per record retained. A filtered history scan stops at a bounded budget and the viewer says so rather than implying it showed everything. This is the deliberate trade: a bounded per-page cost in exchange for never reintroducing shared mutable state.
+There is no index, so building a history page costs one file read per record *on that page* (bounded by `historyPageLimit`), not per record retained. Those reads run in concurrent batches and yield to the event loop between batches, because this plugin's routes share a process — and so an event loop — with the harness's own web UI. A list read parses only the fields a row displays and never touches body text, which is the bulk of a record. A filtered history scan stops at a bounded budget and the viewer says so rather than implying it showed everything.
+
+This is the deliberate trade: a bounded per-page cost in exchange for never reintroducing shared mutable state.
 
 ### Startup
 
 Nothing is preloaded into the ring on `apply`: the list already merges memory and disk, so a restart opens on the recent past regardless. (Preloading was in fact what made an earlier live/history toggle show identical content in both modes — the ring had been filled with the very history the other mode read.)
+
+The Wire Trace tab is mounted only while it is the active tab, so an unopened tab reads nothing at all. Opening it paints the live in-memory ring first and folds the on-disk history in behind that, saying so while the history is still in flight. Auto-refresh then polls the ring only, so watching a live session never re-scans the disk.
 
 Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET <routePrefix>/stats`, never thrown into the capture path.
 

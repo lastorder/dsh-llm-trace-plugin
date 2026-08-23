@@ -75,6 +75,25 @@ export const DEFAULT_PRETTY_BODY_LIMIT = 500000
 export const DEFAULT_PAGE_LIMIT = 50
 
 /**
+ * Files read concurrently per batch while scanning a page.
+ *
+ * Large enough that the per-file I/O round trips overlap instead of running
+ * end to end, small enough that the synchronous parsing between two yields
+ * stays short — this is the knob that keeps one listing from monopolising
+ * the event loop the web UI shares.
+ */
+const SCAN_BATCH = 16
+
+/**
+ * Yield to the event loop so pending I/O callbacks (the UI's own requests)
+ * get a turn. `setImmediate` runs after the poll phase, so anything already
+ * readable is serviced before the next batch starts.
+ */
+function yieldToLoop() {
+  return new Promise((resolve) => setImmediate(resolve))
+}
+
+/**
  * Only files this module wrote are ever read or deleted.
  *
  * The optional middle group accepts records written before the intra-ms
@@ -299,6 +318,65 @@ export function fromPersisted(stored, parseJson) {
 }
 
 /**
+ * Project a stored record down to exactly the fields a LIST row needs,
+ * without ever touching the body text.
+ *
+ * This mirrors `summary()` in the plugin's store: those are the only fields
+ * a list row can display. Everything omitted here — `bodyText`, `bodyJson`,
+ * headers — is precisely the bulk of the file, and skipping it is what makes
+ * listing cheap enough not to block the shared event loop.
+ *
+ * `bodyText` is deliberately carried through as `null` rather than dropped:
+ * consumers that spread this record still see the key with a defined shape,
+ * and `bodyChars` (already stored as a scalar) supplies the size the list
+ * actually displays.
+ *
+ * @param {object} stored - parsed file contents.
+ * @returns {object} an owned, list-shaped record.
+ */
+export function toMeta(stored) {
+  const request = stored.request ?? {}
+  const response = stored.response ?? null
+  return {
+    v: stored.v ?? 1,
+    id: stored.id,
+    startedAt: stored.startedAt ?? null,
+    endedAt: stored.endedAt ?? null,
+    durationMs: stored.durationMs ?? null,
+    status: stored.status ?? null,
+    model: stored.model ?? null,
+    sessionId: stored.sessionId ?? null,
+    turn: typeof stored.turn === 'number' ? stored.turn : null,
+    step: typeof stored.step === 'number' ? stored.step : null,
+    purpose: stored.purpose ?? null,
+    provider: stored.provider ?? null,
+    requestedModel: stored.requestedModel ?? null,
+    attributed: stored.attributed === true,
+    persisted: true,
+    meta: true,
+    request: {
+      method: request.method ?? null,
+      url: request.url ?? null,
+      bodyChars: request.bodyChars ?? 0,
+      bodyTruncated: request.bodyTruncated === true,
+      bodyText: null,
+      bodyJson: null,
+    },
+    response: response === null ? null : {
+      status: response.status ?? null,
+      statusText: response.statusText ?? null,
+      contentType: response.contentType ?? null,
+      bodyChars: response.bodyChars ?? 0,
+      bodyTruncated: response.bodyTruncated === true,
+      bodyText: null,
+      bodyJson: null,
+    },
+    error: stored.error ?? null,
+    recorderError: stored.recorderError ?? null,
+  }
+}
+
+/**
  * Create the durable store.
  *
  * Every method resolves rather than rejects on I/O failure: persistence is a
@@ -360,14 +438,26 @@ export function createRecordArchive(options) {
   }
 
   /**
-   * Read and rehydrate one record by id, or null when it is absent or
-   * unreadable (a torn file from an unclean kill is skipped, not fatal).
+   * Read one record by id, or null when it is absent or unreadable (a torn
+   * file from an unclean kill is skipped, not fatal).
+   *
+   * `metaOnly` exists because listing and detail want very different things
+   * from the same file. A list row is built by `summary()` from ~17 scalars
+   * and touches neither `bodyText` nor `bodyJson` — but the full rehydrate
+   * runs `JSON.parse` over every body a SECOND time (once for the file, once
+   * inside `fromPersisted`) only to throw the result away. Bodies are the
+   * bulk of a record and `JSON.parse` is synchronous, so on the event loop
+   * this process shares with the web UI that second parse is what stalls the
+   * page. `metaOnly` skips it and never touches the body text at all.
+   *
+   * Detail reads keep the full path: `get()` genuinely needs `bodyJson`.
    */
-  async function readRecord(id, parseJson) {
+  async function readRecord(id, parseJson, metaOnly) {
     if (!RECORD_FILE.test(`${id}.json`)) return null
     try {
       const text = await readFile(join(dir, `${id}.json`), 'utf8')
-      return fromPersisted(JSON.parse(text), parseJson)
+      const stored = JSON.parse(text)
+      return metaOnly === true ? toMeta(stored) : fromPersisted(stored, parseJson)
     } catch (error) {
       if (!error || error.code !== 'ENOENT') fail(error)
       return null
@@ -458,11 +548,26 @@ export function createRecordArchive(options) {
      * a bounded scan budget is exhausted. That keeps a single request's cost
      * bounded rather than proportional to everything retained.
      *
-     * @param {{ limit?: number, sessionId?: string, parseJson?: (text: string | null) => unknown }} [query]
+     * Two properties matter more than raw speed, because this runs on the
+     * same event loop that serves the web UI:
+     *
+     *   - Files are read in CONCURRENT BATCHES, not one await at a time. The
+     *     old serial loop paid a full I/O round trip per record.
+     *   - Between batches the loop YIELDS via `setImmediate`. Without that, a
+     *     large page is one uninterrupted block of synchronous parsing and
+     *     the whole page — every session, plus the `/api` channel — freezes
+     *     until it finishes. Yielding trades a little throughput for a UI
+     *     that keeps responding.
+     *
+     * Reads default to metadata only: a list row never displays a body, and
+     * parsing them is what made this expensive. `full: true` opts back in.
+     *
+     * @param {{ limit?: number, sessionId?: string, parseJson?: (text: string | null) => unknown, full?: boolean }} [query]
      */
     async list(query) {
       const request = query ?? {}
       const parseJson = request.parseJson ?? (() => null)
+      const metaOnly = request.full !== true
       const wanted = typeof request.sessionId === 'string' && request.sessionId.length > 0
         ? request.sessionId
         : null
@@ -472,18 +577,41 @@ export function createRecordArchive(options) {
 
       const names = await listNames()
       const total = names.length
-      // Bound the work of a filtered scan: at most this many files are opened
-      // even when the filter matches nothing.
-      const budget = Math.max(cap, Math.min(total, pageLimit * 4))
+      // Unfiltered, every record read is a record shown, so reading past the
+      // page is pure waste. Only a filtered scan needs to look further to
+      // find enough matches — and even then the overshoot is bounded.
+      const budget = wanted === null
+        ? Math.min(cap, total)
+        : Math.max(cap, Math.min(total, pageLimit * 2))
 
       const found = []
       let scanned = 0
-      for (let i = names.length - 1; i >= 0 && found.length < cap && scanned < budget; i -= 1) {
-        scanned += 1
-        const record = await readRecord(idFromName(names[i]), parseJson)
-        if (record === null) continue
-        if (wanted !== null && record.sessionId !== wanted) continue
-        found.push(record)
+      let cursor = names.length - 1
+
+      while (cursor >= 0 && found.length < cap && scanned < budget) {
+        const batch = []
+        while (batch.length < SCAN_BATCH && cursor >= 0 && scanned + batch.length < budget) {
+          batch.push(names[cursor])
+          cursor -= 1
+        }
+        if (batch.length === 0) break
+        scanned += batch.length
+
+        // Newest-first order is preserved because the batch keeps its own
+        // order and batches are consumed in order.
+        const read = await Promise.all(
+          batch.map((name) => readRecord(idFromName(name), parseJson, metaOnly)),
+        )
+        for (const record of read) {
+          if (found.length >= cap) break
+          if (record === null) continue
+          if (wanted !== null && record.sessionId !== wanted) continue
+          found.push(record)
+        }
+
+        // Hand the event loop back so the UI and `/api` can be served between
+        // batches instead of after the entire page.
+        if (cursor >= 0 && found.length < cap && scanned < budget) await yieldToLoop()
       }
 
       return {
@@ -497,7 +625,7 @@ export function createRecordArchive(options) {
     },
 
     get(id, parseJson) {
-      return readRecord(id, parseJson ?? (() => null))
+      return readRecord(id, parseJson ?? (() => null), false)
     },
 
     /**
@@ -509,7 +637,9 @@ export function createRecordArchive(options) {
       const request = query ?? {}
       await ensureDir()
       void this.sweepTemp()
-      const page = await this.list({ limit: request.limit, parseJson: request.parseJson })
+      // Full records: these repopulate the in-memory ring, whose consumers
+      // (detail view, curl) expect real bodies.
+      const page = await this.list({ limit: request.limit, parseJson: request.parseJson, full: true })
       // Oldest first: the in-memory ring is chronological, newest at the end.
       return page.records.slice().reverse()
     },
