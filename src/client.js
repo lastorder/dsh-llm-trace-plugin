@@ -268,19 +268,61 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * jq-style pretty-print of one JSON text: re-indent when parseable, return
-     * the original text unchanged otherwise (never throws, never claims a
-     * malformed body is valid JSON).
-     * @param {string} text - candidate JSON text.
-     * @returns {string} pretty-printed JSON, or `text` verbatim if unparseable.
+     * Parse a raw SSE body into one plain object per frame, so the whole
+     * stream can be read with the same JSON view as a request body.
+     *
+     * Frames are separated by blank lines. Every SSE field becomes a key under
+     * its protocol name: `data:` holds the parsed JSON when the payload is
+     * parseable and the raw string otherwise (so `[DONE]` survives as
+     * `"data": "[DONE]"`), and `event:` / `id:` / `retry:` sit alongside it.
+     * Comment lines (`: keep-alive`) become `"comment"`. Nothing is dropped —
+     * an unparseable or unexpected line is still visible in the result.
+     *
+     * A frame carrying repeated `data:` lines follows the SSE spec and joins
+     * them with newlines before the JSON parse is attempted.
+     *
+     * @param {string} text - the raw event-stream body.
+     * @returns {object[]} one object per frame, in wire order.
      */
-    function prettyJsonText(text) {
-      if (typeof text !== 'string' || text.length === 0) return text || ''
-      try {
-        return JSON.stringify(JSON.parse(text), null, 2)
-      } catch {
-        return text
+    function parseSseFrames(text) {
+      if (typeof text !== 'string' || text.length === 0) return []
+      const frames = []
+      // Normalize CRLF so frame splitting works on either line ending.
+      const blocks = text.replace(/\r\n/g, '\n').split(/\n{2,}/)
+      for (const block of blocks) {
+        if (block.trim() === '') continue
+        const frame = {}
+        const dataLines = []
+        const comments = []
+        for (const line of block.split('\n')) {
+          if (line === '') continue
+          if (line.startsWith(':')) {
+            comments.push(line.slice(1).trim())
+            continue
+          }
+          const sep = line.indexOf(':')
+          const field = sep === -1 ? line : line.slice(0, sep)
+          // Per the SSE spec a single leading space after the colon is stripped.
+          const value = sep === -1 ? '' : line.slice(sep + 1).replace(/^ /, '')
+          if (field === 'data') dataLines.push(value)
+          else frame[field] = value
+        }
+        if (comments.length > 0) frame.comment = comments.length === 1 ? comments[0] : comments
+        if (dataLines.length > 0) {
+          const payload = dataLines.join('\n')
+          // Keep the raw string when the payload isn't JSON, so sentinels like
+          // `[DONE]` stay visible instead of being silently dropped.
+          let parsed
+          try {
+            parsed = JSON.parse(payload)
+          } catch {
+            parsed = payload
+          }
+          frame.data = parsed
+        }
+        if (Object.keys(frame).length > 0) frames.push(frame)
       }
+      return frames
     }
 
     /**
@@ -288,7 +330,8 @@ window.__ModuleLoader__.load({
      * of each `data:` line, leaving frame structure — blank separators,
      * `event:`/`id:`/`retry:` fields, comment lines, and non-JSON sentinels
      * like `data: [DONE]` — completely untouched. A `data:` payload that isn't
-     * parseable JSON passes through verbatim, same as {@link prettyJsonText}.
+     * parseable JSON passes through verbatim; a malformed body is never
+     * silently rewritten into something that looks valid.
      * @param {string} text - the raw SSE body.
      * @returns {string} the same frame sequence with JSON payloads re-indented.
      */
@@ -487,8 +530,7 @@ window.__ModuleLoader__.load({
         const [depth, setDepth] = React.useState(1)
         const [overrides, setOverrides] = React.useState(() => new Map())
         const [longOpen, setLongOpen] = React.useState(() => new Set())
-        const [sseRaw, setSseRaw] = React.useState(true)
-        const [requestRaw, setRequestRaw] = React.useState(false)
+        const [sseRaw, setSseRaw] = React.useState(false)
         const [curlBusy, setCurlBusy] = React.useState(false)
         const [curlNotice, setCurlNotice] = React.useState(null)
 
@@ -538,7 +580,6 @@ window.__ModuleLoader__.load({
 
         React.useEffect(() => {
           setCurlNotice(null)
-          setRequestRaw(false)
         }, [selected])
 
         const copyCurl = () => {
@@ -591,35 +632,32 @@ window.__ModuleLoader__.load({
           })
         }, [])
 
-        // Response tab: SSE bodies are raw event-stream text — most useful
-        // Response tab: SSE bodies are raw event-stream text — most useful
-        // shown verbatim; JSON error bodies get the same tree treatment as
-        // the request. Request tab defaults to the parsed tree (bodyJson may
-        // be null when the body wasn't parseable, in which case the raw
-        // toggle is the only option and is forced on below); a raw-text
-        // toggle lets you see the exact bytes that left the process either way.
+        // What each tab renders in the JSON view.
+        //
+        // Request always shows the parsed body; when the body isn't parseable
+        // JSON there is nothing to parse, so it degrades to a single `__raw__`
+        // key holding the exact text rather than pretending otherwise.
+        //
+        // Response has three shapes: an SSE body becomes one object per frame
+        // (so the stream reads as a JSON array), a JSON body is shown as-is,
+        // and anything else degrades to `__raw__` the same way. SSE keeps a
+        // raw-text toggle because the literal bytes are this plugin's whole
+        // point; it just is no longer the default.
         const isSse = detail !== null && detail.response && detail.response.contentType && detail.response.contentType.includes('event-stream')
         const requestParsed = detail !== null && detail.request.bodyJson !== null
         const requestBody = detail === null ? null : (requestParsed ? detail.request.bodyJson : { __raw__: detail.request.bodyText })
-        const responseBody = detail === null || detail.response === null
-          ? null
-          : (detail.response.bodyJson !== null ? detail.response.bodyJson : { __raw__: detail.response.bodyText })
+        const responseBody = React.useMemo(() => {
+          if (detail === null || detail.response === null) return null
+          if (isSse) return parseSseFrames(detail.response.bodyText)
+          if (detail.response.bodyJson !== null) return detail.response.bodyJson
+          return { __raw__: detail.response.bodyText }
+        }, [detail, isSse])
         const treeValue = tab === 'request' ? requestBody : responseBody
-        // Force raw when there's nothing to parse, so the toggle can't hide the only view that has content.
-        const showRequestRaw = tab === 'request' && (requestRaw || !requestParsed)
-        const showSseRaw = tab === 'response' && isSse && sseRaw
-        const showRaw = showRequestRaw || showSseRaw
-        // Pretty-printed for display and copy alike (jq-style re-indent);
-        // SSE keeps its frame structure and reformats only each data: payload.
-        // A body that isn't parseable JSON falls back to the verbatim text —
-        // there's nothing to reformat, and we never claim otherwise.
-        const rawText = detail === null
-          ? ''
-          : tab === 'request'
-            ? prettyJsonText(detail.request.bodyText)
-            : (detail.response
-              ? (isSse ? prettySseText(detail.response.bodyText) : prettyJsonText(detail.response.bodyText))
-              : '')
+        const showRaw = tab === 'response' && isSse && sseRaw
+        // The raw view is now reachable only for SSE. Frame structure stays
+        // verbatim and only each `data:` payload is re-indented, so what you
+        // read still matches the bytes on the wire frame-for-frame.
+        const rawText = showRaw ? prettySseText(detail.response.bodyText) : ''
         const text = detail === null ? '' : stringify(tab === 'request' ? detail.request : detail.response)
 
         // Deepest nesting actually present, so `+` can stop at the point where
@@ -700,18 +738,14 @@ window.__ModuleLoader__.load({
               h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, 'Request'),
               h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, 'Response'),
               h('span', { className: 'wt-div', key: 'div' }),
-              tab === 'request'
+              isSse && tab === 'response'
                 ? h('button', {
                   className: 'wt-btn',
-                  key: 'reqraw',
-                  'data-on': showRequestRaw ? '1' : '0',
-                  disabled: !requestParsed,
-                  title: requestParsed ? '在解析后的 JSON 树和原始请求体文本之间切换' : '请求体不是可解析的 JSON，只能看原文',
-                  onClick: () => setRequestRaw(!requestRaw),
-                }, showRequestRaw ? '原始 body' : '解析后')
-                : null,
-              isSse && tab === 'response'
-                ? h('button', { className: 'wt-btn', key: 'sse', 'data-on': sseRaw ? '1' : '0', onClick: () => setSseRaw(!sseRaw) }, sseRaw ? 'SSE 原始文本' : 'SSE 树视图')
+                  key: 'sse',
+                  'data-on': sseRaw ? '1' : '0',
+                  title: sseRaw ? '当前显示线路上的原始 SSE 文本。点击切回按帧解析的 JSON 列表。' : '当前把每个 SSE 帧解析成一个 JSON 对象。点击查看线路上的原始文本。',
+                  onClick: () => setSseRaw(!sseRaw),
+                }, sseRaw ? 'SSE 原始文本' : 'SSE 解析后')
                 : null,
               h('button', {
                 className: 'wt-btn wt-btn-step',
@@ -728,7 +762,7 @@ window.__ModuleLoader__.load({
                 disabled: detail === null || showRaw || depth >= contentDepth,
               }, '+'),
               h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : '深度 ' + depth + '/' + contentDepth),
-              h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.method + ' ' + detail.url),
+              h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.request.method + ' ' + detail.request.url),
               h('button', {
                 className: 'wt-btn',
                 key: 'curl',

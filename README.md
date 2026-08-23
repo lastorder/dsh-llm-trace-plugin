@@ -115,13 +115,26 @@ Using the global stepper resets the baseline and clears any per-row folds, so th
 
 A folded container collapses to a one-line placeholder that keeps its trailing comma, e.g. `"messages": [ … 12 items ],`. Fully expanded, the view is valid JSON: it round-trips through `JSON.parse` to exactly the captured value.
 
-Two tabs, Request and Response, plus an SSE-specific toggle on the Response tab: an `event-stream` body defaults to raw text (the frame sequence is usually what you want to read directly), with a one-click switch to the JSON view for the rare case a frame's JSON payload needs digging into.
+Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is parsed into one object per SSE frame so the whole stream reads as a JSON array (see below).
 
 > The in-app button labels are currently Chinese; the English names below are given alongside them.
 
-### Request: parsed / raw toggle
+### Response: SSE as a JSON array
 
-The Request tab defaults to the parsed JSON view. A parsed/raw button (`解析后` / `原始 body`) switches to the exact request-body text that was actually sent — useful when the body isn't standard JSON, or when you want to see it byte-for-byte rather than through the view's own JSON re-serialization. When the body isn't parseable JSON at all, the toggle is forced to raw and disabled. Switching Request ↔ Response keeps your choice for that record; selecting a different record resets it to parsed.
+An `event-stream` body is parsed frame by frame into a JSON array and shown with the same view as any other body. Each frame becomes one object keyed by its own SSE field names:
+
+```json
+[
+  { "comment": "keep-alive" },
+  { "data": { "id": "chatcmpl-1", "choices": [ ] } },
+  { "event": "message", "id": "42", "data": { } },
+  { "data": "[DONE]" }
+]
+```
+
+`data:` holds the parsed JSON when the payload is parseable and the raw string otherwise, so sentinels like `[DONE]` stay visible rather than being dropped; `event:` / `id:` / `retry:` sit alongside it, and comment lines (`: keep-alive`) become `comment`. Repeated `data:` lines within one frame are joined with newlines first, as the SSE spec requires. Nothing is discarded — a malformed payload is kept verbatim as a string.
+
+An `SSE 原始文本` toggle switches to the literal frame sequence on the wire, which is what this plugin exists to show. Only each frame's `data:` payload is re-indented there; frame structure (`event:` / `id:` / `retry:` fields, comment lines, blank separators, and non-JSON sentinels) is left completely untouched.
 
 ### Copy as curl
 
@@ -138,11 +151,9 @@ The stored `authorization` header is always the redacted placeholder — this pl
 
 The client tells you which of the two happened after each copy. Inlining a real secret means **it is now on your clipboard** (and possibly in shell history once pasted) — worth knowing before sharing a screen or pasting into a chat. The `$DSH_CURL_KEY` case avoids that by design, since the secret value never leaves your shell's environment.
 
-### jq-style formatting
+### Copy and download
 
-The Request tab's raw view and the Response tab's non-JSON-view modes (plain JSON, and SSE) show pretty-printed JSON rather than whatever the wire actually carried — request bodies are typically minified by the adapter's own `JSON.stringify`, and this re-indents them the way `jq .` would. For SSE, only each frame's `data: {...}` payload is reformatted; frame structure (`event:` / `id:` / `retry:` fields, comment lines, blank separators, and non-JSON sentinels like `data: [DONE]`) is left completely untouched. A body that isn't parseable JSON at all is shown verbatim, so malformed content is never silently "fixed" into something that looks valid.
-
-Re-indenting is lossless for JSON, so copy (`复制`) and the on-screen view show the same pretty text; download (`下载`) still exports the complete record, unaffected.
+Copy (`复制`) puts the complete record half — the whole `request` or `response` object, headers included — on the clipboard as formatted JSON, matching what the view shows. Download (`下载`) exports the complete record, both halves, as `llm-wire-trace-<id>.json`.
 
 ### Independent scrolling: a shell CSS quirk this plugin corrects
 
