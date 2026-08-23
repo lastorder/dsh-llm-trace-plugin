@@ -60,7 +60,7 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 | Key | Default | Meaning |
 |---|---|---|
 | `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. |
-| `maxBodyChars` | `200000` | Per-field character cap before a body is truncated. |
+| `maxBodyChars` | `1000000` | Per-field character cap before a body is truncated. Sized to hold a whole agent request; a body cut mid-JSON cannot be parsed, so the viewer can only show it as text. |
 | `routePrefix` | `/llm-wire-trace` | Prefix for the plugin's own HTTP routes. |
 | `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
@@ -73,7 +73,7 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
       name: dsh-llm-trace-plugin
       config:
         maxRecords: 500
-        maxBodyChars: 500000
+        maxBodyChars: 2000000
         maxPersistedRecords: 5000
 ```
 
@@ -110,6 +110,10 @@ The filename carries the timestamp so ordering and retention are pure **name** o
 Files are written indented, and each body is stored twice: the verbatim `bodyText` from the wire, plus a parsed `bodyJson` beside it. `bodyText` alone is a JSON *string*, so on disk it is one long escaped line (`\"role\":\"user\"`) that no editor renders usefully — the parsed copy lets `messages`, tool definitions, and the response object expand as real nested JSON.
 
 `bodyJson` is a derived convenience copy, never the source of truth: reading always re-derives it from `bodyText`, so a stale or hand-edited parse on disk cannot change what the viewer shows. It is omitted where it would add nothing — a truncated body, a non-container value, or an SSE response (a frame sequence, never one JSON value, matching the capture-time rule). The cost is roughly double the body bytes.
+
+### Disk footprint
+
+A real agent request carrying file contents and tool history runs to a few hundred thousand characters, and each body is stored twice (verbatim plus parsed). So a large record is roughly 1MB, and the 500-record default bounds the directory at a few hundred MB in the worst case — typically far less, since most calls are much smaller. Lower `maxPersistedRecords`, `maxBodyChars`, or both if that matters on your machine.
 
 ### The cost, stated plainly
 

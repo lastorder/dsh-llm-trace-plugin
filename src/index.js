@@ -129,7 +129,16 @@ export function createStepTracker() {
 }
 
 const DEFAULT_MAX_RECORDS = 200
-const DEFAULT_MAX_BODY_CHARS = 200000
+
+/**
+ * Per-field body cap.
+ *
+ * Sized to hold a whole real request rather than a fragment: an agent turn
+ * carrying file contents and tool history runs well past 200k characters, and
+ * a body cut mid-JSON is unparseable — which is what made the viewer fall
+ * back to a bare `__raw__` blob instead of a browsable request.
+ */
+const DEFAULT_MAX_BODY_CHARS = 1000000
 
 /**
  * Clip a string to a character budget, reporting whether it was cut.

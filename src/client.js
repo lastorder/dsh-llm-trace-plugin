@@ -815,6 +815,29 @@ window.__ModuleLoader__.load({
           return { __raw__: detail.response.bodyText }
         }, [detail, isSse])
         const treeValue = tab === 'request' ? requestBody : responseBody
+
+        // Why the JSON view fell back to a single `__raw__` blob.
+        //
+        // Overwhelmingly the reason is truncation: a body cut at the character
+        // cap stops mid-JSON, so it cannot parse. Saying that outright beats
+        // showing an unexplained `__raw__` key and letting the reader assume
+        // the plugin mangled their request.
+        const shownBody = detail === null
+          ? null
+          : (tab === 'request' ? detail.request : detail.response)
+        const bodyTruncated = shownBody !== null && shownBody !== undefined && shownBody.bodyTruncated === true
+        const rawFallback = treeValue !== null
+          && typeof treeValue === 'object'
+          && !Array.isArray(treeValue)
+          && Object.keys(treeValue).length === 1
+          && Object.prototype.hasOwnProperty.call(treeValue, '__raw__')
+        const bodyNotice = !rawFallback
+          ? null
+          : (bodyTruncated
+            ? '原始内容共 ' + fmtCount(shownBody.bodyChars) + ' 个字符，超出上限，只保留了前 '
+              + fmtCount((shownBody.bodyText || '').length) + ' 个字符。'
+              + '被截断的 JSON 无法解析，因此只能按原文显示；调高 maxBodyChars 可以保留更多。'
+            : '这段内容不是 JSON，按原文显示。')
         const showRaw = tab === 'response' && isSse && sseRaw
         // The raw view is now reachable only for SSE. Frame structure stays
         // verbatim and only each `data:` payload is re-indented, so what you
@@ -1069,14 +1092,26 @@ window.__ModuleLoader__.load({
                 ? h('div', { className: 'wt-empty', key: 'pending' }, '响应尚未到达（连接失败或仍在等待）。')
                 : showRaw
                   ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
-                  : h(JsonView, {
-                    key: 'json',
-                    value: treeValue,
-                    isOpen,
-                    longOpen,
-                    onToggle: toggle,
-                    onToggleLong: toggleLong,
-                  }),
+                  : h(React.Fragment, { key: 'json' }, [
+                    // Say why the structure is missing, rather than leaving a
+                    // bare `__raw__` key for the reader to decipher.
+                    bodyNotice === null
+                      ? null
+                      : h('div', { className: 'wt-jnotice', key: 'notice', style: { padding: '4px 12px' } }, bodyNotice),
+                    // Non-JSON content is shown as text. Wrapping it in a
+                    // synthetic `__raw__` object only dressed it up as JSON it
+                    // is not, and buried it one expand deep.
+                    rawFallback
+                      ? h('pre', { className: 'wt-sse', key: 'text' }, treeValue.__raw__ || '')
+                      : h(JsonView, {
+                        key: 'tree',
+                        value: treeValue,
+                        isOpen,
+                        longOpen,
+                        onToggle: toggle,
+                        onToggleLong: toggleLong,
+                      }),
+                  ].filter(Boolean)),
           ]),
         ])
       }

@@ -60,7 +60,7 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 | 配置项 | 默认值 | 含义 |
 |---|---|---|
 | `maxRecords` | `200` | 内存环形缓冲区大小；只在内存中保留最近的 N 条记录。 |
-| `maxBodyChars` | `200000` | 单个字段被截断前的字符上限。 |
+| `maxBodyChars` | `1000000` | 单个字段被截断前的字符上限。该值足以容纳一个完整的 agent 请求；从中间被截断的 JSON 无法解析，查看器只能按原文显示。 |
 | `routePrefix` | `/llm-wire-trace` | 本插件自身 HTTP 路由的前缀。 |
 | `persist` | `true` | 将记录写入磁盘，使其在重启后依然存在。设为 `false` 则只保留在内存中。 |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | 记录文件的存放目录。 |
@@ -73,7 +73,7 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
       name: dsh-llm-trace-plugin
       config:
         maxRecords: 500
-        maxBodyChars: 500000
+        maxBodyChars: 2000000
         maxPersistedRecords: 5000
 ```
 
@@ -110,6 +110,10 @@ $DSH_HOME/llm-wire-trace/records/<startedAt 毫秒>-<毫秒内序号>-<随机串
 文件以缩进格式写入，并且每个 body 都存两份：线路上逐字捕获的 `bodyText`，以及紧挨着它的、已解析的 `bodyJson`。只有 `bodyText` 是不够的 —— 它本身是一个 JSON **字符串**，落到磁盘上就是一行超长的转义文本（`\"role\":\"user\"`），任何编辑器都没法好好显示；有了解析副本，`messages`、工具定义和响应对象就能以真正的嵌套 JSON 展开。
 
 `bodyJson` 只是派生出来的便利副本，绝不是事实来源：读取时永远从 `bodyText` 重新解析，因此磁盘上一份过期的、甚至被手工改过的解析结果，都不可能影响查看器显示的内容。在它帮不上忙的情况下会被省略 —— body 被截断、值不是对象或数组，以及 SSE 响应（它是帧序列，不是单个 JSON 值，这与捕获时的规则完全一致）。代价是 body 的字节数大约翻倍。
+
+### 磁盘占用
+
+一个真实的 agent 请求会携带文件内容和工具历史，体积可达几十万字符，而每个 body 都会存两份（原文 + 解析后）。因此一条大记录约 1MB，在默认保留 500 条的上限下，最坏情况下该目录约为几百 MB —— 实际通常远小于此，因为多数调用要小得多。如果这对你的机器有影响，可以调低 `maxPersistedRecords`、`maxBodyChars`，或两者都调。
 
 ### 代价，明说
 
