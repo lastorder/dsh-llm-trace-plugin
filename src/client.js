@@ -269,6 +269,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Reduce a session id to its shortest still-distinguishing form.
+     *
+     * Session ids are `session-<uuid>` (and, from the agent loop,
+     * `<id>-session-<uuid>`), so a naive `slice(0, 8)` returns the literal
+     * constant `session-` — identical for every session, which is exactly
+     * the opposite of what a short label is for. Drop the boilerplate
+     * prefix, then keep the leading part of what actually varies.
+     *
+     * @param {string} sessionId - a full session id.
+     * @returns {string} a short label that differs between sessions.
+     */
+    function shortSessionId(sessionId) {
+      const text = String(sessionId)
+      // Take whatever follows the LAST 'session-' marker, which handles both
+      // `session-<uuid>` and the loop's `<id>-session-<uuid>`.
+      const marker = text.lastIndexOf('session-')
+      const distinct = marker === -1 ? text : text.slice(marker + 'session-'.length)
+      // Fall back to the raw id if stripping left nothing to show.
+      const body = distinct.length > 0 ? distinct : text
+      return body.slice(0, 8)
+    }
+
+    /**
      * Short attribution marker for a row in the unfiltered list: which session
      * this wire call belonged to, relative to the one being viewed. A foreign
      * session shows a truncated id purely so two different foreign sessions
@@ -280,7 +303,7 @@ window.__ModuleLoader__.load({
     function sessionLabel(sessionId, currentSessionId) {
       if (sessionId === null || sessionId === undefined || sessionId === '') return '无 session'
       if (sessionId === currentSessionId) return '本 session'
-      return 'session ' + sessionId.slice(0, 8)
+      return 'session ' + shortSessionId(sessionId)
     }
 
     /**
@@ -1067,7 +1090,7 @@ window.__ModuleLoader__.load({
               }
               if (detail.sessionId) {
                 parts.push(h('span', { className: 'wt-coord-sep', key: 's3' }))
-                parts.push(coord('Session', String(detail.sessionId).slice(0, 8), '完整 session id：' + detail.sessionId))
+                parts.push(coord('Session', shortSessionId(detail.sessionId), '完整 session id：' + detail.sessionId))
               }
               return h('div', { className: 'wt-coords', key: 'coords' }, parts)
             })(),
