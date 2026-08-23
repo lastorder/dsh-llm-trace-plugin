@@ -1,0 +1,11 @@
+# Host row for the wire-level LLM trace recorder. It patches globalThis.fetch
+# (a real process-wide side effect, restored on unload/stop) and registers one
+# prefix route on the web server. It publishes no Cordis service, so it
+# belongs to the host composition plane and needs no isolate realm.
+- insert:
+    - id: llm-wire-trace
+      name: dsh-llm-trace-plugin
+      # config:
+      #   maxRecords: 200       # ring-buffer size
+      #   maxBodyChars: 200000  # per-field character cap before truncation
+      #   routePrefix: /llm-wire-trace

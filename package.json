@@ -1,0 +1,50 @@
+{
+  "name": "dsh-llm-trace-plugin",
+  "version": "0.1.0",
+  "description": "Capture the literal HTTP request/response of every LLM provider call (by patching globalThis.fetch) and show them in a Wire Trace session tab",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lastorder/dsh-llm-trace-plugin.git"
+  },
+  "homepage": "https://github.com/lastorder/dsh-llm-trace-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/lastorder/dsh-llm-trace-plugin/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "llm",
+    "trace",
+    "debugging"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
