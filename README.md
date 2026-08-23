@@ -17,7 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 Pin an exact version:
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.1
+dsh plugin --profile web add dsh-llm-trace-plugin@0.1.2
 ```
 
 Or install straight from git:
@@ -30,7 +30,7 @@ Pin a branch or tag with a fragment:
 
 ```sh
 dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.1
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.2
 ```
 
 For local development, link a checkout (a relative path is anchored to the directory you ran `dsh` from, not the profile directory):
