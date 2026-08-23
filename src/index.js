@@ -6,8 +6,33 @@
  * than a harness-level tracer would: instead of the normalized
  * `GenerateOptions` / `StreamChunk` objects the harness builds
  * (provider-neutral, session/turn aware), it observes the actual bytes on the
- * wire (provider-native JSON field names, raw SSE frames), with no harness
- * concepts at all.
+ * wire (provider-native JSON field names, raw SSE frames).
+ *
+ * Those bytes carry almost no harness identity — `dsh-llm-deepseek` puts the
+ * session id on the wire and nothing else, and `dsh-llm-pi-ai` puts nothing at
+ * all. So the harness coordinates a reader actually wants (which turn? which
+ * step? was this a real conversation call or a background title generation?)
+ * are ATTACHED here rather than read off the wire, by observing two harness
+ * channels and binding them to the exact call in flight:
+ *
+ *   - `llm/stream` — the waterfall around every model call. Its `options`
+ *     carries `sessionId`, `provider`, `model`, and `purpose`. The listener
+ *     pulls the inner stream inside an `AsyncLocalStorage.run`, ON EVERY PULL,
+ *     so the adapter's `fetch` — which happens on the first pull — observes
+ *     exactly the context of its own call. Wrapping only the construction of
+ *     the iterable would NOT work: an async generator's body runs on the
+ *     consumer's tick, so the context would be gone by the time the body ran.
+ *   - `session/event` — `step/start` / `step/end` / `turn/start` / `turn/end`
+ *     give the current turn and step per session. The loop appends
+ *     `step/start` before the model call and `step/end` after it, so the
+ *     step in force when a call begins is that call's step.
+ *
+ * The binding is exact, not a time-window guess: concurrent calls (a live turn
+ * plus a background `session-title` request on the SAME session) each see
+ * their own context, because each rides its own async-context branch. A call
+ * that reaches the wire with no such context — anything not made through
+ * `ctx.llm` — is recorded with null coordinates and reported as unattributed,
+ * never assigned a plausible-looking owner.
  *
  * This ONLY works as an installed package. A dynamic Cordis Host package runs
  * its code inside an isolated `node:vm` realm whose `globalThis` is not the
@@ -22,8 +47,85 @@
  * @module dsh-llm-trace-plugin
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
+
 /** Marks every provider request via dsh-llm's attributionHeaders(); see APP_IDENTITY.product. */
 const USER_AGENT_PREFIX = 'deepseek-harness/'
+
+/**
+ * Request header `dsh-llm-deepseek` stamps with the harness SessionId of the
+ * request's owning session — the ONLY harness identity that reaches the wire.
+ *
+ * It remains a useful fallback, but it is no longer the primary source: the
+ * `llm/stream` listener supplies the session id (plus turn, step, provider,
+ * model, and purpose) for every call made through `ctx.llm`, including
+ * `dsh-llm-pi-ai` calls, which put nothing on the wire at all. This header is
+ * read only when that context is absent.
+ */
+const SESSION_HEADER = 'x-deepseek-harness-session-id'
+
+/**
+ * Async-context channel carrying the harness identity of the model call
+ * currently in flight, so the patched `fetch` can stamp a wire record with
+ * coordinates that never appear on the wire itself. Written by the
+ * `llm/stream` listener, read by `wrapFetch`. Empty for any request not made
+ * through `ctx.llm`.
+ */
+const callContext = new AsyncLocalStorage()
+
+/**
+ * Track the live turn/step of every session by following the loop's own
+ * boundary events.
+ *
+ * The loop appends `step/start` immediately before a model call and `step/end`
+ * immediately after it (`dsh-agent-loop`), so a call that begins while a step
+ * is open belongs to that step. Between steps — and during auxiliary calls
+ * made outside any turn — the session has no open step, and this reports null
+ * rather than the most recently seen one: "the last step we saw" is exactly
+ * the kind of plausible-looking wrong answer this plugin must never give.
+ *
+ * @returns {{ observe: (sessionId: string, event: object) => void, current: (sessionId: string) => { turn: number | null, step: number | null }, forget: (sessionId: string) => void, size: () => number }}
+ */
+export function createStepTracker() {
+  /** sessionId -> the currently OPEN coordinates (never a stale, closed one). */
+  const open = new Map()
+  const at = (sessionId) => open.get(sessionId) ?? { turn: null, step: null }
+
+  return {
+    observe(sessionId, event) {
+      if (typeof sessionId !== 'string') return
+      if (event === null || typeof event !== 'object') return
+      const data = event.data ?? {}
+      switch (event.type) {
+        case 'turn/start':
+          open.set(sessionId, { turn: data.turn ?? null, step: null })
+          break
+        case 'step/start':
+          open.set(sessionId, { turn: data.turn ?? null, step: data.step ?? null })
+          break
+        case 'step/end':
+          // Keep the still-open turn, drop the closed step, so a call landing
+          // between two steps is not misattributed to the one that just ended.
+          open.set(sessionId, { turn: at(sessionId).turn, step: null })
+          break
+        case 'turn/end':
+          open.delete(sessionId)
+          break
+        default:
+          break
+      }
+    },
+    current(sessionId) {
+      return at(sessionId)
+    },
+    forget(sessionId) {
+      open.delete(sessionId)
+    },
+    size() {
+      return open.size
+    },
+  }
+}
 
 const DEFAULT_MAX_RECORDS = 200
 const DEFAULT_MAX_BODY_CHARS = 200000
@@ -147,6 +249,12 @@ export function createWireTraceStore(options) {
       method: record.request.method,
       url: record.request.url,
       model: record.model,
+      sessionId: record.sessionId,
+      turn: record.turn,
+      step: record.step,
+      purpose: record.purpose,
+      provider: record.provider,
+      attributed: record.attributed,
       responseStatus: record.response ? record.response.status : null,
       requestChars: record.request.bodyChars,
       responseChars: record.response ? record.response.bodyChars : 0,
@@ -169,6 +277,11 @@ export function createWireTraceStore(options) {
       seq += 1
       const info = describeRequest(input, init)
       const bodyClip = clip(info.bodyText || '', maxBodyChars)
+      // Harness identity of the call this fetch belongs to. Present for every
+      // call made through `ctx.llm`; absent for anything else, which is then
+      // honestly recorded as unattributed rather than guessed at.
+      const call = callContext.getStore() ?? null
+      const headerSessionId = info.headers[SESSION_HEADER] ?? null
       const record = {
         id: `w${seq}`,
         startedAt: Date.now(),
@@ -176,6 +289,22 @@ export function createWireTraceStore(options) {
         durationMs: null,
         status: 'streaming',
         model: (tryParseJson(info.bodyText) || {}).model ?? null,
+        // Prefer the async-context session id (works for every provider,
+        // including pi-ai) and fall back to the wire header.
+        sessionId: (call && call.sessionId) ?? headerSessionId,
+        // Harness coordinates that are NOT on the wire. `null` means "not
+        // known", never "0" and never a carried-over previous value.
+        turn: call && typeof call.turn === 'number' ? call.turn : null,
+        step: call && typeof call.step === 'number' ? call.step : null,
+        // Why this call was made: an ordinary conversation step, or a
+        // background auxiliary call the user never asked for directly.
+        purpose: (call && call.purpose) ?? null,
+        // Harness-side route identity, which the wire URL alone cannot give.
+        provider: (call && call.provider) ?? null,
+        requestedModel: (call && call.model) ?? null,
+        // True when this call came through `ctx.llm` at all — the difference
+        // between "we know it had no turn" and "we know nothing about it".
+        attributed: call !== null,
         request: {
           method: info.method,
           url: info.url,
@@ -254,12 +383,58 @@ export function createWireTraceStore(options) {
   return {
     records,
     wrapFetch,
-    list(limit) {
+    /**
+     * List record summaries, newest first, optionally narrowed to one session.
+     *
+     * The filter is applied BEFORE the `limit` window, not after: windowing
+     * first would let a busy neighbouring session's traffic push this
+     * session's records out of the page, so a quiet session could show an
+     * empty list while its records were still held in the store.
+     *
+     * @param {{ limit?: number, sessionId?: string }} [options]
+     * @returns {{ items: object[], total: number, matched: number, unattributed: number }}
+     *   `total` is every record held; `matched` is how many passed the filter
+     *   (equal to `total` when unfiltered); `unattributed` counts records that
+     *   reached the wire with no session identity, so the caller can report
+     *   them instead of letting them vanish silently behind the filter.
+     */
+    list(options) {
+      const settings = typeof options === 'number' ? { limit: options } : (options ?? {})
+      const limit = settings.limit
+      const wanted = typeof settings.sessionId === 'string' && settings.sessionId.length > 0
+        ? settings.sessionId
+        : null
       const cap = typeof limit === 'number' && limit > 0 ? Math.min(limit, 1000) : 300
-      const page = records.slice(Math.max(0, records.length - cap))
+
+      let unattributed = 0
+      for (const record of records) if (record.sessionId === null) unattributed += 1
+
+      const matching = wanted === null ? records : records.filter((record) => record.sessionId === wanted)
+      const page = matching.slice(Math.max(0, matching.length - cap))
       const items = []
       for (let i = page.length - 1; i >= 0; i -= 1) items.push(summary(page[i]))
-      return { items, total: records.length }
+
+      // Per-turn breakdown of what is actually being shown, so the viewer can
+      // group rows and label each turn without re-deriving it in the browser.
+      // Auxiliary calls (a background title/compaction request) have no turn
+      // and are counted separately rather than folded into turn 0.
+      const turnMap = new Map()
+      let auxiliary = 0
+      for (const record of page) {
+        if (record.turn === null) {
+          if (record.purpose !== null) auxiliary += 1
+          continue
+        }
+        const entry = turnMap.get(record.turn) ?? { turn: record.turn, calls: 0, steps: new Set() }
+        entry.calls += 1
+        if (record.step !== null) entry.steps.add(record.step)
+        turnMap.set(record.turn, entry)
+      }
+      const turns = [...turnMap.values()]
+        .sort((a, b) => b.turn - a.turn)
+        .map((entry) => ({ turn: entry.turn, calls: entry.calls, steps: entry.steps.size }))
+
+      return { items, total: records.length, matched: matching.length, unattributed, turns, auxiliary }
     },
     get(id) {
       for (let i = records.length - 1; i >= 0; i -= 1) if (records[i].id === id) return records[i]
@@ -482,6 +657,86 @@ export function apply(ctx, config) {
 
   ctx.effect(() => installFetchPatch(store), 'llm-wire-trace: fetch patch')
 
+  // ------------------------------------------------------------------
+  // Harness-coordinate correlation (turn / step / purpose / provider).
+  //
+  // Nothing here modifies dsh: both channels are ordinary, publicly
+  // documented plugin extension points, and both are strictly observational.
+  // The `llm/stream` listener is a waterfall member that MUST pass the stream
+  // through untouched — it yields exactly the chunks it receives, in order,
+  // and adds only an async-context binding around each pull.
+  // ------------------------------------------------------------------
+
+  const tracker = createStepTracker()
+
+  // Follow turn/step boundaries. Optional service: with no `sessions` service
+  // the plugin still records everything, just without turn/step coordinates.
+  if (ctx.get('sessions') !== undefined) {
+    ctx.on('session/event', (session, event) => {
+      try {
+        tracker.observe(String(session.id), event)
+      } catch {
+        // Observation must never destabilize the session feed.
+      }
+    })
+    ctx.on('session/disposed', (session) => {
+      try {
+        tracker.forget(String(session.id))
+      } catch {
+        // ignore
+      }
+    })
+  }
+
+  // Bind each model call's identity to its own async-context branch.
+  if (ctx.get('llm') !== undefined) {
+    ctx.on('llm/stream', (options, next) => {
+      const sessionId = options.sessionId === undefined ? null : String(options.sessionId)
+      const purpose = options.purpose ?? null
+      // Read the OPEN step at call time, not at chunk time: by the time later
+      // chunks arrive the step may already have closed.
+      //
+      // A purposed call (background title generation, compaction) is NOT part
+      // of the conversation loop even when it happens to overlap a live turn
+      // on the same session, so it deliberately takes no turn/step. Letting it
+      // inherit the ambient turn is precisely the misattribution this design
+      // exists to avoid.
+      const at = sessionId === null || purpose !== null
+        ? { turn: null, step: null }
+        : tracker.current(sessionId)
+      const bound = {
+        sessionId,
+        turn: at.turn,
+        step: at.step,
+        purpose,
+        provider: options.provider ?? null,
+        model: options.model ?? null,
+      }
+
+      const inner = next()
+      // Re-enter the context on EVERY pull. Wrapping only `next()` would bind
+      // nothing useful: an async generator's body runs on the consumer's tick,
+      // so the adapter's fetch — which happens on the first pull — would see
+      // an empty context. Verified behaviour, not an assumption.
+      return (async function* boundStream() {
+        const iterator = inner[Symbol.asyncIterator]()
+        try {
+          while (true) {
+            const result = await callContext.run(bound, () => iterator.next())
+            if (result.done) return
+            yield result.value
+          }
+        } finally {
+          // Propagate early consumer termination to the wrapped stream, so
+          // aborting a turn still tears the provider stream down.
+          if (typeof iterator.return === 'function') {
+            await callContext.run(bound, () => iterator.return(undefined))
+          }
+        }
+      })()
+    })
+  }
+
   ctx.effect(() =>
     ctx.webServer.register({
       kind: 'prefix',
@@ -492,7 +747,14 @@ export function apply(ctx, config) {
         try {
           if (method === 'list') {
             const limitRaw = Number(url.searchParams.get('limit'))
-            sendJson(res, 200, store.list(Number.isFinite(limitRaw) ? limitRaw : undefined))
+            // An absent or empty `sessionId` means "no filter", so a client
+            // that has no session id yet degrades to the full list rather
+            // than silently matching nothing.
+            const sessionId = url.searchParams.get('sessionId') ?? ''
+            sendJson(res, 200, store.list({
+              limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
+              sessionId,
+            }))
             return
           }
           if (method === 'get') {

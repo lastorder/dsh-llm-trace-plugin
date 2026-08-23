@@ -104,6 +104,11 @@ Each record:
   id, startedAt, endedAt, durationMs,
   status: 'ok' | 'http-error' | 'transport-error' | 'streaming',
   model,                          // best-effort, read from the parsed request body
+  sessionId,                      // owning session, or null when unattributable
+  turn, step,                     // harness coordinates; null when not applicable
+  purpose,                        // 'session-title' | 'compaction' | null
+  provider, requestedModel,       // resolved harness route
+  attributed,                     // whether this call came through ctx.llm at all
   request:  { method, url, headers /* redacted */, bodyText, bodyJson, bodyTruncated },
   response: { status, statusText, headers, contentType, bodyText, bodyJson, bodyTruncated } | null,
   error: { name, message } | null,
@@ -111,7 +116,7 @@ Each record:
 ```
 
 - `bodyText` is always the raw string (SSE frames verbatim, or a JSON error body). `bodyJson` is a best-effort parse for the JSON view; SSE bodies are never JSON-parsed as a whole (they're a frame sequence, not one JSON value).
-- No `sessionId` / `turn` / `step` — this layer doesn't have them. Records are ordered purely by time.
+- `sessionId` / `turn` / `step` / `purpose` are **not read off the wire** — the wire barely carries them. They are attached by observing two harness channels; see [Harness coordinates](#harness-coordinates-turn--step).
 - Body fields are capped and the ring buffer holds only the most recent records; both are configurable (see [Configuration](#configuration)).
 
 ## The viewer
@@ -130,6 +135,52 @@ A folded container collapses to a one-line placeholder that keeps its trailing c
 Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is parsed into one object per SSE frame so the whole stream reads as a JSON array (see below).
 
 > The in-app button labels are currently Chinese; the English names below are given alongside them.
+
+### Harness coordinates (turn / step)
+
+The wire tells you *what bytes were sent*. It does not tell you **which turn of the conversation this was, which step within that turn, or whether the user ever asked for this call at all**. Those are the questions a reader actually has, and almost none of that reaches the wire: `dsh-llm-deepseek` sends only a session-id header, and `dsh-llm-pi-ai` sends nothing.
+
+So this plugin *attaches* them, using two ordinary, public plugin extension points. **No dsh source is modified.** Both channels are strictly observational.
+
+**1. `llm/stream` — which call is this?**
+A waterfall around every model call, whose `options` carry `sessionId`, `provider`, `model`, and `purpose`. The listener pulls the wrapped stream inside an `AsyncLocalStorage.run` **on every pull**, so the adapter's `fetch` observes exactly its own call's identity. It yields the chunks it receives, in order, and changes nothing else.
+
+> Wrapping only the *construction* of the stream would capture nothing: an async generator's body runs on the consumer's tick, so the context would already be gone by the time the adapter's `fetch` ran. This is verified behaviour, not an assumption.
+
+**2. `session/event` — which turn and step?**
+The loop appends `step/start` immediately *before* a model call and `step/end` immediately *after* it, so the step open when a call begins is that call's step. Between steps the plugin reports `null` rather than the step that just closed.
+
+### Why this is exact, not a guess
+
+Each call rides its own async-context branch, so **concurrent calls never contaminate each other** — including the case that defeats naive time-window correlation: a background `session-title` request firing on the *same session* while a turn is live. A purposed call (`session-title`, `compaction`) is deliberately given **no turn/step at all**, because it is not part of the conversation loop even when it overlaps one.
+
+A call that never went through `ctx.llm` is recorded with `attributed: false` and null coordinates — reported as unattributed, never given a plausible-looking owner.
+
+### What you see
+
+- Each row leads with its coordinate: `T1·S0`, or a purpose label (后台辅助调用), or 无归属.
+- Rows are grouped under sticky per-turn headers showing that turn's call and step counts.
+- The selected record shows a coordinate strip (Turn / Step / Provider / Session) above the body.
+- The toolbar summarises `… · N turn · N 辅助`.
+
+### Requirements
+
+Needs the `sessions` and `llm` services. Both are optional: without them capture still works, just without coordinates.
+
+## Filtering by session
+
+The tab opens showing only the current session's calls. A toolbar button switches between **当前 Session** (current session) and **全部 Session** (all records).
+
+The filter matches the record's `sessionId`, which comes from the `llm/stream` context described above (falling back to the `x-deepseek-harness-session-id` header when a call did not go through `ctx.llm`). Because the primary source is the harness call itself rather than the wire, **this works for every provider, including pi-ai routes that put nothing on the wire at all.** Filtering happens on the host side, so other sessions' request and response bodies are never sent to the browser.
+
+Two consequences worth knowing:
+
+- **Not every call is attributable.** A request that never went through `ctx.llm` has no session. Those records are hidden under the filter, but never silently: the list footer reports how many exist and points at **全部 Session**. There, each row is tagged 本 session / session `<id prefix>` / 无 session.
+- **Subagents are separate sessions.** A subagent's LLM calls carry its own session id, so they do not appear in the parent session's filtered view. Switch to **全部 Session** to see them.
+
+**清空** (Clear) is unaffected by the filter — it always empties the whole store.
+
+As a safety net, if the first load finds nothing attributable to this session while unattributed records exist, the tab falls back to **全部 Session** and says why. This fires at most once, and touching the toggle yourself disables it.
 
 ### Response: SSE as a JSON array
 

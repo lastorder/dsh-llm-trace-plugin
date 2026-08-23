@@ -104,6 +104,11 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持三个
   id, startedAt, endedAt, durationMs,
   status: 'ok' | 'http-error' | 'transport-error' | 'streaming',
   model,                          // 尽力而为，从解析后的请求体中读取
+  sessionId,                      // 所属 session；无法归属时为 null
+  turn, step,                     // harness 坐标；不适用时为 null
+  purpose,                        // 'session-title' | 'compaction' | null
+  provider, requestedModel,       // 解析到的 harness 路由
+  attributed,                     // 这次调用是否经过了 ctx.llm
   request:  { method, url, headers /* 已脱敏 */, bodyText, bodyJson, bodyTruncated },
   response: { status, statusText, headers, contentType, bodyText, bodyJson, bodyTruncated } | null,
   error: { name, message } | null,
@@ -111,7 +116,7 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持三个
 ```
 
 - `bodyText` 始终是原始字符串（逐字保留的 SSE 帧，或 JSON 错误体）。`bodyJson` 是为 JSON 视图做的尽力解析；SSE 响应体永远不会被作为整体去 JSON 解析（它是一个帧序列，而不是单个 JSON 值）。
-- 没有 `sessionId` / `turn` / `step` —— 这一层没有这些概念。记录纯粹按时间排序。
+- `sessionId` / `turn` / `step` / `purpose` **不是从线路上读到的** —— 线路上几乎没有这些信息。它们是通过观测两个 harness 通道后附加上去的，见 [harness 坐标](#harness-坐标turn--step)。
 - 响应体字段有字符上限，环形缓冲区也只保留最近的若干条；两者都可配置（见[配置](#配置)）。
 
 ## 查看器
@@ -130,6 +135,52 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持三个
 包含 Request 和 Response 两个标签页。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体会被按帧解析成一个个对象，使整条流读起来就是一个 JSON 数组（见下）。
 
 > 应用内的按钮文案目前是中文。
+
+### harness 坐标（turn / step）
+
+线路只能告诉你**发出了哪些字节**，回答不了真正关心的问题：**这是第几轮对话？是这一轮里的第几步？这次调用究竟是不是用户要的？** 而这些信息几乎都不在线路上 —— `dsh-llm-deepseek` 只发一个 session-id 头，`dsh-llm-pi-ai` 什么都不发。
+
+所以本插件通过两个公开的插件扩展点把它们**附加**上去。**不修改 dsh 任何源码**，两个通道都是纯观测。
+
+**1. `llm/stream` —— 这是哪一次调用？**
+它是包裹每次模型调用的 waterfall，其 `options` 带有 `sessionId`、`provider`、`model` 和 `purpose`。监听器在 `AsyncLocalStorage.run` 里**逐次拉取**被包裹的流，因此适配器的 `fetch` 看到的正是它自己那次调用的身份。它原样按序 yield 收到的 chunk，不改变任何其他行为。
+
+> 只包裹流的**构造**是抓不到东西的：异步生成器的函数体运行在消费者的 tick 上，等适配器真正发 `fetch` 时上下文早就没了。这一点是实测验证过的，不是假设。
+
+**2. `session/event` —— 这是第几轮第几步？**
+循环会在模型调用**之前**追加 `step/start`、**之后**追加 `step/end`，所以一次调用开始时处于打开状态的 step 就是它所属的 step。两个 step 之间，插件报告 `null`，而不是刚刚结束的那个。
+
+#### 为什么这是精确的，而不是猜的
+
+每次调用各自处在自己的异步上下文分支上，因此**并发调用之间不会互相污染** —— 包括那个足以击垮朴素时间窗关联的场景：一次 turn 正在进行时，**同一个 session** 上并发触发的后台 `session-title` 请求。带 `purpose` 的调用（`session-title`、`compaction`）会被刻意**完全不赋予 turn/step**，因为即使它和某轮对话在时间上重叠，它也不属于对话循环。
+
+没有经过 `ctx.llm` 的调用会被记为 `attributed: false` 且坐标为 null —— 如实报告为无归属，绝不给它安一个看起来合理的主人。
+
+#### 页面上怎么呈现
+
+- 每行以坐标开头：`T1·S0`，或用途标签（后台辅助调用），或「无归属」。
+- 行按 turn 分组，组头吸顶，并显示该轮的调用数与 step 数。
+- 选中的记录在正文上方有一条坐标条（Turn / Step / Provider / Session）。
+- 工具栏汇总 `… · N turn · N 辅助`。
+
+#### 依赖
+
+需要 `sessions` 与 `llm` 服务。两者都是可选的：没有它们时抓包照常工作，只是没有坐标。
+
+### 按 session 过滤
+
+标签页打开时默认只显示**当前 session** 的调用。工具栏上有一个按钮，可在「当前 Session」与「全部 Session」之间一键切换。
+
+过滤依据是记录上的 `sessionId`，它来自上面说的 `llm/stream` 上下文（若某次调用没走 `ctx.llm`，则回退到 `x-deepseek-harness-session-id` 请求头）。由于主要来源是 harness 调用本身而不是线路，**它对所有 provider 都有效，包括线路上什么都不带的 pi-ai 路线。** 过滤在宿主端完成，因此其他 session 的请求/响应体根本不会传到浏览器。
+
+有两点值得注意：
+
+- **并非每次调用都能归属。** 没有经过 `ctx.llm` 的请求没有 session。这些记录在过滤下会被隐藏，但绝不会悄无声息：列表底部会写明还有多少条，并指向「全部 Session」。在那里，每一行都会标注 本 session / session `<id 前缀>` / 无 session。
+- **子代理是独立的 session。** 子代理的 LLM 调用带的是它自己的 session id，因此不会出现在父会话的过滤视图里。切到「全部 Session」即可看到。
+
+「清空」不受过滤影响 —— 它始终清空全部记录。
+
+作为兜底：如果首次加载发现本 session 一条可归属记录都没有、却存在无归属记录，就会自动回退到「全部 Session」并说明原因。该回退最多发生一次，你只要自己动过那个开关，它就不再生效。
 
 ### Response：把 SSE 显示为 JSON 数组
 
@@ -176,6 +227,8 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持三个
 ## 已知限制
 
 本插件依赖于这样一个实现细节：当前所有的提供方适配器都调用裸的、未经 import 的 `fetch`。如果未来某个适配器改用自带的 HTTP 客户端（例如某个 SDK 内置了自己的 `undici` 实例），它对本补丁就是不可见的 —— 而且是静默不可见，不会报错。这是 fetch 补丁这一方案的固有局限，而非本插件的缺陷。
+
+harness 坐标（turn / step）另有一层不同的依赖：它们来自 `llm/stream` 与 `session/event` 两个通道，而不是 fetch。因此**不经过 `ctx.llm` 的调用可以被抓包、却无法被归属**（记为 `attributed: false`）；反过来，某个绕开裸 `fetch` 的适配器会同时丢失抓包与坐标。两者都属于如实报告的缺口，不会被猜测填补。
 
 ## 仓库结构
 

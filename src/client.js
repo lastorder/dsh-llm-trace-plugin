@@ -101,6 +101,22 @@ window.__ModuleLoader__.load({
       '.wt-jcopy:hover{color:var(--dsw-alias-label-primary)}',
       '.wt-jnotice{padding:6px 12px;color:var(--shiki-token-comment);font-size:11px}',
       '.wt-sse{flex:1;min-height:0;margin:0;padding:12px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:var(--ds-font-family-code);font-size:12px;line-height:19px;background:var(--dsw-alias-markdown-code-block)}',
+      // ---- turn/step presentation ----
+      // A sticky group header so a long list still tells you which turn you
+      // are looking at while scrolling.
+      '.wt-turn{position:sticky;top:0;z-index:1;display:flex;align-items:center;gap:8px;padding:5px 10px;background:var(--dsw-alias-bg-layer-2);border-bottom:1px solid var(--dsw-alias-border-l2);border-top:1px solid var(--dsw-alias-border-l2);font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.wt-turn-n{font-weight:600;color:var(--dsw-alias-label-primary)}',
+      '.wt-turn-meta{margin-left:auto}',
+      // The step coordinate: monospaced so digits line up down the column.
+      '.wt-step{font-family:var(--ds-font-family-code);font-size:11px;flex:none;border-radius:4px;padding:0 5px;line-height:16px;border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary)}',
+      '.wt-step[data-k="step"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}',
+      '.wt-step[data-k="aux"]{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}',
+      '.wt-step[data-k="none"]{opacity:.6}',
+      // Detail-pane coordinate strip: the same facts, always visible above the body.
+      '.wt-coords{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.wt-coord{display:flex;align-items:baseline;gap:4px}',
+      '.wt-coord b{font-weight:600;color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code);font-size:12px}',
+      '.wt-coord-sep{width:1px;height:12px;background:var(--dsw-alias-border-l2)}',
     ].join('\n')
 
     function insertStyles() {
@@ -250,6 +266,73 @@ window.__ModuleLoader__.load({
 
     function fmtCount(n) {
       return n.toLocaleString('en-US')
+    }
+
+    /**
+     * Short attribution marker for a row in the unfiltered list: which session
+     * this wire call belonged to, relative to the one being viewed. A foreign
+     * session shows a truncated id purely so two different foreign sessions
+     * stay visibly distinct — it is a label, never something to match on.
+     * @param {string | null | undefined} sessionId - the record's captured session id.
+     * @param {string | null} currentSessionId - the session this tab is rendered for.
+     * @returns {string} a display label.
+     */
+    function sessionLabel(sessionId, currentSessionId) {
+      if (sessionId === null || sessionId === undefined || sessionId === '') return '无 session'
+      if (sessionId === currentSessionId) return '本 session'
+      return 'session ' + sessionId.slice(0, 8)
+    }
+
+    /**
+     * Human label for a call's `purpose`: why the harness made this request
+     * at all. An ordinary conversation step has none.
+     * @param {string | null | undefined} purpose
+     * @returns {string | null} a label, or null for an ordinary step.
+     */
+    function purposeLabel(purpose) {
+      if (purpose === 'session-title') return '标题生成'
+      if (purpose === 'compaction') return '上下文压缩'
+      if (typeof purpose === 'string' && purpose.length > 0) return purpose
+      return null
+    }
+
+    /**
+     * The compact turn/step coordinate shown on a list row.
+     *
+     * Three distinct states, deliberately never collapsed into one another:
+     *   - an ordinary loop call    -> `T1·S0`
+     *   - a purposed auxiliary call -> its purpose label (it has no step, by
+     *     design: it is not part of the conversation loop)
+     *   - a call the plugin could not attribute at all -> `无归属`
+     * @param {object} item - a list-row summary.
+     * @returns {{ text: string, kind: 'step' | 'aux' | 'none', title: string }}
+     */
+    function stepBadge(item) {
+      const aux = purposeLabel(item.purpose)
+      if (aux !== null) {
+        return {
+          text: aux,
+          kind: 'aux',
+          title: '后台辅助调用（' + aux + '），不属于任何一次对话 turn，因此没有 step 坐标。',
+        }
+      }
+      if (typeof item.turn === 'number' && typeof item.step === 'number') {
+        return {
+          text: 'T' + item.turn + '·S' + item.step,
+          kind: 'step',
+          title: '第 ' + item.turn + ' 轮对话的第 ' + item.step + ' 步（一个 step = 一次模型调用）。',
+        }
+      }
+      if (typeof item.turn === 'number') {
+        return { text: 'T' + item.turn, kind: 'step', title: '第 ' + item.turn + ' 轮对话，调用发生在两个 step 之间。' }
+      }
+      return {
+        text: '无归属',
+        kind: 'none',
+        title: item.attributed === false
+          ? '这次请求没有经过 ctx.llm，插件无法确定它属于哪一轮对话。'
+          : '这次调用发生在任何 turn 之外。',
+      }
     }
 
     function statusKind(status) {
@@ -514,10 +597,27 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     function createWireTraceView(ctx) {
-      return function WireTraceView() {
+      /**
+       * `conversation.view` is a session-scoped slot, so the framework passes
+       * the current session's id as a standard prop (the same channel
+       * ui-trajectory reads). That id is what the session filter matches
+       * against the `x-deepseek-harness-session-id` header the host half
+       * captured off the wire.
+       */
+      return function WireTraceView(props) {
+        const currentSessionId = (props && props.sessionId) ? String(props.sessionId) : null
         const [auto, setAuto] = React.useState(true)
+        // Default to the current session: a wire trace opened from inside a
+        // session is almost always being read about THAT session. The toggle
+        // switches to the full store, which is the only place unattributed
+        // records and other sessions' records are visible.
+        const [onlySession, setOnlySession] = React.useState(true)
         const [items, setItems] = React.useState([])
         const [total, setTotal] = React.useState(0)
+        const [matched, setMatched] = React.useState(0)
+        const [unattributed, setUnattributed] = React.useState(0)
+        const [turns, setTurns] = React.useState([])
+        const [auxiliary, setAuxiliary] = React.useState(0)
         const [selected, setSelected] = React.useState(null)
         const [detail, setDetail] = React.useState(null)
         const [tab, setTab] = React.useState('request')
@@ -533,20 +633,50 @@ window.__ModuleLoader__.load({
         const [sseRaw, setSseRaw] = React.useState(false)
         const [curlBusy, setCurlBusy] = React.useState(false)
         const [curlNotice, setCurlNotice] = React.useState(null)
+        // One-shot escape hatch for a provider that never stamps the session
+        // header at all (pi-ai puts the id only in an SDK-local option, never
+        // on the wire). Under such a provider the default filter would match
+        // nothing forever, so the FIRST filtered load that finds no records of
+        // its own while unattributed ones exist falls back to the full list
+        // and says why. It fires at most once, and any manual use of the
+        // toggle disables it, so it can never fight the user's own choice.
+        const [autoFellBack, setAutoFellBack] = React.useState(false)
+        const fallbackUsed = React.useRef(false)
+
+        // A missing session id (shouldn't happen in a session-scoped slot)
+        // degrades to the unfiltered list rather than filtering against
+        // nothing and showing a permanently empty tab.
+        const filtering = onlySession && currentSessionId !== null
 
         React.useEffect(() => {
           let alive = true
-          apiGet('list', { limit: 300 }).then(
+          apiGet('list', { limit: 300, sessionId: filtering ? currentSessionId : undefined }).then(
             (result) => {
               if (!alive) return
-              setItems((result && result.items) || [])
+              const nextItems = (result && result.items) || []
+              const nextMatched = result && typeof result.matched === 'number' ? result.matched : 0
+              const nextUnattributed = result && typeof result.unattributed === 'number' ? result.unattributed : 0
+              // Nothing of our own, but traffic exists that simply never
+              // carried a session id: filtering is useless here, so show
+              // everything instead of an empty tab.
+              if (filtering && !fallbackUsed.current && nextMatched === 0 && nextUnattributed > 0) {
+                fallbackUsed.current = true
+                setAutoFellBack(true)
+                setOnlySession(false)
+                return
+              }
+              setItems(nextItems)
               setTotal(result ? result.total : 0)
+              setMatched(nextMatched)
+              setUnattributed(nextUnattributed)
+              setTurns((result && result.turns) || [])
+              setAuxiliary(result && typeof result.auxiliary === 'number' ? result.auxiliary : 0)
               setError(null)
             },
             (reason) => { if (alive) setError(String((reason && reason.message) || reason)) },
           )
           return () => { alive = false }
-        }, [tick])
+        }, [tick, filtering, currentSessionId])
 
         React.useEffect(() => {
           if (!auto) return undefined
@@ -685,6 +815,12 @@ window.__ModuleLoader__.load({
           },
           [
             h('div', { className: 'wt-row', key: 'r1' }, [
+              // The coordinate leads the row: "which call is this" is the
+              // first question a reader has, before model or status.
+              (() => {
+                const badge = stepBadge(item)
+                return h('span', { className: 'wt-step', 'data-k': badge.kind, key: 'st', title: badge.title }, badge.text)
+              })(),
               h('span', { className: 'wt-model', key: 'm' }, item.model || item.url),
               h('span', { className: 'wt-tag', 'data-k': statusKind(item.status), key: 's' }, item.status),
             ]),
@@ -697,9 +833,54 @@ window.__ModuleLoader__.load({
             h('div', { className: 'wt-sub', key: 'r3' }, [
               h('span', { key: 'req' }, item.requestChars + ' req chars'),
               h('span', { key: 'res' }, item.responseChars + ' resp chars'),
-            ]),
+              // Only meaningful while the list mixes sessions; under the
+              // filter every row is by definition the current session.
+              filtering ? null : h('span', {
+                key: 'sid',
+                title: item.sessionId === null || item.sessionId === undefined
+                  ? '该请求在线路上没有携带 session 标记。'
+                  : 'session ' + item.sessionId,
+              }, sessionLabel(item.sessionId, currentSessionId)),
+            ].filter(Boolean)),
           ],
         ))
+
+        // Insert a sticky group header whenever the turn changes going down
+        // the list (which is newest-first, so turns descend). Auxiliary and
+        // unattributed calls get their own group rather than being folded
+        // into whichever turn happens to sit next to them in time.
+        const groupKeyOf = (item) => {
+          if (purposeLabel(item.purpose) !== null) return 'aux'
+          if (typeof item.turn === 'number') return 'turn:' + item.turn
+          return 'none'
+        }
+        const groupHeader = (item) => {
+          const key = groupKeyOf(item)
+          if (key === 'aux') return { text: '后台辅助调用', meta: '不属于任何 turn' }
+          if (key === 'none') return { text: '无归属调用', meta: '未经过 ctx.llm' }
+          const stat = turns.find((entry) => entry.turn === item.turn)
+          return {
+            text: '第 ' + item.turn + ' 轮',
+            meta: stat === undefined
+              ? ''
+              : stat.calls + ' 次调用' + (stat.steps > 0 ? ' · ' + stat.steps + ' step' : ''),
+          }
+        }
+        const groupedRows = []
+        let lastGroup = null
+        for (let i = 0; i < items.length; i += 1) {
+          const item = items[i]
+          const key = groupKeyOf(item)
+          if (key !== lastGroup) {
+            const head = groupHeader(item)
+            groupedRows.push(h('div', { className: 'wt-turn', key: 'g:' + key }, [
+              h('span', { className: 'wt-turn-n', key: 'n' }, head.text),
+              head.meta === '' ? null : h('span', { className: 'wt-turn-meta', key: 'm' }, head.meta),
+            ].filter(Boolean)))
+            lastGroup = key
+          }
+          groupedRows.push(rows[i])
+        }
 
         return h('div', { className: 'wt-root' }, [
           h('div', { className: 'wt-left', key: 'left' }, [
@@ -717,7 +898,26 @@ window.__ModuleLoader__.load({
               }, auto ? '自动刷新' : '已暂停'),
               h('button', {
                 className: 'wt-btn',
+                key: 'scope',
+                'data-on': filtering ? '1' : '0',
+                disabled: currentSessionId === null,
+                title: currentSessionId === null
+                  ? '拿不到当前 session id，只能显示全部记录。'
+                  : (filtering
+                    ? '当前只显示本 session 的 provider 调用。点击查看全部记录（含其他 session 和无 session 标记的调用）。'
+                    : '当前显示全部记录。点击只看本 session。'),
+                onClick: () => {
+                  if (currentSessionId === null) return
+                  // An explicit choice ends the automatic fallback for good.
+                  fallbackUsed.current = true
+                  setAutoFellBack(false)
+                  setOnlySession(!onlySession)
+                },
+              }, filtering ? '当前 Session' : '全部 Session'),
+              h('button', {
+                className: 'wt-btn',
                 key: 'clear',
+                title: '清空全部记录（不区分 session）。',
                 onClick: () => {
                   apiPost('clear', {}).then(() => {
                     setSelected(null)
@@ -725,13 +925,35 @@ window.__ModuleLoader__.load({
                   }, (reason) => setError(String(reason)))
                 },
               }, '清空'),
-              h('span', { className: 'wt-meta', key: 'meta' }, items.length + ' / ' + total),
+              h('span', {
+                className: 'wt-meta',
+                key: 'meta',
+                title: filtering ? '本 session 命中数 / 全部记录数' : '已加载 / 全部记录数',
+              }, (filtering ? matched : items.length) + ' / ' + total
+                + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
+                + (auxiliary > 0 ? ' · ' + auxiliary + ' 辅助' : '')),
             ]),
             error === null ? null : h('div', { className: 'wt-err', key: 'err' }, error),
             h('div', { className: 'wt-list', key: 'list' },
               items.length === 0
-                ? h('div', { className: 'wt-empty' }, '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。')
-                : rows),
+                ? h('div', { className: 'wt-empty' }, filtering
+                  ? '本 session 尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。'
+                  : '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。')
+                : [
+                  ...groupedRows,
+                  // The provider never stamped a session id, so the default
+                  // filter was dropped. Explain it where it was noticed.
+                  autoFellBack
+                    ? h('div', { className: 'wt-jnotice', key: '#fallback' },
+                      '本 session 没有可归属的记录（这些调用没有经过 ctx.llm，例如插件重载前就已经发出的请求），已自动显示全部记录。')
+                    : null,
+                  // Records with no session identity are hidden by the filter,
+                  // but never silently: say how many, and where to see them.
+                  filtering && unattributed > 0
+                    ? h('div', { className: 'wt-jnotice', key: '#unattributed' },
+                      '另有 ' + fmtCount(unattributed) + ' 条无归属记录（没有经过 ctx.llm 的请求），点击「全部 Session」查看。')
+                    : null,
+                ].filter(Boolean)),
           ].filter(Boolean)),
           h('div', { className: 'wt-right', key: 'right' }, [
             h('div', { className: 'wt-tabs', key: 'tabs' }, [
@@ -773,6 +995,35 @@ window.__ModuleLoader__.load({
               h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, '复制'),
               h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, '下载'),
             ].filter(Boolean)),
+            // Always-visible coordinate strip for the selected record: the
+            // harness facts that the wire bytes below can never tell you.
+            detail === null ? null : (() => {
+              const badge = stepBadge(detail)
+              const aux = purposeLabel(detail.purpose)
+              const coord = (label, value, title) => h('span', { className: 'wt-coord', key: label, title }, [
+                h('span', { key: 'l' }, label),
+                h('b', { key: 'v' }, value),
+              ])
+              const parts = []
+              if (aux !== null) {
+                parts.push(coord('用途', aux, '后台辅助调用，不属于任何一次对话 turn。'))
+              } else if (typeof detail.turn === 'number') {
+                parts.push(coord('Turn', String(detail.turn), '第几轮对话。'))
+                parts.push(h('span', { className: 'wt-coord-sep', key: 's1' }))
+                parts.push(coord('Step', detail.step === null ? '—' : String(detail.step), '一个 step = 一次模型调用。'))
+              } else {
+                parts.push(coord('归属', badge.text, badge.title))
+              }
+              if (detail.provider !== null && detail.provider !== undefined) {
+                parts.push(h('span', { className: 'wt-coord-sep', key: 's2' }))
+                parts.push(coord('Provider', String(detail.provider), '解析到的 provider 路由。'))
+              }
+              if (detail.sessionId) {
+                parts.push(h('span', { className: 'wt-coord-sep', key: 's3' }))
+                parts.push(coord('Session', String(detail.sessionId).slice(0, 8), '完整 session id：' + detail.sessionId))
+              }
+              return h('div', { className: 'wt-coords', key: 'coords' }, parts)
+            })(),
             curlNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'curl-notice', style: { padding: '4px 12px' } }, curlNotice),
             detail === null
               ? h('div', { className: 'wt-empty', key: 'empty' }, '在左侧选择一条记录查看完整请求/响应。')
