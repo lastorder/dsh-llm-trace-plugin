@@ -262,6 +262,26 @@ export function createWireTraceStore(options) {
     if (archive !== null) void archive.save(record)
   }
 
+  /**
+   * Apply the session filter and page window to the in-memory ring.
+   *
+   * The filter runs BEFORE the window, not after: windowing first would let a
+   * busy neighbouring session's traffic push this session's records out of
+   * the page, so a quiet session could show an empty list while its records
+   * were still held in the store.
+   *
+   * @param {{ limit?: number, sessionId?: string }} settings
+   * @returns {{ page: object[], matched: number }} `page` is oldest-first.
+   */
+  function collectMemory(settings) {
+    const wanted = typeof settings.sessionId === 'string' && settings.sessionId.length > 0
+      ? settings.sessionId
+      : null
+    const matching = wanted === null ? records : records.filter((record) => record.sessionId === wanted)
+    const cap = capacity(settings.limit)
+    return { page: matching.slice(Math.max(0, matching.length - cap)), matched: matching.length }
+  }
+
   function summary(record) {
     return {
       id: record.id,
@@ -424,89 +444,60 @@ export function createWireTraceStore(options) {
      */
     list(options) {
       const settings = typeof options === 'number' ? { limit: options } : (options ?? {})
-      const limit = settings.limit
-      const wanted = typeof settings.sessionId === 'string' && settings.sessionId.length > 0
-        ? settings.sessionId
-        : null
-      const cap = typeof limit === 'number' && limit > 0 ? Math.min(limit, 1000) : 300
-
-      let unattributed = 0
-      for (const record of records) if (record.sessionId === null) unattributed += 1
-
-      const matching = wanted === null ? records : records.filter((record) => record.sessionId === wanted)
-      const page = matching.slice(Math.max(0, matching.length - cap))
-      const items = []
-      for (let i = page.length - 1; i >= 0; i -= 1) items.push(summary(page[i]))
-
-      // Per-turn breakdown of what is actually being shown, so the viewer can
-      // group rows and label each turn without re-deriving it in the browser.
-      // Auxiliary calls (a background title/compaction request) have no turn
-      // and are counted separately rather than folded into turn 0.
-      const turnMap = new Map()
-      let auxiliary = 0
-      for (const record of page) {
-        if (record.turn === null) {
-          if (record.purpose !== null) auxiliary += 1
-          continue
-        }
-        const entry = turnMap.get(record.turn) ?? { turn: record.turn, calls: 0, steps: new Set() }
-        entry.calls += 1
-        if (record.step !== null) entry.steps.add(record.step)
-        turnMap.set(record.turn, entry)
-      }
-      const turns = [...turnMap.values()]
-        .sort((a, b) => b.turn - a.turn)
-        .map((entry) => ({ turn: entry.turn, calls: entry.calls, steps: entry.steps.size }))
-
-      return { items, total: records.length, matched: matching.length, unattributed, turns, auxiliary }
+      const memory = collectMemory(settings)
+      const grouped = summarizePage(memory.page, summary)
+      return { ...grouped, total: records.length, matched: memory.matched }
     },
     /**
-     * List record summaries from DISK, newest first — the durable history
-     * that outlives this process.
+     * List records from memory AND disk as one seamless page, newest first.
      *
-     * Kept separate from `list()` rather than folded into it: the in-memory
-     * ring is small, hot, and synchronous, while history is bounded by a
-     * per-page read budget and is necessarily async. Merging them would make
-     * the common path pay for the rare one, and would double-count the newest
-     * records, which live in both places.
+     * Where a record happens to be stored is an implementation detail, not
+     * something a reader should have to think about — so this merges the two
+     * rather than exposing them as separate views. Memory supplies liveness
+     * (in-flight `streaming` records that no final file exists for yet); disk
+     * supplies depth (everything older than the small in-memory ring, and
+     * everything from before the last restart).
+     *
+     * A record near the head exists in BOTH, so the two are keyed by id and
+     * the in-memory copy wins: it is the same record, but it is the one still
+     * being mutated as its response body streams in.
      *
      * @param {{ limit?: number, sessionId?: string }} [options]
      */
-    async history(options) {
-      if (archive === null) return { items: [], total: 0, matched: 0, unattributed: 0, turns: [], auxiliary: 0, persistence: false }
+    async listAll(options) {
       const settings = options ?? {}
+      const memory = collectMemory(settings)
+
+      if (archive === null) {
+        const grouped = summarizePage(memory.page, summary)
+        return { ...grouped, total: records.length, matched: memory.matched, persistence: false, truncated: false }
+      }
+
       const page = await archive.list({
         limit: settings.limit,
         sessionId: settings.sessionId,
         parseJson: tryParseJson,
       })
-      // `page.records` is already newest-first and already filtered.
-      const grouped = summarizePage(page.records.slice().reverse(), summary)
+
+      // Disk first so the live copy of a shared id overwrites the stored one.
+      const merged = new Map()
+      for (const record of page.records) merged.set(record.id, record)
+      for (const record of memory.page) merged.set(record.id, record)
+
+      // Chronological, oldest first — the order summarizePage expects.
+      const ordered = [...merged.values()].sort((a, b) => a.startedAt - b.startedAt)
+      const cap = capacity(settings.limit)
+      const windowed = ordered.slice(Math.max(0, ordered.length - cap))
+
+      const grouped = summarizePage(windowed, summary)
       return {
         ...grouped,
-        total: page.total,
-        matched: page.records.length,
+        // Disk holds every record that memory does, so its count is the total.
+        total: Math.max(page.total, records.length),
+        matched: merged.size,
         persistence: true,
         truncated: page.truncated,
-        scanned: page.scanned,
       }
-    },
-
-    /**
-     * Repopulate the in-memory ring from disk at startup, so a restart shows
-     * the recent past instead of an empty list. Records already in memory win:
-     * this only ever fills the space ahead of them.
-     */
-    async restore() {
-      if (archive === null) return { restored: 0 }
-      const loaded = await archive.restore({ limit: maxRecords, parseJson: tryParseJson })
-      const known = new Set(records.map((record) => record.id))
-      const fresh = loaded.filter((record) => !known.has(record.id))
-      // Oldest first, and never more than the ring can hold.
-      const room = Math.max(0, maxRecords - records.length)
-      const admitted = fresh.slice(Math.max(0, fresh.length - room))
-      records.unshift(...admitted)
-      return { restored: admitted.length }
     },
 
     async stats() {
@@ -540,6 +531,14 @@ export function createWireTraceStore(options) {
       return { removed, removedFiles }
     },
   }
+}
+
+/**
+ * Page size for a list request, clamped so one call cannot ask for the world.
+ * @param {number | undefined} limit - requested size.
+ */
+function capacity(limit) {
+  return typeof limit === 'number' && limit > 0 ? Math.min(limit, 1000) : 300
 }
 
 /**
@@ -800,17 +799,12 @@ export function apply(ctx, config) {
 
   const store = createWireTraceStore({ ...settings, archive })
 
-  // Repopulate the in-memory ring from disk so a restart opens on the recent
-  // past rather than an empty list. Not awaited: capture must start
-  // immediately, and a slow or failing disk must not delay the fetch patch.
+  // Deliberately NOT loading disk records into the in-memory ring. The list
+  // already merges memory and disk, so preloading would only duplicate what
+  // the merge provides — and it was what made an earlier "live vs history"
+  // toggle show identical content in both modes.
   if (archive !== null) {
-    void store.restore()
-      .then((result) => {
-        if (result.restored > 0) {
-          console.log(`llm-wire-trace: restored ${result.restored} record(s) from ${archive.dir}`)
-        }
-      })
-      .catch((error) => console.warn('llm-wire-trace: restore failed:', error.message))
+    void archive.sweepTemp().catch(() => {})
   }
 
   ctx.effect(() => installFetchPatch(store), 'llm-wire-trace: fetch patch')
@@ -909,16 +903,9 @@ export function apply(ctx, config) {
             // that has no session id yet degrades to the full list rather
             // than silently matching nothing.
             const sessionId = url.searchParams.get('sessionId') ?? ''
-            sendJson(res, 200, store.list({
-              limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
-              sessionId,
-            }))
-            return
-          }
-          if (method === 'history') {
-            const limitRaw = Number(url.searchParams.get('limit'))
-            const sessionId = url.searchParams.get('sessionId') ?? ''
-            sendJson(res, 200, await store.history({
+            // Memory and disk as one page: where a record is stored is an
+            // implementation detail the viewer should never have to expose.
+            sendJson(res, 200, await store.listAll({
               limit: Number.isFinite(limitRaw) ? limitRaw : undefined,
               sessionId,
             }))

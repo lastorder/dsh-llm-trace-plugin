@@ -79,7 +79,9 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 
 ## Persistence
 
-The in-memory ring dies with the process, which is backwards for a debugging tool: the traces you most want are the ones from the run that just crashed. So records are also written to disk, and the viewer gains a 实时 / 历史记录 (live / history) toggle — live reads the ring, history reads the disk, including records from before the last restart.
+The in-memory ring dies with the process, which is backwards for a debugging tool: the traces you most want are the ones from the run that just crashed. So records are also written to disk.
+
+**There is no "live vs history" mode to choose.** The list always merges both: memory supplies liveness (in-flight `streaming` calls, which have no final file yet), disk supplies depth (everything older than the small ring, and everything from before the last restart). Records near the head exist in both, so they are keyed by id and the in-memory copy wins — it is the same record, but the one still being mutated as its body streams in. Where a record happens to be stored is an implementation detail, and the viewer deliberately does not expose it.
 
 ### One file per record, and why
 
@@ -109,7 +111,9 @@ There is no index, so building a history page costs one file read per record *on
 
 ### Startup
 
-The newest records are loaded back into the ring on `apply`, so a restart opens on the recent past instead of an empty list. The load is never awaited — capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET <routePrefix>/stats`, never thrown into the capture path.
+Nothing is preloaded into the ring on `apply`: the list already merges memory and disk, so a restart opens on the recent past regardless. (Preloading was in fact what made an earlier live/history toggle show identical content in both modes — the ring had been filled with the very history the other mode read.)
+
+Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET <routePrefix>/stats`, never thrown into the capture path.
 
 ### Privacy: bodies are stored verbatim
 
