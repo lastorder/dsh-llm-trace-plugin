@@ -27,8 +27,6 @@ window.__ModuleLoader__.load({
     const ROOT_PATH = '$'
     const LONG_STRING = 120
     const MAX_ROWS = 20000
-    const EXPAND_ALL_BUDGET = 5000
-    const EXPAND_ALL_FALLBACK_DEPTH = 3
 
     const CSS = [
       // ---- fix for the shell's own layout: in the "active" phase (any open,
@@ -57,6 +55,8 @@ window.__ModuleLoader__.load({
       '.wt-btn:hover{color:var(--dsw-alias-label-primary)}',
       '.wt-btn[data-on="1"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}',
       '.wt-btn:disabled{opacity:.45;cursor:default}',
+      // Depth stepper: square, monospaced glyphs so + and − sit at equal width.
+      '.wt-btn-step{font-family:var(--ds-font-family-code);font-weight:600;padding:3px 0;width:26px;text-align:center}',
       '.wt-div{width:1px;height:16px;flex:none;align-self:center;margin:0 8px;background:var(--dsw-alias-border-l2)}',
       '.wt-meta{color:var(--dsw-alias-label-secondary);font-size:12px;margin-left:auto}',
       '.wt-list{flex:1;min-height:0;overflow-y:auto}',
@@ -81,11 +81,13 @@ window.__ModuleLoader__.load({
       '.wt-jrow[data-c="1"]{cursor:pointer}',
       '.wt-jrow:hover{background:var(--dsw-alias-interactive-bg-hover)}',
       '.wt-jind{display:inline-block;width:14px;flex:none;border-left:1px solid var(--dsw-alias-border-l1)}',
-      '.wt-jgutter{display:inline-block;width:16px;flex:none;text-align:center;color:var(--shiki-token-punctuation);opacity:.7}',
+      // The gutter is the per-row +/- affordance: dim until the row is hovered,
+      // so a deep document reads as jq output rather than a column of symbols.
+      '.wt-jgutter{display:inline-block;width:16px;flex:none;text-align:center;color:var(--shiki-token-punctuation);opacity:.45;font-weight:600}',
+      '.wt-jrow:hover .wt-jgutter{opacity:1;color:var(--dsw-alias-label-primary)}',
       '.wt-jbody{min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}',
       '.wt-jkey{color:var(--shiki-token-function)}',
-      '.wt-jidx{color:var(--shiki-token-keyword)}',
-      '.wt-jpunct{color:var(--shiki-token-punctuation)}',
+      '.wt-jpunct{color:var(--shiki-token-punctuation);opacity:.75}',
       '.wt-jstr{color:var(--shiki-token-string)}',
       '.wt-jnum{color:var(--shiki-token-parameter)}',
       '.wt-jbool{color:var(--shiki-token-constant)}',
@@ -146,79 +148,92 @@ window.__ModuleLoader__.load({
       return flat.length > max ? flat.slice(0, max) + '…' : flat
     }
 
-    function summaryOf(value, kind, count, open) {
-      if (kind === 'array') return 'Array(' + count + ')'
-      if (open) return 'Object(' + count + ')'
-      const keys = Object.keys(value).slice(0, 3).join(', ')
-      return '{ ' + keys + (count > 3 ? ', …' : '') + ' }'
+    /** Collapsed-container placeholder, e.g. `{ … 3 keys }` / `[ … 12 items ]`. */
+    function collapsedSummary(kind, count) {
+      const noun = kind === 'array' ? (count === 1 ? 'item' : 'items') : (count === 1 ? 'key' : 'keys')
+      const open = kind === 'array' ? '[' : '{'
+      const close = kind === 'array' ? ']' : '}'
+      return open + ' … ' + fmtCount(count) + ' ' + noun + ' ' + close
     }
 
-    function flattenJson(root, expanded) {
-      const rows = []
+    /**
+     * Flatten a JSON value into jq-shaped display lines.
+     *
+     * Unlike a node-per-row tree, this emits the punctuation jq itself would
+     * print: an expanded container costs an opening line (`"key": {`), its
+     * children, and a closing line (`}`) that carries the trailing comma when
+     * the container is not its parent's last entry. A collapsed container is a
+     * single line whose value is a `{ … n keys }` placeholder, so the shape of
+     * the document stays readable at any depth.
+     *
+     * A line is one of:
+     *   - `open`  : container header; `+`/`-` togglable, has `path`
+     *   - `close` : container footer; punctuation only
+     *   - `leaf`  : a scalar, an empty container, or a collapsed container
+     *
+     * @param root - the parsed JSON value to render.
+     * @param isOpen - (path, depth) => boolean, decides each container's state.
+     * @returns {{ lines: object[], truncated: boolean }}
+     */
+    function flattenJq(root, isOpen) {
+      const lines = []
       let truncated = false
-      const walk = (label, labelKind, value, depth, path) => {
-        if (rows.length >= MAX_ROWS) {
+
+      // `label` is the key/index this value sits under (null at the root).
+      // `last` drives whether a comma follows this value.
+      const walk = (label, labelKind, value, depth, path, last) => {
+        if (lines.length >= MAX_ROWS) {
           truncated = true
           return
         }
         const kind = classify(value)
         const count = childCount(value, kind)
         const container = isContainer(kind) && count > 0
-        const open = container && expanded.has(path)
-        rows.push({ path, depth, label, labelKind, kind, value, count, container, open })
-        if (!open) return
-        if (kind === 'array') {
-          for (let i = 0; i < value.length; i += 1) walk(String(i), 'index', value[i], depth + 1, path + PATH_SEP + i)
-        } else {
-          for (const key of Object.keys(value)) walk(key, 'key', value[key], depth + 1, path + PATH_SEP + key)
+        const open = container && isOpen(path, depth)
+
+        if (!container || !open) {
+          // One self-contained line: scalar, empty container, or collapsed.
+          lines.push({ type: 'leaf', path, depth, label, labelKind, kind, value, count, container, last })
+          return
         }
+
+        lines.push({ type: 'open', path, depth, label, labelKind, kind, value, count, last })
+        const keys = kind === 'array' ? value.map((_, i) => String(i)) : Object.keys(value)
+        for (let i = 0; i < keys.length; i += 1) {
+          const key = keys[i]
+          walk(
+            key,
+            kind === 'array' ? 'index' : 'key',
+            value[key],
+            depth + 1,
+            path + PATH_SEP + key,
+            i === keys.length - 1,
+          )
+        }
+        if (lines.length >= MAX_ROWS) {
+          truncated = true
+          return
+        }
+        lines.push({ type: 'close', path: path + '#close', depth, kind, last })
       }
-      const kind = classify(root)
-      if (kind === 'array') {
-        for (let i = 0; i < root.length; i += 1) walk(String(i), 'index', root[i], 0, ROOT_PATH + PATH_SEP + i)
-      } else if (kind === 'object') {
-        for (const key of Object.keys(root)) walk(key, 'key', root[key], 0, ROOT_PATH + PATH_SEP + key)
-      } else {
-        walk('', 'none', root, 0, ROOT_PATH)
-      }
-      return { rows, truncated }
+
+      walk(null, 'none', root, 0, ROOT_PATH, true)
+      return { lines, truncated }
     }
 
-    function countNodes(root, limit) {
-      let total = 0
-      const stack = [root]
-      while (stack.length > 0 && total <= limit) {
-        const value = stack.pop()
-        const kind = classify(value)
-        if (kind === 'array') {
-          total += value.length
-          for (const child of value) stack.push(child)
-        } else if (kind === 'object') {
-          const keys = Object.keys(value)
-          total += keys.length
-          for (const key of keys) stack.push(value[key])
-        }
-      }
-      return total
-    }
-
-    function collectContainerPaths(root, maxDepth) {
-      const paths = [ROOT_PATH]
-      const walk = (value, depth, path) => {
-        if (depth >= maxDepth) return
+    /** Deepest container nesting level present in `root`, capped by `limit`. */
+    function maxDepthOf(root, limit) {
+      let deepest = 0
+      const walk = (value, depth) => {
+        if (depth > deepest) deepest = depth
+        if (deepest >= limit) return
         const kind = classify(value)
         if (!isContainer(kind)) return
         const keys = kind === 'array' ? value.map((_, i) => String(i)) : Object.keys(value)
-        for (const key of keys) {
-          const child = value[key]
-          if (!isContainer(classify(child))) continue
-          const childPath = path + PATH_SEP + key
-          paths.push(childPath)
-          walk(child, depth + 1, childPath)
-        }
+        for (const key of keys) walk(value[key], depth + 1)
       }
-      walk(root, 0, ROOT_PATH)
-      return paths
+      walk(root, 0)
+      return Math.min(deepest, limit)
     }
 
     function fmtTime(ms) {
@@ -341,78 +356,104 @@ window.__ModuleLoader__.load({
       if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text)
     }
 
-    function JsonTree(props) {
-      const { value, expanded, longOpen, onToggle, onToggleLong, notice } = props
-      const flat = React.useMemo(() => flattenJson(value, expanded), [value, expanded])
+    /**
+     * Render one jq-shaped JSON document.
+     *
+     * Every line is a real DOM row (not preformatted text), so containers stay
+     * individually togglable and long strings keep their expandable block —
+     * but the punctuation, indentation, and trailing commas are exactly what
+     * `jq .` would print, which is the point of this view.
+     */
+    function JsonView(props) {
+      const { value, isOpen, longOpen, onToggle, onToggleLong } = props
+      const flat = React.useMemo(() => flattenJq(value, isOpen), [value, isOpen])
+
+      /** `"key": ` / `` (array elements carry no label in jq output). */
+      const labelParts = (line) => {
+        if (line.labelKind === 'key') {
+          return [
+            h('span', { className: 'wt-jkey', key: 'l' }, JSON.stringify(line.label)),
+            h('span', { className: 'wt-jpunct', key: 'c' }, ': '),
+          ]
+        }
+        return []
+      }
 
       const elements = []
-      for (const row of flat.rows) {
+      for (const line of flat.lines) {
         const indents = []
-        for (let i = 0; i < row.depth; i += 1) indents.push(h('span', { className: 'wt-jind', key: 'i' + i }))
+        for (let i = 0; i < line.depth; i += 1) indents.push(h('span', { className: 'wt-jind', key: 'i' + i }))
 
         const body = []
-        if (row.labelKind === 'index') {
-          body.push(h('span', { className: 'wt-jidx', key: 'l' }, row.label))
-          body.push(h('span', { className: 'wt-jpunct', key: 'c' }, ': '))
-        } else if (row.labelKind === 'key') {
-          body.push(h('span', { className: 'wt-jkey', key: 'l' }, row.label))
-          body.push(h('span', { className: 'wt-jpunct', key: 'c' }, ': '))
-        }
+        let togglePath = null
 
-        if (row.container) {
-          body.push(h('span', { className: 'wt-jsum', key: 'v' }, summaryOf(row.value, row.kind, row.count, row.open)))
-        } else if (row.kind === 'object') {
-          body.push(h('span', { className: 'wt-jpunct', key: 'v' }, '{}'))
-        } else if (row.kind === 'array') {
-          body.push(h('span', { className: 'wt-jpunct', key: 'v' }, '[]'))
-        } else if (row.kind === 'string') {
-          if (isLongString(row.value)) {
-            body.push(h('span', {
-              className: 'wt-jstr wt-jclip',
-              key: 'v',
-              onClick: (event) => { event.stopPropagation(); onToggleLong(row.path) },
-            }, '"' + oneLine(row.value, LONG_STRING) + '"'))
-            body.push(h('span', { className: 'wt-jmeta', key: 'm' }, '  ' + fmtCount(row.value.length) + ' chars'))
-          } else {
-            body.push(h('span', { className: 'wt-jstr', key: 'v' }, JSON.stringify(row.value)))
-          }
-        } else if (row.kind === 'number') {
-          body.push(h('span', { className: 'wt-jnum', key: 'v' }, String(row.value)))
-        } else if (row.kind === 'boolean') {
-          body.push(h('span', { className: 'wt-jbool', key: 'v' }, String(row.value)))
-        } else if (row.kind === 'null') {
-          body.push(h('span', { className: 'wt-jnull', key: 'v' }, 'null'))
+        if (line.type === 'close') {
+          body.push(h('span', { className: 'wt-jpunct', key: 'v' }, (line.kind === 'array' ? ']' : '}') + (line.last ? '' : ',')))
+        } else if (line.type === 'open') {
+          togglePath = line.path
+          body.push(...labelParts(line))
+          body.push(h('span', { className: 'wt-jpunct', key: 'v' }, line.kind === 'array' ? '[' : '{'))
         } else {
-          body.push(h('span', { className: 'wt-jnull', key: 'v' }, String(row.value)))
+          // leaf: scalar, empty container, or collapsed container
+          body.push(...labelParts(line))
+          const comma = line.last ? '' : ','
+          if (line.container) {
+            togglePath = line.path
+            body.push(h('span', { className: 'wt-jsum', key: 'v' }, collapsedSummary(line.kind, line.count)))
+            if (comma) body.push(h('span', { className: 'wt-jpunct', key: 'cm' }, comma))
+          } else if (line.kind === 'object' || line.kind === 'array') {
+            body.push(h('span', { className: 'wt-jpunct', key: 'v' }, (line.kind === 'array' ? '[]' : '{}') + comma))
+          } else if (line.kind === 'string') {
+            if (isLongString(line.value)) {
+              body.push(h('span', {
+                className: 'wt-jstr wt-jclip',
+                key: 'v',
+                onClick: (event) => { event.stopPropagation(); onToggleLong(line.path) },
+              }, '"' + oneLine(line.value, LONG_STRING) + '"'))
+              if (comma) body.push(h('span', { className: 'wt-jpunct', key: 'cm' }, comma))
+              body.push(h('span', { className: 'wt-jmeta', key: 'm' }, '  ' + fmtCount(line.value.length) + ' chars'))
+            } else {
+              body.push(h('span', { className: 'wt-jstr', key: 'v' }, JSON.stringify(line.value)))
+              if (comma) body.push(h('span', { className: 'wt-jpunct', key: 'cm' }, comma))
+            }
+          } else {
+            const cls = line.kind === 'number' ? 'wt-jnum' : line.kind === 'boolean' ? 'wt-jbool' : 'wt-jnull'
+            const rendered = line.kind === 'null' ? 'null' : String(line.value)
+            body.push(h('span', { className: cls, key: 'v' }, rendered))
+            if (comma) body.push(h('span', { className: 'wt-jpunct', key: 'cm' }, comma))
+          }
         }
 
         elements.push(h('div', {
           className: 'wt-jrow',
-          key: row.path,
-          'data-c': row.container ? '1' : '0',
-          onClick: row.container ? () => onToggle(row.path) : undefined,
+          key: line.path + ':' + line.type,
+          'data-c': togglePath === null ? '0' : '1',
+          onClick: togglePath === null ? undefined : () => onToggle(togglePath, line.depth),
         }, [
           ...indents,
-          h('span', { className: 'wt-jgutter', key: 'g' }, row.container ? (row.open ? '▾' : '▸') : ''),
+          h('span', {
+            className: 'wt-jgutter',
+            key: 'g',
+          }, togglePath === null ? '' : (line.type === 'open' ? '-' : '+')),
           h('span', { className: 'wt-jbody', key: 'b' }, body),
-          h('button', {
+          line.type === 'close' ? null : h('button', {
             className: 'wt-jcopy',
             key: 'cp',
             title: '复制该节点',
             onClick: (event) => {
               event.stopPropagation()
-              copy(typeof row.value === 'string' ? row.value : stringify(row.value))
+              copy(typeof line.value === 'string' ? line.value : stringify(line.value))
             },
           }, '⧉'),
-        ]))
+        ].filter(Boolean)))
 
-        if (row.kind === 'string' && isLongString(row.value) && longOpen.has(row.path)) {
+        if (line.type === 'leaf' && line.kind === 'string' && isLongString(line.value) && longOpen.has(line.path)) {
           elements.push(h('div', {
             className: 'wt-jblock',
-            key: row.path + '#full',
+            key: line.path + '#full',
             title: '点击收起',
-            onClick: () => onToggleLong(row.path),
-          }, row.value))
+            onClick: () => onToggleLong(line.path),
+          }, line.value))
         }
       }
 
@@ -421,7 +462,6 @@ window.__ModuleLoader__.load({
       }
 
       return h('div', { className: 'wt-json' }, [
-        notice === null ? null : h('div', { className: 'wt-jnotice', key: '#notice' }, notice),
         ...elements,
       ].filter(Boolean))
     }
@@ -440,13 +480,17 @@ window.__ModuleLoader__.load({
         const [tab, setTab] = React.useState('request')
         const [error, setError] = React.useState(null)
         const [tick, setTick] = React.useState(0)
-        const [expanded, setExpanded] = React.useState(() => new Set([ROOT_PATH]))
+        // Container open/closed state is a global baseline depth plus per-path
+        // manual overrides. The global +/- buttons reset the baseline and drop
+        // every override (agreed rule): letting the two stack would make "why
+        // didn't that branch move?" unanswerable.
+        const [depth, setDepth] = React.useState(1)
+        const [overrides, setOverrides] = React.useState(() => new Map())
         const [longOpen, setLongOpen] = React.useState(() => new Set())
         const [sseRaw, setSseRaw] = React.useState(true)
         const [requestRaw, setRequestRaw] = React.useState(false)
         const [curlBusy, setCurlBusy] = React.useState(false)
         const [curlNotice, setCurlNotice] = React.useState(null)
-        const [notice, setNotice] = React.useState(null)
 
         React.useEffect(() => {
           let alive = true
@@ -487,9 +531,9 @@ window.__ModuleLoader__.load({
         }, [selected, detailTick])
 
         React.useEffect(() => {
-          setExpanded(new Set([ROOT_PATH]))
+          setDepth(1)
+          setOverrides(new Map())
           setLongOpen(new Set())
-          setNotice(null)
         }, [selected, tab])
 
         React.useEffect(() => {
@@ -519,14 +563,24 @@ window.__ModuleLoader__.load({
           )
         }
 
-        const toggle = React.useCallback((path) => {
-          setExpanded((current) => {
-            const next = new Set(current)
-            if (next.has(path)) next.delete(path)
-            else next.add(path)
+        // A container is open when an explicit override says so, else when its
+        // nesting level is within the global baseline depth.
+        const isOpen = React.useCallback((path, lineDepth) => {
+          const override = overrides.get(path)
+          if (override !== undefined) return override
+          return lineDepth < depth
+        }, [overrides, depth])
+
+        // Per-row toggle records an override that is the negation of whatever
+        // the row currently shows, so one click always flips what you see.
+        const toggle = React.useCallback((path, lineDepth) => {
+          setOverrides((current) => {
+            const next = new Map(current)
+            const shown = current.has(path) ? current.get(path) : lineDepth < depth
+            next.set(path, !shown)
             return next
           })
-        }, [])
+        }, [depth])
 
         const toggleLong = React.useCallback((path) => {
           setLongOpen((current) => {
@@ -568,19 +622,19 @@ window.__ModuleLoader__.load({
               : '')
         const text = detail === null ? '' : stringify(tab === 'request' ? detail.request : detail.response)
 
-        const expandAll = () => {
-          if (treeValue === null) return
-          const total2 = countNodes(treeValue, EXPAND_ALL_BUDGET)
-          const oversized = total2 > EXPAND_ALL_BUDGET
-          const depth = oversized ? EXPAND_ALL_FALLBACK_DEPTH : 64
-          setExpanded(new Set(collectContainerPaths(treeValue, depth)))
-          setNotice(oversized ? '内容过大，已展开至 ' + EXPAND_ALL_FALLBACK_DEPTH + ' 层。' : null)
-        }
+        // Deepest nesting actually present, so `+` can stop at the point where
+        // it would no longer change anything (and the button can disable).
+        const contentDepth = React.useMemo(
+          () => (treeValue === null ? 0 : maxDepthOf(treeValue, 64)),
+          [treeValue],
+        )
 
-        const collapseAll = () => {
-          setExpanded(new Set([ROOT_PATH]))
-          setLongOpen(new Set())
-          setNotice(null)
+        // Global depth stepper: reset the baseline and drop manual overrides.
+        const step = (delta) => {
+          const next = Math.max(0, Math.min(contentDepth, depth + delta))
+          if (next === depth) return
+          setDepth(next)
+          setOverrides(new Map())
         }
 
         const rows = items.map((item) => h(
@@ -659,8 +713,21 @@ window.__ModuleLoader__.load({
               isSse && tab === 'response'
                 ? h('button', { className: 'wt-btn', key: 'sse', 'data-on': sseRaw ? '1' : '0', onClick: () => setSseRaw(!sseRaw) }, sseRaw ? 'SSE 原始文本' : 'SSE 树视图')
                 : null,
-              h('button', { className: 'wt-btn', key: 'exp', onClick: expandAll, disabled: detail === null || showRaw }, '展开全部'),
-              h('button', { className: 'wt-btn', key: 'col', onClick: collapseAll, disabled: detail === null || showRaw }, '折叠全部'),
+              h('button', {
+                className: 'wt-btn wt-btn-step',
+                key: 'less',
+                title: '整体折叠一层',
+                onClick: () => step(-1),
+                disabled: detail === null || showRaw || depth <= 0,
+              }, '−'),
+              h('button', {
+                className: 'wt-btn wt-btn-step',
+                key: 'more',
+                title: '整体展开一层',
+                onClick: () => step(1),
+                disabled: detail === null || showRaw || depth >= contentDepth,
+              }, '+'),
+              h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : '深度 ' + depth + '/' + contentDepth),
               h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.method + ' ' + detail.url),
               h('button', {
                 className: 'wt-btn',
@@ -679,14 +746,13 @@ window.__ModuleLoader__.load({
                 ? h('div', { className: 'wt-empty', key: 'pending' }, '响应尚未到达（连接失败或仍在等待）。')
                 : showRaw
                   ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
-                  : h(JsonTree, {
-                    key: 'tree',
+                  : h(JsonView, {
+                    key: 'json',
                     value: treeValue,
-                    expanded,
+                    isOpen,
                     longOpen,
                     onToggle: toggle,
                     onToggleLong: toggleLong,
-                    notice,
                   }),
           ]),
         ])

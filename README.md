@@ -98,19 +98,30 @@ Each record:
 }
 ```
 
-- `bodyText` is always the raw string (SSE frames verbatim, or a JSON error body). `bodyJson` is a best-effort parse for the tree view; SSE bodies are never JSON-parsed as a whole (they're a frame sequence, not one JSON value).
+- `bodyText` is always the raw string (SSE frames verbatim, or a JSON error body). `bodyJson` is a best-effort parse for the JSON view; SSE bodies are never JSON-parsed as a whole (they're a frame sequence, not one JSON value).
 - No `sessionId` / `turn` / `step` — this layer doesn't have them. Records are ordered purely by time.
 - Body fields are capped and the ring buffer holds only the most recent records; both are configurable (see [Configuration](#configuration)).
 
 ## The viewer
 
-A collapsible, syntax-coloured JSON tree, using the product's own shiki palette so it tracks the light/dark theme for free. Two tabs, Request and Response, plus an SSE-specific toggle on the Response tab: an `event-stream` body defaults to raw text (the frame sequence is usually what you want to read directly), with a one-click switch to the tree view for the rare case a frame's JSON payload needs digging into.
+A `jq`-shaped JSON view: the brackets, commas, and indentation `jq .` would print, syntax-coloured from the product's own shiki palette so it tracks the light/dark theme for free. Keys, strings, numbers, booleans, and `null` each get their own colour. Unlike preformatted text, every line is a real row, so containers stay foldable.
+
+Folding works two ways, and they compose:
+
+- **A global depth stepper** (`−` / `+` in the toolbar) opens or closes the whole document one level at a time, with the current level shown beside it as `深度 2/5`. `+` stops once the deepest nesting present is reached.
+- **A per-row `+` / `-`** in the gutter folds one individual container, for when you want a single branch open without expanding its whole level.
+
+Using the global stepper resets the baseline and clears any per-row folds, so the depth readout always describes what you actually see.
+
+A folded container collapses to a one-line placeholder that keeps its trailing comma, e.g. `"messages": [ … 12 items ],`. Fully expanded, the view is valid JSON: it round-trips through `JSON.parse` to exactly the captured value.
+
+Two tabs, Request and Response, plus an SSE-specific toggle on the Response tab: an `event-stream` body defaults to raw text (the frame sequence is usually what you want to read directly), with a one-click switch to the JSON view for the rare case a frame's JSON payload needs digging into.
 
 > The in-app button labels are currently Chinese; the English names below are given alongside them.
 
 ### Request: parsed / raw toggle
 
-The Request tab defaults to the parsed JSON tree. A parsed/raw button (`解析后` / `原始 body`) switches to the exact request-body text that was actually sent — useful when the body isn't standard JSON, or when you want to see it byte-for-byte rather than through the tree's own JSON re-serialization. When the body isn't parseable JSON at all, the toggle is forced to raw and disabled. Switching Request ↔ Response keeps your choice for that record; selecting a different record resets it to parsed.
+The Request tab defaults to the parsed JSON view. A parsed/raw button (`解析后` / `原始 body`) switches to the exact request-body text that was actually sent — useful when the body isn't standard JSON, or when you want to see it byte-for-byte rather than through the view's own JSON re-serialization. When the body isn't parseable JSON at all, the toggle is forced to raw and disabled. Switching Request ↔ Response keeps your choice for that record; selecting a different record resets it to parsed.
 
 ### Copy as curl
 
@@ -129,7 +140,7 @@ The client tells you which of the two happened after each copy. Inlining a real 
 
 ### jq-style formatting
 
-The Request tab's raw view and the Response tab's non-tree views (plain JSON, and SSE) show pretty-printed JSON rather than whatever the wire actually carried — request bodies are typically minified by the adapter's own `JSON.stringify`, and this re-indents them the way `jq .` would. For SSE, only each frame's `data: {...}` payload is reformatted; frame structure (`event:` / `id:` / `retry:` fields, comment lines, blank separators, and non-JSON sentinels like `data: [DONE]`) is left completely untouched. A body that isn't parseable JSON at all is shown verbatim, so malformed content is never silently "fixed" into something that looks valid.
+The Request tab's raw view and the Response tab's non-JSON-view modes (plain JSON, and SSE) show pretty-printed JSON rather than whatever the wire actually carried — request bodies are typically minified by the adapter's own `JSON.stringify`, and this re-indents them the way `jq .` would. For SSE, only each frame's `data: {...}` payload is reformatted; frame structure (`event:` / `id:` / `retry:` fields, comment lines, blank separators, and non-JSON sentinels like `data: [DONE]`) is left completely untouched. A body that isn't parseable JSON at all is shown verbatim, so malformed content is never silently "fixed" into something that looks valid.
 
 Re-indenting is lossless for JSON, so copy (`复制`) and the on-screen view show the same pretty text; download (`下载`) still exports the complete record, unaffected.
 
