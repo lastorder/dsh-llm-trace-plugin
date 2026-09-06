@@ -8,7 +8,7 @@
 
 ## 安装
 
-直接从 npm 安装：
+**npm 是官方支持的安装路径。** 发布的包自带预编译的 `dist/`（发布时由 `pnpm run build` 生成），本地不需要任何构建工具链：
 
 ```sh
 dsh plugin --profile web add dsh-llm-trace-plugin
@@ -17,26 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 指定精确版本：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.4
-```
-
-或者直接从 git 安装：
-
-```sh
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git
-```
-
-用 fragment 指定分支或 tag：
-
-```sh
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.4
-```
-
-本地开发时可以链接一份 checkout（相对路径会锚定到你运行 `dsh` 的目录，而不是 profile 目录）：
-
-```sh
-dsh plugin --profile web add link:.
+dsh plugin --profile web add dsh-llm-trace-plugin@0.2.0
 ```
 
 之后按**包名**更新或卸载：
@@ -46,11 +27,30 @@ dsh plugin --profile web update dsh-llm-trace-plugin
 dsh plugin --profile web remove dsh-llm-trace-plugin
 ```
 
+### 从源码 checkout 安装（git 或 `link:`）
+
+本仓库发布的是 TypeScript 源码，**不**包含提交进版本库的 `dist/`——git 形式的安装或本地 `link:` checkout 拿到的只有源码，而且本插件不声明 `prepare` 脚本，所以没有任何东西会自动帮你构建。（这是刻意的设计：git 依赖上的 `prepare` 脚本需要 pnpm ≥10 明确的 `allowBuilds` 批准才能执行，本质上等于"允许这个包在你安装的这一刻在你机器上跑任意代码"——对一个大多数用户都是从 npm 安装的插件来说，这个风险值得避免。）安装前请自己先构建一次：
+
+```sh
+cd /path/to/dsh-llm-trace-plugin
+pnpm install
+pnpm run build      # 产出 dist/host/** 与 dist/client.js
+```
+
+然后像安装任何本地插件一样安装这份 checkout：
+
+```sh
+dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
+# 或者，从固定到某个分支/tag/commit 的 git 远程安装：
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.2.0
+```
+
+git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都要重新 `pnpm run build`，因为没有任何东西会替你自动构建。
+
 注意事项：
 
 - `dsh plugin` 会转发给 pnpm，随后根据*已安装状态*回填 `$DSH_HOME/profiles/web/package.json` 里的 `dsh.profile.bundles`，因此 git 形式的安装会以本包真实的名字 `dsh-llm-trace-plugin` 登记。
 - **安装后需要重启 `dsh web`。** 已安装的包不是开发态 checkout，没有客户端插件的 HMR 监听。
-- 本插件的源码是 TypeScript，但发布/安装的包只包含编译后的纯 JavaScript `dist/` 产物 —— 并且**没有声明 `prepare` 脚本**，所以 git 安装不需要在 profile 的 `pnpm-workspace.yaml` 里添加 `allowBuilds` 条目 —— git 插件通常会触发的构建放行提示在这里不适用。
 - 包名已从 `dsh-llm-wire-trace-plugin` 改为 `dsh-llm-trace-plugin`。如果你之前是按旧名字安装的，请先卸载：`dsh plugin --profile web remove dsh-llm-wire-trace-plugin`。
 
 ## 配置
@@ -454,9 +454,9 @@ pnpm run test        # tsc -> .test-build，node --test
 pnpm run verify       # build + typecheck + test —— 认为一次改动完成前的完整自验证
 ```
 
-`dist/` 纳入版本控制（并包含在发布的 `files` 里），所以无论是从 npm 还是 `git+https://...` 安装都不需要执行构建。这是刻意的设计：**本包依然不声明 `prepare` 脚本**，所以 git 安装依然不需要在 profile 的 `pnpm-workspace.yaml` 里添加 `allowBuilds` 条目 —— git 插件通常会触发的构建放行提示在这里不适用。只有从源码构建的贡献者才需要 Node + `pnpm run build`；安装这个包的用户拿到的始终是编译好的纯 JavaScript。
+`dist/` **不**纳入版本控制——它和其他构建产物一样被 gitignore 掉，由 `pnpm run build` 生成，发布时由 `prepublishOnly` 脚本重新生成一份（确保 `npm publish` 每次都发布与该提交源码完全对应的构建结果）。只有*发布出去的 npm 包*才自带预编译的 `dist/`；git checkout 或 `link:` 安装永远不会自带。这两种安装方式意味着什么，见上文"[从源码 checkout 安装](#从源码-checkout-安装git-或-link)"一节。
 
-本地开发时，每次改动源码后运行一次 `pnpm run build`，然后重新安装 `link:.` checkout（或者直接重启 `dsh web`，因为被链接的包的 `dist/` 不在 client-plugin 的 HMR 监听范围内）。
+本地开发时，每次改动源码后都要运行一次 `pnpm run build`（这份 checkout 本身要能跑起来就得先构建——没有提交进版本库的 `dist/` 可以兜底），然后重新安装 `link:.` checkout（或者直接重启 `dsh web`，因为被链接的包的 `dist/` 不在 client-plugin 的 HMR 监听范围内）。
 
 ### 测试
 
@@ -464,7 +464,7 @@ pnpm run verify       # build + typecheck + test —— 认为一次改动完成
 
 刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
 
-一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持纳入版本控制、body 逐字存储），见 [`AGENTS.zh.md`](AGENTS.zh.md)。
+一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持是 gitignore 掉的构建产物、body 逐字存储），见 [`AGENTS.zh.md`](AGENTS.zh.md)。
 
 关于本项目自身如何使用 DSH/Cordis 插件框架——服务、事件、Slot，以及只有已安装包才能做的那一件事（补丁 `fetch`）——的简短讲解，见 [`docs/plugin-development.zh.md`](docs/plugin-development.zh.md)。关于本项目自己的模块为什么这样拆分、数据如何在它们之间流动，见 [`docs/architecture.zh.md`](docs/architecture.zh.md)。
 

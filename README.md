@@ -8,7 +8,7 @@ This works at the *wire* layer. A harness-level tracer observes the normalized `
 
 ## Install
 
-Install straight from npm:
+**npm is the supported install path.** The published package ships a prebuilt `dist/` (compiled by `pnpm run build` at publish time), so this works with no local toolchain:
 
 ```sh
 dsh plugin --profile web add dsh-llm-trace-plugin
@@ -17,26 +17,7 @@ dsh plugin --profile web add dsh-llm-trace-plugin
 Pin an exact version:
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.1.4
-```
-
-Or install straight from git:
-
-```sh
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git
-```
-
-Pin a branch or tag with a fragment:
-
-```sh
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#main
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.1.4
-```
-
-For local development, link a checkout (a relative path is anchored to the directory you ran `dsh` from, not the profile directory):
-
-```sh
-dsh plugin --profile web add link:.
+dsh plugin --profile web add dsh-llm-trace-plugin@0.2.0
 ```
 
 Then update or remove it by **package name**:
@@ -46,11 +27,30 @@ dsh plugin --profile web update dsh-llm-trace-plugin
 dsh plugin --profile web remove dsh-llm-trace-plugin
 ```
 
+### Installing from a source checkout (git or `link:`)
+
+The repository ships TypeScript source, **not** a committed `dist/` — a git-spec install or a local `link:` checkout gets only source, and this plugin declares no `prepare` script, so nothing builds it for you automatically. (That is deliberate: a `prepare` script on a git dependency requires an explicit `allowBuilds` approval from pnpm ≥10 before it may run, i.e. "permission to execute this package's code on your machine at install time" — worth avoiding for a plugin most users install from npm.) Build once yourself, from the checkout, before installing:
+
+```sh
+cd /path/to/dsh-llm-trace-plugin
+pnpm install
+pnpm run build      # produces dist/host/** and dist/client.js
+```
+
+Then install the checkout the same way as any local plugin:
+
+```sh
+dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
+# or, from a git remote pinned to a branch/tag/commit:
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.2.0
+```
+
+A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
+
 Notes:
 
 - `dsh plugin` forwards to pnpm and then reconciles `dsh.profile.bundles` in `$DSH_HOME/profiles/web/package.json` from the *installed* state, so a git spec registers under this package's real name, `dsh-llm-trace-plugin`.
 - **Restart `dsh web` after installing.** An installed package is not a dev checkout, so there is no client-plugin HMR watcher.
-- This plugin's source is TypeScript, but the published/installed package ships only the compiled, plain-JavaScript `dist/` output — and declares **no `prepare` script**, so a git install needs no `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — the build-approval prompt that git-hosted plugins usually trigger does not apply here.
 - The package name changed from `dsh-llm-wire-trace-plugin` to `dsh-llm-trace-plugin`. If you installed it under the old name, remove that first: `dsh plugin --profile web remove dsh-llm-wire-trace-plugin`.
 
 ## Configuration
@@ -452,9 +452,9 @@ pnpm run test        # tsc -> .test-build, node --test
 pnpm run verify       # build + typecheck + test — the full self-check before calling a change done
 ```
 
-`dist/` is committed to the repository (and shipped in the published `files`), so an install — whether from npm or `git+https://...` — never needs to run a build. That is deliberate: **this package still declares no `prepare` script**, so a git install still needs no `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — the build-approval prompt git-hosted plugins usually trigger does not apply here. Only a contributor building from source needs Node + `pnpm run build`; a user installing the package gets plain JavaScript either way.
+`dist/` is **not** committed to the repository — it is a build artifact, gitignored like any other, produced by `pnpm run build` and produced fresh at publish time by the `prepublishOnly` script (so `npm publish` always ships a build matching the exact source at that commit). Only the *published npm package* carries a prebuilt `dist/`; a git checkout or `link:` install never does. See "[Installing from a source checkout](#installing-from-a-source-checkout-git-or-link)" above for what that means for those install paths.
 
-For local development, run `pnpm run build` after every source change, then reinstall the `link:.` checkout (or just restart `dsh web`, since a linked package's `dist/` is not covered by the client-plugin HMR watcher).
+For local development, run `pnpm run build` after every source change (needed for the plugin to run at all from this checkout — there is no committed `dist/` to fall back on), then reinstall the `link:.` checkout (or just restart `dsh web`, since a linked package's `dist/` is not covered by the client-plugin HMR watcher).
 
 ### Tests
 
@@ -462,7 +462,7 @@ For local development, run `pnpm run build` after every source change, then rein
 
 Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
 
-See [`AGENTS.md`](AGENTS.md) for the exact self-verification flow a change must complete before it's done, the module boundaries the test layout depends on, and the hard constraints (no `prepare` script, `dist/` stays committed, bodies stay verbatim) that protect this project's deliberate design choices.
+See [`AGENTS.md`](AGENTS.md) for the exact self-verification flow a change must complete before it's done, the module boundaries the test layout depends on, and the hard constraints (no `prepare` script, `dist/` stays a gitignored build artifact, bodies stay verbatim) that protect this project's deliberate design choices.
 
 See [`docs/plugin-development.md`](docs/plugin-development.md) for a short walkthrough of how this codebase uses the DSH/Cordis plugin framework itself — services, events, Slots, and the one thing (patching `fetch`) that only an installed package can do. See [`docs/architecture.md`](docs/architecture.md) for why this codebase's own modules are split the way they are and how data flows between them.
 

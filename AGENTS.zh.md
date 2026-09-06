@@ -50,8 +50,8 @@ pnpm run clean          # 删除 dist/ 与 .test-build/
 
 ## 硬性约束（不要撤销这些经过深思熟虑的决定）
 
-- **绝不要给 `package.json` 加 `prepare` 脚本。** 本包发布的是编译好的 `dist/`，所以 git 安装永远不需要构建，也就永远不会触发 pnpm 的 `allowBuilds` 审批提示——见 README 的"Install"一节。加上 `prepare` 会让以后每一次 git 安装都重新触发这个提示。
-- **`dist/` 必须保持纳入版本控制，绝不放进 `.gitignore`。** 它在这里不是随手扔掉的构建产物，而是真正发布的内容，刻意提交进版本库就是为了让 git spec 安装有东西可加载。不要因为"看起来像生成产物"就把它加进 `.gitignore`。
+- **npm 是唯一"免费"拿到构建产物的安装路径。** `prepublishOnly`（`pnpm run clean && pnpm run build`）会在发布者本机上作为 `npm publish`/`pnpm publish` 流程的一部分运行，所以 registry 上的 tarball 永远带着与发布时源码完全对应的最新 `dist/`。**不要**为了把这个能力延伸到 git-spec/`link:` 安装而加 `prepare` 脚本：pnpm ≥10 要求 git 依赖的 `prepare` 脚本必须经过明确的 `allowBuilds` 批准才能运行，这正好会重新引入本项目一直在避免的"允许这个包在你安装的这一刻在你机器上跑任意代码"的提示。git checkout 或本地 `link:` 安装拿到的只有源码，必须自己跑一次 `pnpm run build`——具体步骤见 README 的"Install"一节里给用户的说明。
+- **`dist/` 与 `.test-build/` 是 gitignore 掉的构建产物，不是仓库内容。** 绝不要提交它们，也绝不要把它们从 `.gitignore` 里移除——用 `pnpm run build` 重新生成即可（或者让 `prepublishOnly` 在发布时自动重新生成 `dist/`）。一份提交进版本库、却过期的 `dist/` 会在有人忘记先构建就提交时悄悄和 `src/` 脱节；不追踪它就彻底消除了这种失效模式。
 - **`README.md` 和 `README.zh.md` 是强制同步的一对。** 绝不允许只改一侧不改另一侧，也不允许让 `README.i18n.yaml` 记录的哈希过期——那里的不匹配意味着有翻译缺口在评审时被漏掉了。
 - **`src/host/persistence/` 里的 body 必须逐字存储。** 不要新增任何在请求/响应体落盘前对其做摘要、脱敏（超出 `authorization` 之外）或其他改写的逻辑；这个保证（见主 README 的"Persistence"一节）正是 curl 重放功能和合并后 SSE 视图值得信赖的前提。
 
