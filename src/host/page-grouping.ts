@@ -7,14 +7,14 @@
  * @module dsh-llm-trace-plugin/host/page-grouping
  */
 
-import type { GroupedPage, TurnStat, WireRecord, WireRecordSummary } from '../shared/record-shape.js'
+import type { AnyWireRecord, GroupedPage, TurnStat, WireRecordSummary } from '../shared/record-shape.js'
 
 /** Page size for a list request, clamped so one call cannot ask for the world. */
 export function capacity(limit: number | undefined, ceiling: number): number {
   return typeof limit === 'number' && limit > 0 ? Math.min(limit, ceiling) : ceiling
 }
 
-export function summarizeRecord(record: WireRecord): WireRecordSummary {
+export function summarizeRecord(record: AnyWireRecord): WireRecordSummary {
   return {
     id: record.id,
     startedAt: record.startedAt,
@@ -40,17 +40,25 @@ export function summarizeRecord(record: WireRecord): WireRecordSummary {
  * @param page - records, oldest first.
  * @param summarize - record-to-summary mapper.
  */
-export function summarizePage(page: WireRecord[], summarize: (record: WireRecord) => WireRecordSummary): GroupedPage {
+export function summarizePage(page: AnyWireRecord[], summarize: (record: AnyWireRecord) => WireRecordSummary): GroupedPage {
   const items: WireRecordSummary[] = []
-  for (let i = page.length - 1; i >= 0; i -= 1) items.push(summarize(page[i]))
-
   let unattributed = 0
-  for (const record of page) if (record.sessionId === null) unattributed += 1
-
-  const turnMap = new Map<number, { turn: number, calls: number, steps: Set<number> }>()
   let auxiliary = 0
-  for (const record of page) {
+  const turnMap = new Map<number, { turn: number, calls: number, steps: Set<number> }>()
+
+  // One reverse pass does all four jobs: the page arrives oldest-first and
+  // `items` must come out newest-first, so walking backwards produces the
+  // display order directly while the counters accumulate alongside.
+  for (let i = page.length - 1; i >= 0; i -= 1) {
+    const record = page[i]
+    items.push(summarize(record))
+
+    if (record.sessionId === null) unattributed += 1
+
     if (record.turn === null) {
+      // A purposed call (title generation, compaction) is not part of any
+      // turn by design, so it is counted separately rather than folded into
+      // whichever turn happens to sit next to it in time.
       if (record.purpose !== null) auxiliary += 1
       continue
     }
@@ -59,6 +67,7 @@ export function summarizePage(page: WireRecord[], summarize: (record: WireRecord
     if (record.step !== null) entry.steps.add(record.step)
     turnMap.set(record.turn, entry)
   }
+
   const turns: TurnStat[] = [...turnMap.values()]
     .sort((a, b) => b.turn - a.turn)
     .map((entry) => ({ turn: entry.turn, calls: entry.calls, steps: entry.steps.size }))

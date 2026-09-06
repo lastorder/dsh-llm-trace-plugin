@@ -134,3 +134,72 @@ test('buildCurl: includes --data-raw, single-quoted, when a request body is pres
   const command = buildCurl(record, undefined)
   assert.ok(command.includes(`--data-raw ${shQuote(record.request.bodyText)}`))
 })
+
+// -- buildCurl: non-bearer credential headers --
+
+/** A record whose credential rides a bare-key header, as Anthropic's does. */
+function anthropicRecord() {
+  return makeRecord({
+    request: {
+      method: 'POST',
+      url: 'https://api.anthropic.com/v1/messages',
+      headers: {
+        'x-api-key': '***redacted***',
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      bodyText: '{"model":"claude"}',
+      bodyChars: 18,
+      bodyTruncated: false,
+      bodyJson: { model: 'claude' },
+    },
+  })
+}
+
+test('buildCurl: rebuilds a bare-key credential header without a Bearer prefix', () => {
+  // Sending a bare key as `Bearer <key>` is rejected by the provider, which
+  // would make the copied command look broken rather than the credential look
+  // missing — so the original scheme (here: none) has to survive the rebuild.
+  const command = buildCurl(anthropicRecord(), { value: 'sk-ant-real' })
+  assert.ok(command.includes(shQuote('x-api-key: sk-ant-real')))
+  assert.ok(!command.includes('Bearer'))
+  assert.ok(!command.includes('***redacted***'))
+})
+
+test('buildCurl: a bare-key header with no resolved credential references $DSH_CURL_KEY, still unprefixed', () => {
+  const command = buildCurl(anthropicRecord(), undefined)
+  assert.ok(command.includes(`"x-api-key: $${CURL_OVERRIDE_ENV}"`))
+  assert.ok(!command.includes('Bearer'))
+  assert.ok(!command.includes('***redacted***'))
+})
+
+test('buildCurl: non-credential headers on the same record are still emitted verbatim', () => {
+  const command = buildCurl(anthropicRecord(), { value: 'sk-ant-real' })
+  assert.ok(command.includes(shQuote('anthropic-version: 2023-06-01')))
+})
+
+test('buildCurl: never leaves the redacted placeholder in the command for any credential header', () => {
+  const record = makeRecord({
+    request: {
+      method: 'POST',
+      url: 'https://gateway.example.com/v1/chat',
+      headers: {
+        authorization: 'Bearer ***redacted***',
+        'x-api-key': '***redacted***',
+        cookie: '***redacted***',
+      },
+      bodyText: '{}',
+      bodyChars: 2,
+      bodyTruncated: false,
+      bodyJson: {},
+    },
+  })
+  for (const resolved of [undefined, { value: 'real' }]) {
+    const command = buildCurl(record, resolved)
+    assert.ok(!command.includes('***redacted***'), `placeholder leaked with resolved=${JSON.stringify(resolved)}`)
+  }
+})
+
+test('KNOWN_HOST_CREDENTIAL_ENV: Anthropic maps to its conventional env var', () => {
+  assert.equal(KNOWN_HOST_CREDENTIAL_ENV.get('api.anthropic.com'), 'ANTHROPIC_API_KEY')
+})

@@ -16,6 +16,33 @@ import { fmtCount, maxDepthOf } from './json-model.js'
 import { parseSseFrames, prettySseText } from './sse.js'
 import { mergeSseChunks } from './sse-merge/index.js'
 import { createJsonView, type ReactLike as MinimalReactLike } from './json-view.js'
+import {
+  curlCopiedWithEnvRef,
+  curlFailed,
+  depthLabel,
+  fullSessionIdTitle,
+  hiddenUnattributedNotice,
+  sessionTitle,
+  truncatedBodyNotice,
+  turnGroupLabel,
+  turnGroupMeta,
+  UI,
+} from './strings.js'
+import {
+  describeBodyNotice,
+  groupRows,
+  isRawFallback,
+  isSseResponse,
+  mergeSummaryPages,
+  normalizePage,
+  RAW_KEY,
+  selectRequestBody,
+  selectResponseBody,
+  shouldFallBackToAllSessions,
+  stepDepth,
+  turnStatFor,
+  type ListPayload,
+} from './view-model.js'
 import type { WireRecord, WireRecordSummary } from '../shared/record-shape.js'
 
 /** Minimal shape of the plugin `ctx` this view needs (an `interval` timer helper). */
@@ -129,18 +156,18 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
      * @returns false when the payload triggered the fallback and should
      *   therefore not be rendered.
      */
-    const applyPage = React.useCallback((result: any, opts: { filtering: boolean, memoryOnly: boolean }) => {
-      const nextItems: WireRecordSummary[] = (result && result.items) || []
-      const nextMatched = result && typeof result.matched === 'number' ? result.matched : 0
-      const nextUnattributed = result && typeof result.unattributed === 'number' ? result.unattributed : 0
-      // Nothing of our own, but traffic exists that simply never carried a
-      // session id: filtering is useless here, so show everything instead of
-      // an empty tab. Only a payload that actually consulted disk can prove
-      // this — an in-memory page may just not have reached this session's
-      // records yet.
-      const decisive = !(result && result.historyPending === true)
-      if (opts.filtering && decisive && !fallbackUsed.current
-        && nextMatched === 0 && nextUnattributed > 0) {
+    const applyPage = React.useCallback((result: ListPayload | null, opts: { filtering: boolean, memoryOnly: boolean }) => {
+      const page = normalizePage(result)
+      if (shouldFallBackToAllSessions({
+        filtering: opts.filtering,
+        // Only a payload that actually consulted disk can prove there is
+        // nothing of ours: an in-memory page may just not have reached this
+        // session's records yet.
+        decisive: !page.historyPending,
+        alreadyUsed: fallbackUsed.current,
+        matched: page.matched,
+        unattributed: page.unattributed,
+      })) {
         fallbackUsed.current = true
         setAutoFellBack(true)
         setOnlySession(false)
@@ -151,27 +178,19 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       // rows INTO the existing list (by id, live copy winning) instead of
       // replacing it — otherwise a poll would erase history.
       if (opts.memoryOnly && historyLanded.current) {
-        setItems((prev: WireRecordSummary[]) => {
-          const byId = new Map<string, WireRecordSummary>()
-          for (const row of prev) byId.set(row.id, row)
-          for (const row of nextItems) byId.set(row.id, row)
-          return [...byId.values()].sort((a, b) => {
-            if (a.startedAt !== b.startedAt) return b.startedAt - a.startedAt
-            return a.id < b.id ? 1 : a.id > b.id ? -1 : 0
-          })
-        })
+        setItems((prev: WireRecordSummary[]) => mergeSummaryPages(prev, page.items))
         setError(null)
         return true
       }
 
       if (!opts.memoryOnly) historyLanded.current = true
-      setItems(nextItems)
-      setTruncated(result ? result.truncated === true : false)
-      setTotal(result ? result.total : 0)
-      setMatched(nextMatched)
-      setUnattributed(nextUnattributed)
-      setTurns((result && result.turns) || [])
-      setAuxiliary(result && typeof result.auxiliary === 'number' ? result.auxiliary : 0)
+      setItems(page.items)
+      setTruncated(page.truncated)
+      setTotal(page.total)
+      setMatched(page.matched)
+      setUnattributed(page.unattributed)
+      setTurns(page.turns)
+      setAuxiliary(page.auxiliary)
       setError(null)
       return true
     }, [])
@@ -278,14 +297,14 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           copy(result.command)
           const auth = result.auth || { kind: 'env', envName: 'DSH_CURL_KEY' }
           if (auth.kind === 'value') {
-            setCurlNotice('已复制，含解析到的真实密钥——它现在在你的剪贴板里，小心历史记录/共享屏幕。')
+            setCurlNotice(UI.curl.copiedWithKey)
           } else {
-            setCurlNotice('已复制，authorization 引用了 $' + auth.envName + '；先 export ' + auth.envName + '=你的密钥，再运行就不用改命令了。')
+            setCurlNotice(curlCopiedWithEnvRef(auth.envName))
           }
         },
         (reason: any) => {
           setCurlBusy(false)
-          setCurlNotice('生成失败：' + String((reason && reason.message) || reason))
+          setCurlNotice(curlFailed(String((reason && reason.message) || reason)))
         },
       )
     }
@@ -318,58 +337,33 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       })
     }, [])
 
-    // What each tab renders in the JSON view.
-    //
-    // Request always shows the parsed body; when the body isn't parseable
-    // JSON there is nothing to parse, so it degrades to a single `__raw__`
-    // key holding the exact text rather than pretending otherwise.
-    //
-    // Response has three shapes: an SSE body is, by default, REASSEMBLED —
-    // its scattered delta fragments merged back into the exact shape that
-    // provider's own non-streamed response would have had (see
-    // `sse-merge/index.ts`) — and shown through the exact same JSON tree
-    // Request uses; a JSON body is shown as-is; anything else degrades to
-    // `__raw__` the same way. A toggle switches an SSE response to the
-    // literal, unmerged bytes on the wire, because those bytes are this
-    // plugin's whole point and must stay one click away, even though they
-    // are no longer the default (they are close to unreadable directly: one
-    // reply is typically dozens to hundreds of frames, each carrying a
-    // character or two of content).
-    const isSse = detail !== null && detail.response !== null && detail.response.contentType !== null
-      && detail.response.contentType.includes('event-stream')
-    const requestParsed = detail !== null && detail.request.bodyJson !== null
-    const requestBody = detail === null ? null : (requestParsed ? detail.request.bodyJson : { __raw__: detail.request.bodyText })
-    const responseBody = React.useMemo(() => {
-      if (detail === null || detail.response === null) return null
-      if (isSse && sseMerged) return mergeSseChunks(parseSseFrames(detail.response.bodyText))
-      if (isSse) return parseSseFrames(detail.response.bodyText)
-      if (detail.response.bodyJson !== null) return detail.response.bodyJson
-      return { __raw__: detail.response.bodyText }
-    }, [detail, isSse, sseMerged])
+    // What each tab renders in the JSON view; see `view-model.ts` for the
+    // exact rules and why each shape was chosen.
+    const isSse = isSseResponse(detail)
+    const requestBody = selectRequestBody(detail)
+    const responseBody = React.useMemo(
+      () => selectResponseBody({
+        detail,
+        merged: sseMerged,
+        parseFrames: parseSseFrames,
+        mergeFrames: mergeSseChunks,
+      }),
+      [detail, sseMerged],
+    )
     const treeValue = tab === 'request' ? requestBody : responseBody
 
-    // Why the JSON view fell back to a single `__raw__` blob.
-    //
-    // Overwhelmingly the reason is truncation: a body cut at the character
-    // cap stops mid-JSON, so it cannot parse. Saying that outright beats
-    // showing an unexplained `__raw__` key and letting the reader assume the
-    // plugin mangled their request.
+    // Why the JSON view fell back to a single `__raw__` blob — overwhelmingly
+    // because a body cut at the character cap stops mid-JSON and cannot parse.
     const shownBody = detail === null
       ? null
       : (tab === 'request' ? detail.request : detail.response)
-    const bodyTruncated = shownBody !== null && shownBody !== undefined && shownBody.bodyTruncated === true
-    const rawFallback = treeValue !== null
-      && typeof treeValue === 'object'
-      && !Array.isArray(treeValue)
-      && Object.keys(treeValue).length === 1
-      && Object.prototype.hasOwnProperty.call(treeValue, '__raw__')
-    const bodyNotice = !rawFallback
+    const rawFallback = isRawFallback(treeValue)
+    const notice = describeBodyNotice({ treeValue, shown: shownBody })
+    const bodyNotice = notice.kind === 'none'
       ? null
-      : (bodyTruncated
-        ? '原始内容共 ' + fmtCount(shownBody!.bodyChars) + ' 个字符，超出上限，只保留了前 '
-          + fmtCount((shownBody!.bodyText || '').length) + ' 个字符。'
-          + '被截断的 JSON 无法解析，因此只能按原文显示；调高 maxBodyChars 可以保留更多。'
-        : '这段内容不是 JSON，按原文显示。')
+      : (notice.kind === 'truncated'
+        ? truncatedBodyNotice(fmtCount(notice.totalChars), fmtCount(notice.keptChars))
+        : UI.notice.notJson)
     // The raw view shows the literal bytes only when the reader explicitly
     // asked to see them (`!sseMerged`); the merged view — including the
     // frame-list fallback if merging ever needed one — stays on the JSON
@@ -390,7 +384,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
 
     // Global depth stepper: reset the baseline and drop manual overrides.
     const step = (delta: number) => {
-      const next = Math.max(0, Math.min(contentDepth, depth + delta))
+      const next = stepDepth(depth, delta, contentDepth)
       if (next === depth) return
       setDepth(next)
       setOverrides(new Map())
@@ -429,48 +423,33 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           filtering ? null : h('span', {
             key: 'sid',
             title: item.sessionId === null || item.sessionId === undefined
-              ? '该请求在线路上没有携带 session 标记。'
-              : 'session ' + item.sessionId,
+              ? UI.session.noneTitle
+              : sessionTitle(item.sessionId),
           }, sessionLabel(item.sessionId, currentSessionId)),
         ].filter(Boolean)),
       ],
     ))
 
-    // Insert a sticky group header whenever the turn changes going down the
-    // list (which is newest-first, so turns descend). Auxiliary and
-    // unattributed calls get their own group rather than being folded into
-    // whichever turn happens to sit next to them in time.
-    const groupKeyOf = (item: WireRecordSummary) => {
-      if (purposeLabel(item.purpose) !== null) return 'aux'
-      if (typeof item.turn === 'number') return 'turn:' + item.turn
-      return 'none'
-    }
-    const groupHeader = (item: WireRecordSummary) => {
-      const key = groupKeyOf(item)
-      if (key === 'aux') return { text: '后台辅助调用', meta: '不属于任何 turn' }
-      if (key === 'none') return { text: '无归属调用', meta: '未经过 ctx.llm' }
-      const stat = turns.find((entry) => entry.turn === item.turn)
+    // A sticky group header is emitted wherever the group changes going down
+    // the list (newest-first, so turns descend). Grouping rules live in
+    // `view-model.ts`; this only renders them.
+    const groupHeaderContent = (group: { key: string, turn: number | null }) => {
+      if (group.key === 'aux') return { text: UI.group.auxiliary, meta: UI.group.auxiliaryMeta }
+      if (group.key === 'none') return { text: UI.group.unattributed, meta: UI.group.unattributedMeta }
+      const stat = turnStatFor(turns, group.turn)
       return {
-        text: '第 ' + item.turn + ' 轮',
-        meta: stat === undefined
-          ? ''
-          : stat.calls + ' 次调用' + (stat.steps > 0 ? ' · ' + stat.steps + ' step' : ''),
+        text: turnGroupLabel(group.turn as number),
+        meta: stat === null ? '' : turnGroupMeta(stat.calls, stat.steps),
       }
     }
     const groupedRows: any[] = []
-    let lastGroup: string | null = null
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i]
-      const key = groupKeyOf(item)
-      if (key !== lastGroup) {
-        const head = groupHeader(item)
-        groupedRows.push(h('div', { className: 'wt-turn', key: 'g:' + key }, [
-          h('span', { className: 'wt-turn-n', key: 'n' }, head.text),
-          head.meta === '' ? null : h('span', { className: 'wt-turn-meta', key: 'm' }, head.meta),
-        ].filter(Boolean)))
-        lastGroup = key
-      }
-      groupedRows.push(rows[i])
+    for (const group of groupRows(items)) {
+      const head = groupHeaderContent(group)
+      groupedRows.push(h('div', { className: 'wt-turn', key: 'g:' + group.key }, [
+        h('span', { className: 'wt-turn-n', key: 'n' }, head.text),
+        head.meta === '' ? null : h('span', { className: 'wt-turn-meta', key: 'm' }, head.meta),
+      ].filter(Boolean)))
+      for (let i = 0; i < group.items.length; i += 1) groupedRows.push(rows[group.start + i])
     }
 
     return h('div', { className: 'wt-root' }, [
@@ -480,7 +459,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
             className: 'wt-btn',
             key: 'auto',
             'data-on': auto ? '1' : '0',
-            title: auto ? '每 3 秒自动刷新（只读内存中的实时记录，不扫描磁盘）。点击暂停。' : '已暂停刷新。点击恢复并立即刷新一次。',
+            title: auto ? UI.toolbar.autoOnTitle : UI.toolbar.autoOffTitle,
             onClick: () => {
               const next = !auto
               setAuto(next)
@@ -491,17 +470,15 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                 setHistoryTick((n: number) => n + 1)
               }
             },
-          }, auto ? '自动刷新' : '已暂停'),
+          }, auto ? UI.toolbar.autoOn : UI.toolbar.autoOff),
           h('button', {
             className: 'wt-btn',
             key: 'scope',
             'data-on': filtering ? '1' : '0',
             disabled: currentSessionId === null,
             title: currentSessionId === null
-              ? '拿不到当前 session id，只能显示全部记录。'
-              : (filtering
-                ? '当前只显示本 session 的 provider 调用。点击查看全部记录（含其他 session 和无 session 标记的调用）。'
-                : '当前显示全部记录。点击只看本 session。'),
+              ? UI.toolbar.scopeUnavailableTitle
+              : (filtering ? UI.toolbar.scopeFilteringTitle : UI.toolbar.scopeAllTitle),
             onClick: () => {
               if (currentSessionId === null) return
               // An explicit choice ends the automatic fallback for good.
@@ -509,11 +486,11 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
               setAutoFellBack(false)
               setOnlySession(!onlySession)
             },
-          }, filtering ? '当前 Session' : '全部 Session'),
+          }, filtering ? UI.toolbar.scopeSession : UI.toolbar.scopeAll),
           h('button', {
             className: 'wt-btn',
             key: 'clear',
-            title: '清空全部记录（不区分 session），磁盘上的历史记录也会一并删除。',
+            title: UI.toolbar.clearTitle,
             onClick: () => {
               apiPost('clear', {}).then(() => {
                 setSelected(null)
@@ -523,90 +500,83 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                 setHistoryTick((n: number) => n + 1)
               }, (reason: any) => setError(String(reason)))
             },
-          }, '清空'),
+          }, UI.toolbar.clear),
           h('span', {
             className: 'wt-meta',
             key: 'meta',
-            title: filtering ? '本 session 命中数 / 全部记录数（含磁盘）' : '已加载 / 全部记录数（含磁盘）',
+            title: filtering ? UI.toolbar.metaFilteredTitle : UI.toolbar.metaAllTitle,
           }, (filtering ? matched : items.length) + ' / ' + total
             + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
-            + (auxiliary > 0 ? ' · ' + auxiliary + ' 辅助' : '')),
+            + (auxiliary > 0 ? ' · ' + auxiliary + UI.toolbar.auxiliarySuffix : '')),
         ]),
         error === null ? null : h('div', { className: 'wt-err', key: 'err' }, error),
         h('div', { className: 'wt-list', key: 'list' },
           items.length === 0
-            ? h('div', { className: 'wt-empty' }, filtering
-              ? '本 session 尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。'
-              : '尚未捕获到 provider 调用。发一条消息后这里会出现记录（只记录带 deepseek-harness user-agent 的请求）。')
+            ? h('div', { className: 'wt-empty' }, filtering ? UI.empty.filtered : UI.empty.all)
             : [
               ...groupedRows,
               // Live records are already on screen; the disk half is still
               // arriving. Say so, so an incomplete list is never mistaken for
               // the whole history.
               historyLoading
-                ? h('div', { className: 'wt-jnotice', key: '#history' }, '正在后台载入磁盘历史记录…')
+                ? h('div', { className: 'wt-jnotice', key: '#history' }, UI.notice.historyLoading)
                 : null,
               // The provider never stamped a session id, so the default
               // filter was dropped. Explain it where it was noticed.
               autoFellBack
-                ? h('div', { className: 'wt-jnotice', key: '#fallback' },
-                  '本 session 没有可归属的记录（这些调用没有经过 ctx.llm，例如插件重载前就已经发出的请求），已自动显示全部记录。')
+                ? h('div', { className: 'wt-jnotice', key: '#fallback' }, UI.notice.autoFellBack)
                 : null,
               // Records with no session identity are hidden by the filter,
               // but never silently: say how many, and where to see them.
               filtering && unattributed > 0
-                ? h('div', { className: 'wt-jnotice', key: '#unattributed' },
-                  '另有 ' + fmtCount(unattributed) + ' 条无归属记录（没有经过 ctx.llm 的请求），点击「全部 Session」查看。')
+                ? h('div', { className: 'wt-jnotice', key: '#unattributed' }, hiddenUnattributedNotice(fmtCount(unattributed)))
                 : null,
               // Say so rather than implying the page showed everything: a
               // filtered history read stops at a bounded scan budget.
               truncated
-                ? h('div', { className: 'wt-jnotice', key: '#truncated' },
-                  '磁盘上还有更早的记录未被扫描（单次查询有读取上限）。')
+                ? h('div', { className: 'wt-jnotice', key: '#truncated' }, UI.notice.truncatedHistory)
                 : null,
             ].filter(Boolean)),
       ].filter(Boolean)),
       h('div', { className: 'wt-right', key: 'right' }, [
         h('div', { className: 'wt-tabs', key: 'tabs' }, [
-          h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, 'Request'),
-          h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, 'Response'),
+          h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, UI.tabs.request),
+          h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, UI.tabs.response),
           h('span', { className: 'wt-div', key: 'div' }),
           isSse && tab === 'response'
             ? h('button', {
               className: 'wt-btn',
               key: 'sse',
               'data-on': sseMerged ? '1' : '0',
-              title: sseMerged
-                ? '当前把分散的 delta 增量合并成完整内容，仍按 JSON 树展示。点击查看线路上的原始 SSE 文本。'
-                : '当前显示线路上的原始 SSE 文本（未合并）。点击切回合并后的完整内容。',
+              title: sseMerged ? UI.tabs.sseMergedTitle : UI.tabs.sseRawTitle,
               onClick: () => setSseMerged(!sseMerged),
-            }, sseMerged ? '优化展示' : '原始 SSE')
+            }, sseMerged ? UI.tabs.sseMerged : UI.tabs.sseRaw)
             : null,
           h('button', {
             className: 'wt-btn wt-btn-step',
             key: 'less',
-            title: '整体折叠一层',
+            title: UI.tabs.collapseTitle,
             onClick: () => step(-1),
             disabled: detail === null || showRaw || depth <= 0,
-          }, '−'),
+          }, UI.tabs.collapse),
           h('button', {
             className: 'wt-btn wt-btn-step',
             key: 'more',
-            title: '整体展开一层',
+            title: UI.tabs.expandTitle,
             onClick: () => step(1),
             disabled: detail === null || showRaw || depth >= contentDepth,
-          }, '+'),
-          h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : '深度 ' + depth + '/' + contentDepth),
+          }, UI.tabs.expand),
+          h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : depthLabel(depth, contentDepth)),
           h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.request.method + ' ' + detail.request.url),
           h('button', {
             className: 'wt-btn',
             key: 'curl',
             disabled: detail === null || curlBusy,
-            title: '生成一条可以直接在命令行里跑的 curl 命令并复制到剪贴板。authorization 会尝试补上真实密钥，补不到就留占位符。',
+            title: UI.tabs.curlTitle,
             onClick: copyCurl,
-          }, curlBusy ? '生成中…' : '复制 curl'),
-          h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, '复制'),
-          h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, '下载'),
+          }, curlBusy ? UI.tabs.curlBusy : UI.tabs.curl),
+          h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, UI.tabs.copy),
+          h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, UI.tabs.download),
         ].filter(Boolean)),
         // Always-visible coordinate strip for the selected record: the
         // harness facts that the wire bytes below can never tell you.
@@ -619,29 +589,29 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           ])
           const parts: any[] = []
           if (aux !== null) {
-            parts.push(coord('用途', aux, '后台辅助调用，不属于任何一次对话 turn。'))
+            parts.push(coord(UI.coord.purpose, aux, UI.coord.purposeTitle))
           } else if (typeof detail.turn === 'number') {
-            parts.push(coord('Turn', String(detail.turn), '第几轮对话。'))
+            parts.push(coord(UI.coord.turn, String(detail.turn), UI.coord.turnTitle))
             parts.push(h('span', { className: 'wt-coord-sep', key: 's1' }))
-            parts.push(coord('Step', detail.step === null ? '—' : String(detail.step), '一个 step = 一次模型调用。'))
+            parts.push(coord(UI.coord.step, detail.step === null ? UI.coord.none : String(detail.step), UI.coord.stepTitle))
           } else {
-            parts.push(coord('归属', badge.text, badge.title))
+            parts.push(coord(UI.coord.attribution, badge.text, badge.title))
           }
           if (detail.provider !== null && detail.provider !== undefined) {
             parts.push(h('span', { className: 'wt-coord-sep', key: 's2' }))
-            parts.push(coord('Provider', String(detail.provider), '解析到的 provider 路由。'))
+            parts.push(coord(UI.coord.provider, String(detail.provider), UI.coord.providerTitle))
           }
           if (detail.sessionId) {
             parts.push(h('span', { className: 'wt-coord-sep', key: 's3' }))
-            parts.push(coord('Session', shortSessionId(detail.sessionId), '完整 session id：' + detail.sessionId))
+            parts.push(coord(UI.coord.session, shortSessionId(detail.sessionId), fullSessionIdTitle(detail.sessionId)))
           }
           return h('div', { className: 'wt-coords', key: 'coords' }, parts)
         })(),
         curlNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'curl-notice', style: { padding: '4px 12px' } }, curlNotice),
         detail === null
-          ? h('div', { className: 'wt-empty', key: 'empty' }, '在左侧选择一条记录查看完整请求/响应。')
+          ? h('div', { className: 'wt-empty', key: 'empty' }, UI.empty.noSelection)
           : (tab === 'response' && detail.response === null)
-            ? h('div', { className: 'wt-empty', key: 'pending' }, '响应尚未到达（连接失败或仍在等待）。')
+            ? h('div', { className: 'wt-empty', key: 'pending' }, UI.empty.responsePending)
             : showRaw
               ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
               : h(React.Fragment, { key: 'json' }, [
@@ -654,7 +624,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                 // synthetic `__raw__` object only dressed it up as JSON it is
                 // not, and buried it one expand deep.
                 rawFallback
-                  ? h('pre', { className: 'wt-sse', key: 'text' }, (treeValue as any).__raw__ || '')
+                  ? h('pre', { className: 'wt-sse', key: 'text' }, (treeValue as Record<string, string>)[RAW_KEY] || '')
                   : h(JsonView, {
                     key: 'tree',
                     value: treeValue,

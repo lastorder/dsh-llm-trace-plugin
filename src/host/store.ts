@@ -5,12 +5,12 @@
  * @module dsh-llm-trace-plugin/host/store
  */
 
-import type { GroupedPage, ListAllPage, ListPage, WireRecord } from '../shared/record-shape.js'
+import type { AnyWireRecord, GroupedPage, ListAllPage, ListPage, WireRecord } from '../shared/record-shape.js'
 import { ARCHIVE_CACHE_TTL_MS, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_RECORDS, LIST_PAGE_CEILING } from './constants.js'
-import { installFetchPatch, wrapFetch } from './fetch-patch.js'
+import { wrapFetch } from './fetch-patch.js'
 import { capacity, summarizePage, summarizeRecord } from './page-grouping.js'
 import { tryParseJson } from './http-utils.js'
-import type { RecordArchive } from './persistence/archive.js'
+import type { ArchiveListResult, RecordArchive } from './persistence/archive.js'
 
 export interface WireTraceStoreOptions {
   maxRecords?: number
@@ -58,10 +58,10 @@ export interface WireTraceStore {
  * dependency-free of any web/route concerns so it can be unit-tested against
  * a fake `fetch`.
  */
-export function createWireTraceStore(options?: WireTraceStoreOptions): WireTraceStore {
-  const maxRecords = options?.maxRecords || DEFAULT_MAX_RECORDS
-  const maxBodyChars = options?.maxBodyChars || DEFAULT_MAX_BODY_CHARS
-  const archive = options?.archive ?? null
+export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): WireTraceStore {
+  const maxRecords = storeOptions?.maxRecords || DEFAULT_MAX_RECORDS
+  const maxBodyChars = storeOptions?.maxBodyChars || DEFAULT_MAX_BODY_CHARS
+  const archive = storeOptions?.archive ?? null
   const records: WireRecord[] = []
 
   function push(record: WireRecord) {
@@ -120,9 +120,9 @@ export function createWireTraceStore(options?: WireTraceStoreOptions): WireTrace
    * The promise is cached rather than its value, so concurrent callers share
    * one scan instead of each starting their own.
    */
-  let archiveCache: { key: string, at: number, promise: Promise<any> } | null = null
+  let archiveCache: { key: string, at: number, promise: Promise<ArchiveListResult> } | null = null
 
-  function listArchive(settings: ListOptions) {
+  function listArchive(settings: ListOptions): Promise<ArchiveListResult> {
     const key = `${settings.sessionId ?? ''}|${capacity(settings.limit, LIST_PAGE_CEILING)}`
     const now = Date.now()
     if (archiveCache !== null && archiveCache.key === key && now - archiveCache.at < ARCHIVE_CACHE_TTL_MS) {
@@ -144,6 +144,33 @@ export function createWireTraceStore(options?: WireTraceStoreOptions): WireTrace
   /** Drop the cached page so the next read sees disk as it is now. */
   function invalidateArchiveCache() {
     archiveCache = null
+  }
+
+  /**
+   * Attach the `bodyJson` parses a detail view needs, derived from the record's
+   * own `bodyText`.
+   *
+   * In-memory records carry `bodyJson: null` by design (see fetch-patch.ts):
+   * parsing at capture time cost a multi-megabyte `JSON.parse` on the hot path
+   * and then held the result for the life of the ring, for a field only the
+   * detail view ever reads. Deriving it here means exactly the records a
+   * reader actually opens get parsed, one at a time.
+   *
+   * This mirrors `fromPersisted` in the persistence codec, so a live record
+   * and a restored one are indistinguishable to every consumer — including the
+   * rule that an SSE body is a frame sequence and never one JSON value.
+   */
+  function hydrateBodies(record: WireRecord): WireRecord {
+    const contentType = record.response === null ? null : record.response.contentType
+    const isEventStream = typeof contentType === 'string' && contentType.includes('event-stream')
+    return {
+      ...record,
+      request: { ...record.request, bodyJson: tryParseJson(record.request.bodyText) },
+      response: record.response === null ? null : {
+        ...record.response,
+        bodyJson: isEventStream ? null : tryParseJson(record.response.bodyText),
+      },
+    }
   }
 
   return {
@@ -205,7 +232,7 @@ export function createWireTraceStore(options?: WireTraceStoreOptions): WireTrace
       const page = await listArchive(settings)
 
       // Disk first so the live copy of a shared id overwrites the stored one.
-      const merged = new Map<string, WireRecord>()
+      const merged = new Map<string, AnyWireRecord>()
       for (const record of page.records) merged.set(record.id, record)
       for (const record of memory.page) merged.set(record.id, record)
 
@@ -242,9 +269,14 @@ export function createWireTraceStore(options?: WireTraceStoreOptions): WireTrace
      * Look up one record: memory first, then disk. The disk fallback is what
      * makes a restored row's detail view, and its curl command, keep working
      * after the record has aged out of the ring.
+     *
+     * A memory hit is hydrated on the way out (see `hydrateBodies`); the
+     * archive path already re-derives its own parses in `fromPersisted`.
      */
     async get(id) {
-      for (let i = records.length - 1; i >= 0; i -= 1) if (records[i].id === id) return records[i]
+      for (let i = records.length - 1; i >= 0; i -= 1) {
+        if (records[i].id === id) return hydrateBodies(records[i])
+      }
       if (archive === null) return null
       return archive.get(id, tryParseJson)
     },
@@ -267,5 +299,3 @@ export function createWireTraceStore(options?: WireTraceStoreOptions): WireTrace
     },
   }
 }
-
-export { installFetchPatch }

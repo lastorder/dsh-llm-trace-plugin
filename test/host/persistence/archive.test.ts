@@ -140,18 +140,6 @@ test('clear removes every persisted record and reports the count', async () => {
   })
 })
 
-test('restore loads the newest records back, oldest-first, with full bodies', async () => {
-  await withTempDir(async (dir) => {
-    const archive = createRecordArchive({ dir })
-    await archive.save(makeRecord({ id: buildRecordName(1000).slice(0, -5), startedAt: 1000 }))
-    await archive.save(makeRecord({ id: buildRecordName(2000).slice(0, -5), startedAt: 2000 }))
-    const restored = await archive.restore({ parseJson: (text) => (text ? JSON.parse(text) : null) })
-    assert.equal(restored.length, 2)
-    assert.ok(restored[0].startedAt < restored[1].startedAt)
-    assert.notEqual(restored[0].request.bodyText, null)
-  })
-})
-
 test('stats reports dir/retained/maxRecords/writes/failures', async () => {
   await withTempDir(async (dir) => {
     const archive = createRecordArchive({ dir, maxRecords: 5 })

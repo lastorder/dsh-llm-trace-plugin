@@ -40,13 +40,14 @@
 import { randomBytes } from 'node:crypto'
 import { mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { WireRecord } from '../../shared/record-shape.js'
+import type { AnyWireRecord, WireRecord } from '../../shared/record-shape.js'
 import {
   DEFAULT_MAX_PERSISTED,
   DEFAULT_PAGE_LIMIT,
   DEFAULT_PRETTY_BODY_LIMIT,
   RECORD_FILE,
   SCAN_BATCH,
+  SWEEP_INTERVAL,
   TEMP_FILE,
 } from './constants.js'
 import { fromPersisted, toMeta, toPersisted } from './codec.js'
@@ -77,7 +78,7 @@ export interface ArchiveListQuery {
 }
 
 export interface ArchiveListResult {
-  records: WireRecord[]
+  records: AnyWireRecord[]
   total: number
   scanned: number
   /** True when older records exist that this bounded scan did not reach. */
@@ -98,7 +99,6 @@ export interface RecordArchive {
   save(record: WireRecord): Promise<boolean>
   list(query?: ArchiveListQuery): Promise<ArchiveListResult>
   get(id: string, parseJson?: (text: string | null) => unknown): Promise<WireRecord | null>
-  restore(query?: { limit?: number, parseJson?: (text: string | null) => unknown }): Promise<WireRecord[]>
   sweepTemp(): Promise<void>
   clear(): Promise<number>
   sweep(): Promise<void>
@@ -182,7 +182,7 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
     id: string,
     parseJson: (text: string | null) => unknown,
     metaOnly: boolean,
-  ): Promise<WireRecord | null> {
+  ): Promise<AnyWireRecord | null> {
     if (!RECORD_FILE.test(`${id}.json`)) return null
     try {
       const text = await readFile(join(dir, `${id}.json`), 'utf8')
@@ -203,7 +203,7 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
   async function sweep(force?: boolean): Promise<void> {
     if (sweeping) return
     // Amortize: a readdir per record would dominate the cost of writing one.
-    if (!force && sinceSweep < 50) return
+    if (!force && sinceSweep < SWEEP_INTERVAL) return
     sweeping = true
     sinceSweep = 0
     try {
@@ -308,7 +308,7 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
         ? Math.min(cap, total)
         : Math.max(cap, Math.min(total, pageLimit * 2))
 
-      const found: WireRecord[] = []
+      const found: AnyWireRecord[] = []
       let scanned = 0
       let cursor = names.length - 1
 
@@ -348,23 +348,15 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
       }
     },
 
-    get(id, parseJson) {
-      return readRecord(id, parseJson ?? (() => null), false)
-    },
-
     /**
-     * Load the newest records back into memory at startup, and sweep away any
-     * orphan temp files left by an unclean shutdown.
+     * Read one full record by id, bodies included.
+     *
+     * `metaOnly: false` is what separates this from a list read: a detail view
+     * and the curl builder genuinely need `bodyText`, so this is the one path
+     * that pays the parse.
      */
-    async restore(query) {
-      const request = query ?? {}
-      await ensureDir()
-      void this.sweepTemp()
-      // Full records: these repopulate the in-memory ring, whose consumers
-      // (detail view, curl) expect real bodies.
-      const page = await this.list({ limit: request.limit, parseJson: request.parseJson, full: true })
-      // Oldest first: the in-memory ring is chronological, newest at the end.
-      return page.records.slice().reverse()
+    get(id, parseJson) {
+      return readRecord(id, parseJson ?? (() => null), false) as Promise<WireRecord | null>
     },
 
     /** Remove temp files stranded by a crash mid-write. */

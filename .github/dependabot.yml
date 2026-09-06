@@ -1,0 +1,36 @@
+version: 2
+
+# Keeps the toolchain from silently drifting. Before this file existed, all
+# four GitHub Actions in release.yml had fallen two to three major versions
+# behind without anything reporting it.
+updates:
+  # GitHub Actions. Grouped into one PR: bumping them together is how they are
+  # actually reviewed and tested, and four separate PRs a month is noise.
+  #
+  # Note that softprops/action-gh-release is pinned to a commit SHA on purpose
+  # (see release.yml). Dependabot understands SHA pins and will propose the new
+  # SHA with its version comment updated, which is exactly the reviewable form
+  # this repository wants.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: 'ci'
+
+  # devDependencies only — this package has no runtime dependencies at all, so
+  # there is nothing else to track.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      dev-dependencies:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: 'build'

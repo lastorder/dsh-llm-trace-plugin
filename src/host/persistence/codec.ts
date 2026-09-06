@@ -8,7 +8,7 @@
  * @module dsh-llm-trace-plugin/host/persistence/codec
  */
 
-import type { WireRecord } from '../../shared/record-shape.js'
+import type { WireRecord, WireRecordMeta } from '../../shared/record-shape.js'
 import { DEFAULT_PRETTY_BODY_LIMIT } from './constants.js'
 
 /** Best-effort parse used only to make a stored body readable. Never throws. */
@@ -144,21 +144,20 @@ export function fromPersisted(stored: any, parseJson: (text: string | null) => u
  * Project a stored record down to exactly the fields a LIST row needs,
  * without ever touching the body text.
  *
- * This mirrors `summary()` in the plugin's store: those are the only fields a
- * list row can display. Everything omitted here — `bodyText`, `bodyJson`,
- * headers — is precisely the bulk of the file, and skipping it is what makes
- * listing cheap enough not to block the shared event loop.
+ * This mirrors `summarizeRecord` in page-grouping.ts: those are the only
+ * fields a list row can display. Everything omitted here — `bodyText`,
+ * `bodyJson`, headers — is precisely the bulk of the file, and skipping it is
+ * what makes listing cheap enough not to block the shared event loop.
  *
- * `bodyText` is deliberately carried through as `null` rather than dropped:
- * consumers that spread this record still see the key with a defined shape,
- * and `bodyChars` (already stored as a scalar) supplies the size the list
- * actually displays.
+ * `bodyText` is carried through as an explicit `null` rather than dropped, so
+ * a consumer that spreads this record still sees the key with a defined shape;
+ * `bodyChars` (already a stored scalar) supplies the size the list displays.
+ * The return type says all of this outright — see {@link WireRecordMeta}.
  */
-export function toMeta(stored: any): WireRecord {
+export function toMeta(stored: any): WireRecordMeta {
   const request = stored.request ?? {}
   const response = stored.response ?? null
   return {
-    v: stored.v ?? 1,
     id: stored.id,
     startedAt: stored.startedAt ?? null,
     endedAt: stored.endedAt ?? null,
@@ -193,5 +192,5 @@ export function toMeta(stored: any): WireRecord {
     },
     error: stored.error ?? null,
     recorderError: stored.recorderError ?? null,
-  } as unknown as WireRecord
+  }
 }

@@ -33,6 +33,27 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
   res.end(body)
 }
 
+/**
+ * Whether a mutating request may proceed, judged by `Sec-Fetch-Site`.
+ *
+ * `clear` deletes every persisted record, and this server listens on
+ * localhost with no authentication — so any page the user happens to have
+ * open could otherwise wipe their trace history with a single cross-origin
+ * request. The browser stamps `Sec-Fetch-Site` itself and a page cannot forge
+ * it, which makes it the right signal here.
+ *
+ * Absent header means the caller is NOT a modern browser (curl, a script, a
+ * test), so this fails OPEN: the threat being closed is specifically the
+ * drive-by browser request, and refusing every non-browser client would break
+ * legitimate scripted use for no security gain.
+ */
+export function isSameOriginRequest(req: Pick<IncomingMessage, 'headers'>): boolean {
+  const site = req.headers['sec-fetch-site']
+  if (site === undefined) return true
+  const value = Array.isArray(site) ? site[0] : site
+  return value === 'same-origin' || value === 'none'
+}
+
 export interface RouteDeps {
   store: WireTraceStore
   routePrefix: string
@@ -96,6 +117,19 @@ export function createRouteHandler(deps: RouteDeps) {
         return
       }
       if (method === 'clear') {
+        // Destructive, so it is POST-only and same-origin-only. A bare
+        // `GET /llm-wire-trace/clear` used to delete every persisted record,
+        // which any cross-origin page could trigger as a plain navigation or
+        // image load without ever reading the response.
+        if (req.method !== 'POST') {
+          res.setHeader('allow', 'POST')
+          sendJson(res, 405, { error: 'clear requires POST' })
+          return
+        }
+        if (!isSameOriginRequest(req)) {
+          sendJson(res, 403, { error: 'clear requires a same-origin request' })
+          return
+        }
         const body = await readJsonBody(req)
         sendJson(res, 200, await store.clear({ keepPersisted: body.keepPersisted === true }))
         return

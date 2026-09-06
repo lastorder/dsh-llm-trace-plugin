@@ -61,7 +61,6 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 |---|---|---|
 | `maxRecords` | `200` | 内存环形缓冲区大小；只在内存中保留最近的 N 条记录。body 同样驻留在内存中，如果你经常发送非常大的请求，可以调低该值。 |
 | `maxBodyChars` | `8000000` | 单个字段被截断前的字符上限。该值足以容纳完整的 1M token 上下文（约 400 万字符）并留有 2 倍余量；从中间被截断的 JSON 无法解析，查看器只能按原文显示。 |
-| `routePrefix` | `/llm-wire-trace` | 本插件自身 HTTP 路由的前缀。 |
 | `persist` | `true` | 将记录写入磁盘，使其在重启后依然存在。设为 `false` 则只保留在内存中。 |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | 记录文件的存放目录。 |
 | `maxPersistedRecords` | `300` | 磁盘上保留的记录数；超出后删除最旧的。 |
@@ -132,11 +131,11 @@ body 的上限是按 1M token 上下文来定的，因此单条记录可能很�
 
 Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打开的标签页什么都不会读。打开它时，先渲染内存中的实时记录，磁盘历史随后在后台并入 —— 在历史尚未到达期间，界面会明确说明这一点。之后的自动刷新只轮询内存，所以盯着一个实时 session 看，永远不会重新扫描磁盘。
 
-捕获会立即开始，磁盘缓慢或故障都不会拖慢 fetch 补丁，也不会让任何请求失败。持久化过程中的错误会被计数，并通过 `GET <routePrefix>/stats` 汇报，而绝不会抛进捕获链路。
+捕获会立即开始，磁盘缓慢或故障都不会拖慢 fetch 补丁，也不会让任何请求失败。持久化过程中的错误会被计数，并通过 `GET /llm-wire-trace/stats` 汇报，而绝不会抛进捕获链路。
 
 ### 隐私：请求体按原样落盘
 
-`authorization` 头在磁盘上同样会被脱敏，与内存中一致。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
+凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`cookie` 和 `set-cookie`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
 
 在查看器中执行「清空」时，磁盘上的副本也会一并删除 —— 否则「清空」会在下次重启后自己变回来。
 
@@ -160,7 +159,8 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 - 非提供方的调用直接透传：不记录、不克隆，响应体对它自己的调用方完整无损。
 - 提供方调用的调用方依然能读到完整、未经修改的响应体 —— 镜像永远不会与之争抢。
 - 传输失败（底层 `fetch` 抛错）会被记录并**原样重新抛出** —— 绝不吞掉。
-- `authorization` 在存储或展示前一律脱敏为 `Bearer ***redacted***`；其他请求头不作任何改动。
+- 所有凭据类请求头在存储或展示前一律脱敏：`authorization` 与 `proxy-authorization` 变为 `Bearer ***redacted***`，而裸密钥类请求头（`x-api-key`、`api-key`、`x-goog-api-key`、`cookie`、`set-cookie`）变为 `***redacted***`，不会凭空加上并不存在的 scheme。其他请求头不作任何改动。
+- 具有破坏性的 `clear` 路由仅接受 `POST`，并会拒绝跨源请求（依据 `Sec-Fetch-Site`），因此浏览器里打开的其他页面无法清空你的追踪历史。
 - 重新激活插件不会对已经打过补丁的 `fetch` 二次包装（而是显式抛错）；停止时会恢复那个确切的原始引用。
 
 ## 捕获的内容
@@ -365,16 +365,18 @@ content 和 reasoning-content 的增量按线路顺序拼接；工具调用被�
 
 ### 复制为 curl
 
-`复制 curl` 按钮会向 host 请求一条依据该记录重建的、可直接运行的 `curl` 命令（`GET <routePrefix>/curl?id=`），并复制到剪贴板。每个参数都使用标准 POSIX 的 `'\''` 转义进行单引号包裹，因此该命令可以原样粘贴进 bash/zsh/sh 运行，即使请求体中包含引号、`$(...)` 或反引号也没问题。
+`复制 curl` 按钮会向 host 请求一条依据该记录重建的、可直接运行的 `curl` 命令（`GET /llm-wire-trace/curl?id=`），并复制到剪贴板。每个参数都使用标准 POSIX 的 `'\''` 转义进行单引号包裹，因此该命令可以原样粘贴进 bash/zsh/sh 运行，即使请求体中包含引号、`$(...)` 或反引号也没问题。
 
-存储下来的 `authorization` 头始终是脱敏占位符 —— 本插件从不在静态存储中保留真实密钥 —— 因此该请求头会在生成 curl 命令时重新构造，有两种方式：
+记录中携带的那个凭据请求头始终是脱敏占位符 —— 本插件从不在静态存储中保留真实密钥 —— 因此该请求头会在生成 curl 命令时重新构造，有两种方式：
 
 - **解析到了真实值**，按以下顺序检查：
   1. 进程环境中的 `DSH_CURL_KEY` —— 一个由插件自身提供、与提供方无关的手动覆盖项，对**任何**请求都有效，无论它发往哪个提供方或主机。优先检查它，以保证显式覆盖总能生效。
-  2. 专门针对 `https://api.deepseek.com`，采用与 `dsh-llm-deepseek` 适配器自身相同的密钥解析方式：先 `ctx.credentials`，再是环境变量 `DEEPSEEK_API_KEY`。
+  2. 针对已知固定密钥变量名的主机 —— `https://api.deepseek.com`（`DEEPSEEK_API_KEY`）与 `https://api.anthropic.com`（`ANTHROPIC_API_KEY`）—— 采用与该提供方适配器自身相同的解析方式：先 `ctx.credentials`，再是对应的环境变量。
 
   无论哪种方式，密钥都会像其他请求头一样被单引号包裹后直接内联 —— 粘贴即可运行，无需再编辑。
-- **两条路径都没找到**：该请求头会变成 `"authorization: Bearer $DSH_CURL_KEY"` —— 使用双引号，以便 shell 在运行时展开该变量；并且无论记录对应哪个提供方或主机，都始终使用这一个变量名。只需 `export DSH_CURL_KEY=...` 一次，复制出来的命令对**任何**记录都能原样运行；这正是该功能主要面向的场景。
+- **两条路径都没找到**：该请求头会引用 `$DSH_CURL_KEY` —— 使用双引号，以便 shell 在运行时展开该变量；并且无论记录对应哪个提供方或主机，都始终使用这一个变量名。只需 `export DSH_CURL_KEY=...` 一次，复制出来的命令对**任何**记录都能原样运行；这正是该功能主要面向的场景。
+
+无论哪种情况，请求头原本的 scheme 都会被保留：`authorization` 重建为 `Bearer <密钥>`，而像 Anthropic 的 `x-api-key` 这类裸密钥请求头则只重建密钥本身。把裸密钥加上 `Bearer` 前缀发送（或反过来）会被提供方拒绝，那会让复制出来的命令看起来像是坏了，而不是像缺少凭据。
 
 每次复制后，客户端都会告诉你属于上述哪一种情况。内联真实密钥意味着**它现在就在你的剪贴板里**（粘贴后还可能进入 shell 历史）—— 在共享屏幕或粘贴到聊天工具前值得留意。`$DSH_CURL_KEY` 那种情况从设计上避免了这一点，因为真实密钥的值始终不会离开你 shell 的环境变量。
 
@@ -413,11 +415,13 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
   persistence/                  一条记录一个文件的持久化存储
     naming.ts                   文件命名与 trace 目录解析
     codec.ts                    记录 ⇄ 持久化 JSON 互转
-    archive.ts                  实际的文件 I/O（save/list/get/restore/sweep/clear）
+    archive.ts                  实际的文件 I/O（save/list/get/sweep/clear）
     constants.ts
 src/client/                   浏览器半边（由 esbuild 打包为单个经典脚本）
   entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹
   wire-trace-view.ts            WireTraceView 组件（状态与渲染）
+  view-model.ts                 视图背后的纯列表/详情逻辑（不依赖 DOM，有单元测试）
+  strings.ts                    所有面向用户的文案，集中一处
   json-view.ts                   可折叠 JSON 树组件
   json-model.ts                   纯 JSON 展平数据模型（不含 DOM）
   format.ts                       标签/格式化函数（turn 徽标、session 标签、时间戳）
@@ -448,11 +452,14 @@ docs/architecture.zh.md       本仓库自己的模块为什么这样拆分
 
 ```sh
 pnpm install
-pnpm run build       # tsc -> dist/host/**，esbuild -> dist/client.js
+pnpm run build       # tsc -> dist/host/**（含 .d.ts），esbuild -> dist/client.js
 pnpm run typecheck   # host + client，仅类型检查不产出文件
 pnpm run test        # tsc -> .test-build，node --test
-pnpm run verify       # build + typecheck + test —— 认为一次改动完成前的完整自验证
+pnpm run lint        # 对 src/ 与 test/ 运行 oxlint
+pnpm run verify       # build + typecheck + test + lint —— 认为一次改动完成前的完整自验证
 ```
+
+需要 **Node >= 22.6**（test 脚本把 glob 模式作为测试运行器的参数，该能力自 22.6 起提供），并使用原生编译器 **TypeScript 7** 构建。
 
 `dist/` **不**纳入版本控制——它和其他构建产物一样被 gitignore 掉，由 `pnpm run build` 生成，发布时由 `prepublishOnly` 脚本重新生成一份（确保 `npm publish` 每次都发布与该提交源码完全对应的构建结果）。只有*发布出去的 npm 包*才自带预编译的 `dist/`；git checkout 或 `link:` 安装永远不会自带。这两种安装方式意味着什么，见上文"[从源码 checkout 安装](#从源码-checkout-安装git-或-link)"一节。
 
@@ -460,7 +467,7 @@ pnpm run verify       # build + typecheck + test —— 认为一次改动完成
 
 ### 测试
 
-`test/` 与 `src/host/**`、`src/shared/**`，以及不含 DOM 的 client 模块（`format.ts`、`json-model.ts`、`sse.ts`、`sse-merge/**`）逐文件对应，用 Node 内置的测试运行器（`node:test`）——不引入任何测试框架依赖。覆盖范围包括：内存 store 与伪造 archive 的合并逻辑、持久化层用真实临时目录做的文件 I/O、turn/step 归属用到的 `AsyncLocalStorage` 上下文绑定，以及每个 SSE 合并适配器针对合成数据和一个本项目真实修过的 bug 的精确复现（一个 `message` item 自己的 id 被误判成 tool-call id）。
+`test/` 与 `src/host/**`、`src/shared/**`，以及不含 DOM 的 client 模块（`constants.ts`、`format.ts`、`json-model.ts`、`sse.ts`、`strings.ts`、`view-model.ts`、`sse-merge/**`）逐文件对应，用 Node 内置的测试运行器（`node:test`）——不引入任何测试框架依赖。覆盖范围包括：内存 store 与伪造 archive 的合并逻辑、持久化层用真实临时目录做的文件 I/O、turn/step 归属用到的 `AsyncLocalStorage` 上下文绑定，每个 SSE 合并适配器针对合成数据和一个本项目真实修过的 bug 的精确复现（一个 `message` item 自己的 id 被误判成 tool-call id），以及查看器自身的列表/详情逻辑 —— 内存读取与历史读取这两条竞争路径的合并、一次性的 session 过滤回退、turn 分组，以及请求体/响应体的选取。
 
 刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
 

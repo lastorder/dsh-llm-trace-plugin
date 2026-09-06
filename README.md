@@ -61,7 +61,6 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 |---|---|---|
 | `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. Bodies are held in memory too, so lower this if you routinely send very large requests. |
 | `maxBodyChars` | `8000000` | Per-field character cap before a body is truncated. Sized to hold a full 1M-token context (~4M characters) with 2x headroom; a body cut mid-JSON cannot be parsed, so the viewer can only show it as text. |
-| `routePrefix` | `/llm-wire-trace` | Prefix for the plugin's own HTTP routes. |
 | `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
 | `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
 | `maxPersistedRecords` | `300` | Retained record files; the oldest are deleted past this. |
@@ -132,11 +131,11 @@ Nothing is preloaded into the ring on `apply`: the list already merges memory an
 
 The Wire Trace tab is mounted only while it is the active tab, so an unopened tab reads nothing at all. Opening it paints the live in-memory ring first and folds the on-disk history in behind that, saying so while the history is still in flight. Auto-refresh then polls the ring only, so watching a live session never re-scans the disk.
 
-Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET <routePrefix>/stats`, never thrown into the capture path.
+Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET /llm-wire-trace/stats`, never thrown into the capture path.
 
 ### Privacy: bodies are stored verbatim
 
-`authorization` headers are redacted on disk exactly as in memory. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
+Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `cookie`, and `set-cookie`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
 
 Clearing from the viewer deletes the persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
 
@@ -160,7 +159,8 @@ The wrapper is written to hold these properties:
 - A non-provider call passes straight through: not recorded, not cloned, body fully intact for its own caller.
 - A provider call's caller still reads the complete, unmodified response body — the mirror never contends with it.
 - A transport failure (the underlying `fetch` throws) is recorded and **rethrown unchanged** — never swallowed.
-- `authorization` is always redacted to `Bearer ***redacted***` before it is stored or displayed; no other header is touched.
+- Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.
+- The destructive `clear` route is `POST`-only and rejects a cross-origin request (`Sec-Fetch-Site`), so a page open elsewhere in your browser cannot wipe your trace history.
 - Re-activating the plugin cannot double-wrap an already-patched `fetch` (it throws loudly instead); stopping restores the exact original reference.
 
 ## What it captures
@@ -365,16 +365,18 @@ A toggle (`原始 SSE` / `优化展示`) switches to the literal frame sequence 
 
 ### Copy as curl
 
-The copy-curl button (`复制 curl`) asks the host for a ready-to-run `curl` command reconstructed from the record (`GET <routePrefix>/curl?id=`) and copies it. Every argument is single-quoted with the standard POSIX `'\''` escape, so the command is safe to paste into bash/zsh/sh as-is, including bodies containing quotes, `$(...)`, and backticks.
+The copy-curl button (`复制 curl`) asks the host for a ready-to-run `curl` command reconstructed from the record (`GET /llm-wire-trace/curl?id=`) and copies it. Every argument is single-quoted with the standard POSIX `'\''` escape, so the command is safe to paste into bash/zsh/sh as-is, including bodies containing quotes, `$(...)`, and backticks.
 
-The stored `authorization` header is always the redacted placeholder — this plugin never keeps a real secret at rest — so the header is rebuilt fresh for the curl command, one of two ways:
+Whichever credential header the record carried is always the redacted placeholder — this plugin never keeps a real secret at rest — so that header is rebuilt fresh for the curl command, one of two ways:
 
 - **A real value was resolved**, checked in this order:
   1. `DSH_CURL_KEY` in the process environment — a manual, plugin-owned, provider-neutral override that works for **any** request regardless of which provider or host it went to. Checked first so an explicit override always wins.
-  2. For `https://api.deepseek.com` specifically, the same way `dsh-llm-deepseek`'s own adapter resolves its key: `ctx.credentials` first, then the ambient `DEEPSEEK_API_KEY` environment variable.
+  2. For a host with a known conventional key — `https://api.deepseek.com` (`DEEPSEEK_API_KEY`) and `https://api.anthropic.com` (`ANTHROPIC_API_KEY`) — the same way that provider's own adapter resolves it: `ctx.credentials` first, then the ambient environment variable.
 
   Either way, the key is inlined directly, single-quoted like every other header — paste and run, no editing needed.
-- **Nothing was found by either path**: the header becomes `"authorization: Bearer $DSH_CURL_KEY"` — double-quoted so the shell expands the variable at run time, and always this one name regardless of which provider or host the record is for. `export DSH_CURL_KEY=...` once, and the copied command then runs as-is for **any** record; this is the case the feature is mainly for.
+- **Nothing was found by either path**: the header references `$DSH_CURL_KEY` — double-quoted so the shell expands the variable at run time, and always this one name regardless of which provider or host the record is for. `export DSH_CURL_KEY=...` once, and the copied command then runs as-is for **any** record; this is the case the feature is mainly for.
+
+The header's original scheme is preserved either way: `authorization` is rebuilt as `Bearer <key>`, while a bare-key header such as Anthropic's `x-api-key` is rebuilt as the key alone. Sending a bare key behind a `Bearer` prefix (or the reverse) would be rejected by the provider, which would make the copied command look broken rather than the credential look missing.
 
 The client tells you which of the two happened after each copy. Inlining a real secret means **it is now on your clipboard** (and possibly in shell history once pasted) — worth knowing before sharing a screen or pasting into a chat. The `$DSH_CURL_KEY` case avoids that by design, since the secret value never leaves your shell's environment.
 
@@ -411,11 +413,13 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
   persistence/                 durable, file-per-record store
     naming.ts                  file-name generation and trace-dir resolution
     codec.ts                   record ⇄ persisted-JSON conversions
-    archive.ts                 the actual file I/O (save/list/get/restore/sweep/clear)
+    archive.ts                 the actual file I/O (save/list/get/sweep/clear)
     constants.ts
 src/client/                  browser half (bundled by esbuild into one classic script)
   entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper
   wire-trace-view.ts           the WireTraceView component (state + rendering)
+  view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
+  strings.ts                   every user-visible string in one place
   json-view.ts                 the collapsible JSON tree component
   json-model.ts                 pure JSON-flattening data model (no DOM)
   format.ts                     labels/formatters (turn badge, session label, timestamps)
@@ -446,11 +450,14 @@ docs/architecture.md         why this codebase's own modules are split the way t
 
 ```sh
 pnpm install
-pnpm run build       # tsc -> dist/host/**, esbuild -> dist/client.js
+pnpm run build       # tsc -> dist/host/** (+ .d.ts), esbuild -> dist/client.js
 pnpm run typecheck   # host + client, no emit
 pnpm run test        # tsc -> .test-build, node --test
-pnpm run verify       # build + typecheck + test — the full self-check before calling a change done
+pnpm run lint        # oxlint over src/ and test/
+pnpm run verify       # build + typecheck + test + lint — the full self-check before calling a change done
 ```
+
+Requires **Node >= 22.6** (the test script uses glob patterns as test-runner arguments, which the runner gained in 22.6) and builds with **TypeScript 7**, the native compiler.
 
 `dist/` is **not** committed to the repository — it is a build artifact, gitignored like any other, produced by `pnpm run build` and produced fresh at publish time by the `prepublishOnly` script (so `npm publish` always ships a build matching the exact source at that commit). Only the *published npm package* carries a prebuilt `dist/`; a git checkout or `link:` install never does. See "[Installing from a source checkout](#installing-from-a-source-checkout-git-or-link)" above for what that means for those install paths.
 
@@ -458,7 +465,7 @@ For local development, run `pnpm run build` after every source change (needed fo
 
 ### Tests
 
-`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`format.ts`, `json-model.ts`, `sse.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, and every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id).
+`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `strings.ts`, `view-model.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id), and the viewer's own list/detail logic — the merge of the racing memory and history reads, the one-shot session-filter fallback, turn grouping, and body selection.
 
 Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
 

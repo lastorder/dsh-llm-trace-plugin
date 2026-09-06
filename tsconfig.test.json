@@ -13,6 +13,8 @@
     "src/client/format.ts",
     "src/client/json-model.ts",
     "src/client/sse.ts",
+    "src/client/strings.ts",
+    "src/client/view-model.ts",
     "src/client/sse-merge/**/*.ts",
     "test/**/*.ts"
   ]

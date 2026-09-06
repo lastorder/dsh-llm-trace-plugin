@@ -16,6 +16,7 @@ import { LONG_STRING, MAX_ROWS } from './constants.js'
 import { flattenJq, isLongString, oneLine, collapsedSummary, fmtCount, type JsonLine } from './json-model.js'
 import { copy } from './api-client.js'
 import { stringify } from './format.js'
+import { jsonTruncatedNotice, UI } from './strings.js'
 
 /** The subset of the React runtime this module needs. */
 export interface ReactLike {
@@ -112,7 +113,7 @@ export function createJsonView(React: ReactLike) {
         line.type === 'close' ? null : h('button', {
           className: 'wt-jcopy',
           key: 'cp',
-          title: '复制该节点',
+          title: UI.json.copyNode,
           onClick: (event: any) => {
             event.stopPropagation()
             copy(typeof line.value === 'string' ? line.value : stringify(line.value))
@@ -124,14 +125,14 @@ export function createJsonView(React: ReactLike) {
         elements.push(h('div', {
           className: 'wt-jblock',
           key: line.path + '#full',
-          title: '点击收起',
+          title: UI.json.collapseBlock,
           onClick: () => onToggleLong(line.path),
         }, line.value))
       }
     }
 
     if (flat.truncated) {
-      elements.push(h('div', { className: 'wt-jnotice', key: '#truncated' }, '内容过多，已截断到 ' + fmtCount(MAX_ROWS) + ' 行。'))
+      elements.push(h('div', { className: 'wt-jnotice', key: '#truncated' }, jsonTruncatedNotice(fmtCount(MAX_ROWS))))
     }
 
     return h('div', { className: 'wt-json' }, [

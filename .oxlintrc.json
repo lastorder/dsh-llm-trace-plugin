@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+
+  // Correctness and suspicious only. The stylistic and micro-perf categories
+  // were tried and produced noise against choices this codebase made on
+  // purpose (see the disabled rules below) — a linter that has to be argued
+  // with stops being read.
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+
+  "rules": {
+    "eslint/no-shadow": "error",
+    "unicorn/prefer-node-protocol": "error",
+
+    // This is a debugging tool whose host half deliberately logs to the
+    // console on activation.
+    "no-console": "off",
+    // The host declares its own structural PluginContext rather than importing
+    // Cordis types (see src/host/index.ts), and the client is handed an
+    // untyped React at runtime; `any` at those two seams is the design.
+    "typescript/no-explicit-any": "off",
+    "typescript/no-non-null-assertion": "off",
+    // `null` is load-bearing here: it means "not known" and is deliberately
+    // distinguished from `undefined` throughout the record shape.
+    "unicorn/no-null": "off",
+
+    // `toSorted()` is ES2023; this package targets ES2022 (tsconfig.base.json).
+    // Every `.sort()` here is also on a freshly built array, so there is
+    // nothing shared to mutate in the first place.
+    "unicorn/no-array-sort": "off",
+
+    // persistence/archive.ts awaits once per batch on purpose: that await IS
+    // the yield that keeps a large page scan from monopolising the event loop
+    // the web UI shares. Removing it is the bug, not the fix.
+    "eslint/no-await-in-loop": "off",
+
+    // `window.__ModuleLoader__` and the `__raw__` body key are fixed external
+    // contracts, not names this project chose.
+    "eslint/no-underscore-dangle": "off",
+
+    // Factory-local helpers close over factory state on purpose; hoisting them
+    // would mean threading that state through every call site.
+    "unicorn/consistent-function-scoping": "off"
+  },
+
+  "ignorePatterns": ["dist", ".test-build", "node_modules"]
+}

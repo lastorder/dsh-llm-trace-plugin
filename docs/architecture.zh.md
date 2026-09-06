@@ -58,7 +58,8 @@ index.ts（apply）把以上所有模块组装进 ctx.effect()/ctx.on()
 ```
 sse.ts（解析）──帧──► sse-merge/（重组）──合并后的 JSON──► wire-trace-view.ts ──渲染──► json-view.ts
                                                                   │
-                                    json-model.ts（展平）、format.ts（标签）、api-client.ts（fetch）
+                    view-model.ts（列表/详情逻辑）、json-model.ts（展平）、
+                    format.ts（标签）、strings.ts（文案）、api-client.ts（fetch）
 ```
 
 - **`sse.ts`** 只知道 SSE 线路格式（`event:`/`data:`/空行分帧），从没听说过 OpenAI、Anthropic 或 Cordis。
@@ -74,9 +75,11 @@ sse.ts（解析）──帧──► sse-merge/（重组）──合并后的 JS
   以后要支持第四种 provider 形状，只需要在这三个文件旁边新增一个文件，再把它的工厂函数注册进 `index.ts` 的 `ADAPTER_FACTORIES` 数组——模块里的其他任何地方都不用改。这正是拆分存在的原因：之前的单文件版本把"怎么识别这一帧"和"怎么渲染它"混在一起，导致新增一个 provider 意味着改一个不断膨胀的函数，而不是新增一个文件。
 - **`json-model.ts`** 是 JSON 树展平算法（`flattenJq`、折叠/展开状态记录），不含 DOM、不含 React——正是它让 request 面板、合并后的 response 面板、原始帧面板都能走同一套可折叠树来渲染。
 - **`format.ts`** 是纯展示层的字符串格式化（turn 徽标、session 标签、时间戳），无状态、无副作用。
+- **`strings.ts`** 收纳了标签页中所有面向用户的文案，以及少量把值插入文案的辅助函数。它并不是一套 i18n 框架 —— 只有一种语言，表本身就是一个普通对象 —— 但把文案集中一处，才使得审阅整个标签页的措辞不必翻三个文件，也让那些插值辅助函数变得可测；在它们还是散落在 `React.createElement` 调用里的字符串拼接时，这是做不到的。
+- **`view-model.ts`** 是标签页背后的纯列表/详情逻辑：合并内存与历史这两条竞争读取路径（`mergeSummaryPages`）、判断何时必须放弃 session 过滤（`shouldFallBackToAllSessions`）、按 turn 分组（`groupRows`），以及决定每个页签渲染哪份 body（`selectRequestBody`/`selectResponseBody`/`describeBodyNotice`）。其中没有任何一处触碰 React、`window` 或 `document`。它之所以存在，是因为这部分逻辑是 client 半边里最微妙的 —— 那次合并正是防止一次迟到的轮询把已加载的历史记录抹掉的关键 —— 而当它还待在组件内部时，完全没有任何测试覆盖。
 - **`api-client.ts`** 是本插件自身 `/llm-wire-trace/*` 路由的薄 `fetch` 封装（与 host 侧的 `routes.ts` 对应），外加两个无关的浏览器工具函数（`download`、`copy`）。
 - **`json-view.ts`** 是唯一的展示型 React 组件，参数化在一个最小的 `ReactLike` 接口之上，而不是直接 import `react`——因为按 `plugin-development.zh.md` 里讲的经典脚本约束，`react` 只在运行时通过 factory 的 `require` 才存在，永远不会是静态 import。
-- **`wire-trace-view.ts`** 是唯一持有状态（`React.useState`/`useEffect`）、把以上所有模块编排成标签页实际行为的文件——轮询、过滤、合并/原始切换。它是 `src/client/` 里体量最大的文件，这是有意为之：状态编排本来就不像纯计算那样能被干净拆解；凡是*能*被提取成纯逻辑的部分都已经提取出去了（进了 `json-model.ts`/`format.ts`/`sse-merge/`），剩下留在这个文件里的，就只是那些真正关于"这个组件此刻该做什么"的部分。
+- **`wire-trace-view.ts`** 是唯一持有状态（`React.useState`/`useEffect`）、把以上所有模块编排成标签页实际行为的文件——轮询、过滤、合并/原始切换。它是 `src/client/` 里体量最大的文件，这是有意为之：状态编排本来就不像纯计算那样能被干净拆解；凡是*能*被提取成纯逻辑的部分都已经提取出去了（进了 `view-model.ts`/`json-model.ts`/`format.ts`/`strings.ts`/`sse-merge/`），剩下留在这个文件里的，就只是那些真正关于"这个组件此刻该做什么"的部分。剩下的内容绝大多数是 `React.createElement` 树 —— 这也是为什么把逻辑提取出去之后，文件行数缩减得远不如受测面积增长得多。
 - **`entry.ts`** 是唯一接触 `window.__ModuleLoader__` 或 Cordis Slot 注册的文件——与 host 侧的 `index.ts` 是同一种"框架胶水代码只留在一个文件里"的模式。
 
 ## 为什么是这个形状，从更普遍的角度看

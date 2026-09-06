@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { clip, describeRequest, outgoingUserAgent, redactedHeaders, tryParseJson } from '../../src/host/http-utils.js'
+import { clip, describeRequest, outgoingUserAgent, redactedHeaders, redactHeaderValue, tryParseJson } from '../../src/host/http-utils.js'
 
 // -- clip --
 
@@ -39,6 +39,55 @@ test('redactedHeaders: null/undefined/non-object input returns an empty map, nev
   assert.deepEqual(redactedHeaders(null), {})
   assert.deepEqual(redactedHeaders(undefined), {})
   assert.deepEqual(redactedHeaders('not headers'), {})
+})
+
+// Every one of these carries a credential, and every captured header is
+// written verbatim to disk — so a name missing from REDACTED_HEADERS is a
+// plaintext secret in a file under the user's trace directory. Anthropic
+// (x-api-key) is the case that matters most in practice: this plugin already
+// ships an adapter that merges Anthropic's SSE stream.
+test('redactedHeaders: redacts bare-key credential headers without inventing a Bearer scheme', () => {
+  const result = redactedHeaders({
+    'x-api-key': 'sk-ant-secret',
+    'api-key': 'azure-secret',
+    'x-goog-api-key': 'google-secret',
+  })
+  assert.equal(result['x-api-key'], '***redacted***')
+  assert.equal(result['api-key'], '***redacted***')
+  assert.equal(result['x-goog-api-key'], '***redacted***')
+})
+
+test('redactedHeaders: redacts cookie and proxy-authorization', () => {
+  const result = redactedHeaders({
+    cookie: 'session=secret',
+    'set-cookie': 'session=secret',
+    'proxy-authorization': 'Bearer proxy-secret',
+  })
+  assert.equal(result.cookie, '***redacted***')
+  assert.equal(result['set-cookie'], '***redacted***')
+  // proxy-authorization is bearer-scheme, so the scheme survives.
+  assert.equal(result['proxy-authorization'], 'Bearer ***redacted***')
+})
+
+test('redactedHeaders: a header that merely LOOKS credential-ish is left untouched', () => {
+  // Guards against over-redaction: only the exact names in the set are hidden,
+  // so ordinary request metadata stays readable in the trace.
+  const result = redactedHeaders({
+    'x-api-version': '2023-06-01',
+    'anthropic-version': '2023-06-01',
+    'user-agent': 'deepseek-harness/1.0',
+  })
+  assert.equal(result['x-api-version'], '2023-06-01')
+  assert.equal(result['anthropic-version'], '2023-06-01')
+  assert.equal(result['user-agent'], 'deepseek-harness/1.0')
+})
+
+test('redactHeaderValue: redaction is keyed on the name, independent of the value shape', () => {
+  assert.equal(redactHeaderValue('authorization', 'Bearer abc'), 'Bearer ***redacted***')
+  assert.equal(redactHeaderValue('x-api-key', 'abc'), '***redacted***')
+  assert.equal(redactHeaderValue('content-type', 'application/json'), 'application/json')
+  // A credential header with an empty value is still redacted, never echoed.
+  assert.equal(redactHeaderValue('x-api-key', ''), '***redacted***')
 })
 
 // -- outgoingUserAgent --

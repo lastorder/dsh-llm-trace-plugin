@@ -38,6 +38,7 @@
 
 import { createStepTracker } from './step-tracker.js'
 import { bindLlmStream, type LlmStreamOptions } from './call-context.js'
+import { ROUTE_PREFIX } from './constants.js'
 import { createWireTraceStore } from './store.js'
 import { createRouteHandler } from './routes.js'
 import { installFetchPatch } from './fetch-patch.js'
@@ -51,7 +52,6 @@ export { buildRecordName, createRecordArchive } from './persistence/index.js'
 export interface PluginConfig {
   maxRecords?: number
   maxBodyChars?: number
-  routePrefix?: string
   persist?: boolean
   traceDir?: string
   maxPersistedRecords?: number
@@ -79,7 +79,6 @@ export const inject = ['webServer']
 
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const settings = config ?? {}
-  const routePrefix = typeof settings.routePrefix === 'string' ? settings.routePrefix : '/llm-wire-trace'
 
   // Durable half. On by default — surviving a restart is the entire point —
   // but fully switchable off with `persist: false`, which returns the plugin
@@ -149,14 +148,14 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   ctx.effect(() =>
     ctx.webServer.register({
       kind: 'prefix',
-      path: routePrefix,
+      path: ROUTE_PREFIX,
       handler: createRouteHandler({
         store,
-        routePrefix,
+        routePrefix: ROUTE_PREFIX,
         getCredentials: () => ctx.get('credentials') as CredentialProvider | undefined,
       }),
     }),
   )
 
-  console.log('llm-wire-trace: fetch patched, listening on /llm-wire-trace')
+  console.log(`llm-wire-trace: fetch patched, listening on ${ROUTE_PREFIX}`)
 }

@@ -4,7 +4,14 @@
  * @module dsh-llm-trace-plugin/client/format
  */
 
-import type { WireRecord, WireRecordSummary, WireStatus } from '../shared/record-shape.js'
+import type { WireRecordSummary, WireStatus } from '../shared/record-shape.js'
+import {
+  auxiliaryBadgeTitle,
+  foreignSessionLabel,
+  stepBadgeTitle,
+  turnOnlyBadgeTitle,
+  UI,
+} from './strings.js'
 
 export function fmtTime(ms: number | null | undefined): string {
   if (typeof ms !== 'number') return '-'
@@ -45,9 +52,9 @@ export function shortSessionId(sessionId: string): string {
  * visibly distinct — it is a label, never something to match on.
  */
 export function sessionLabel(sessionId: string | null | undefined, currentSessionId: string | null): string {
-  if (sessionId === null || sessionId === undefined || sessionId === '') return '无 session'
-  if (sessionId === currentSessionId) return '本 session'
-  return 'session ' + shortSessionId(sessionId)
+  if (sessionId === null || sessionId === undefined || sessionId === '') return UI.session.none
+  if (sessionId === currentSessionId) return UI.session.current
+  return foreignSessionLabel(shortSessionId(sessionId))
 }
 
 /**
@@ -55,8 +62,8 @@ export function sessionLabel(sessionId: string | null | undefined, currentSessio
  * all. An ordinary conversation step has none.
  */
 export function purposeLabel(purpose: string | null | undefined): string | null {
-  if (purpose === 'session-title') return '标题生成'
-  if (purpose === 'compaction') return '上下文压缩'
+  if (purpose === 'session-title') return UI.purpose.sessionTitle
+  if (purpose === 'compaction') return UI.purpose.compaction
   if (typeof purpose === 'string' && purpose.length > 0) return purpose
   return null
 }
@@ -79,28 +86,24 @@ export interface StepBadge {
 export function stepBadge(item: Pick<WireRecordSummary, 'purpose' | 'turn' | 'step' | 'attributed'>): StepBadge {
   const aux = purposeLabel(item.purpose)
   if (aux !== null) {
-    return {
-      text: aux,
-      kind: 'aux',
-      title: '后台辅助调用（' + aux + '），不属于任何一次对话 turn，因此没有 step 坐标。',
-    }
+    return { text: aux, kind: 'aux', title: auxiliaryBadgeTitle(aux) }
   }
   if (typeof item.turn === 'number' && typeof item.step === 'number') {
     return {
       text: 'T' + item.turn + '·S' + item.step,
       kind: 'step',
-      title: '第 ' + item.turn + ' 轮对话的第 ' + item.step + ' 步（一个 step = 一次模型调用）。',
+      title: stepBadgeTitle(item.turn, item.step),
     }
   }
   if (typeof item.turn === 'number') {
-    return { text: 'T' + item.turn, kind: 'step', title: '第 ' + item.turn + ' 轮对话，调用发生在两个 step 之间。' }
+    return { text: 'T' + item.turn, kind: 'step', title: turnOnlyBadgeTitle(item.turn) }
   }
   return {
-    text: '无归属',
+    text: UI.badge.unattributed,
     kind: 'none',
     title: item.attributed === false
-      ? '这次请求没有经过 ctx.llm，插件无法确定它属于哪一轮对话。'
-      : '这次调用发生在任何 turn 之外。',
+      ? UI.badge.unattributedNoLlm
+      : UI.badge.unattributedOutsideTurn,
   }
 }
 

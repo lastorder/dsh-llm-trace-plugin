@@ -94,6 +94,25 @@ test('toMeta: never touches bodyText/bodyJson, both come out null', () => {
   assert.equal(meta.response!.bodyChars, 11)
 })
 
+test('toMeta: omits headers entirely, the other bulky field a list row never shows', () => {
+  // The narrow WireRecordMeta return type is what lets a consumer see, from
+  // the type alone, that a list row cannot show a body or headers — instead of
+  // discovering it as an unexpected null at runtime, which is what the old
+  // `as unknown as WireRecord` cast hid.
+  const meta = toMeta({
+    id: 'r1',
+    request: { method: 'POST', url: 'https://x', headers: { authorization: 'Bearer x' }, bodyChars: 7 },
+    response: { status: 200, statusText: 'OK', contentType: 'application/json', bodyChars: 11 },
+  })
+  assert.equal(Object.prototype.hasOwnProperty.call(meta.request, 'headers'), false)
+  assert.equal(Object.prototype.hasOwnProperty.call(meta.response, 'headers'), false)
+})
+
+test('toMeta: a record with no response projects response as null, not a stub', () => {
+  const meta = toMeta({ id: 'r1', request: { method: 'GET', url: 'https://x' }, response: null })
+  assert.equal(meta.response, null)
+})
+
 test('toMeta: marks the record as both persisted and meta', () => {
   const stored = { id: 'r1', request: {}, response: null }
   const meta = toMeta(stored)

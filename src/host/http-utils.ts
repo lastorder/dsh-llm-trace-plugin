@@ -7,6 +7,7 @@
  */
 
 import type { HeaderMap } from '../shared/record-shape.js'
+import { BEARER_HEADERS, REDACTED_HEADERS, REDACTED_VALUE } from './constants.js'
 
 export interface ClippedText {
   text: string
@@ -21,14 +22,28 @@ export function clip(text: string, max: number): ClippedText {
 }
 
 /**
+ * Redact one header value when its name carries a credential.
+ *
+ * A bearer-scheme header keeps its scheme (`Bearer ***redacted***`) so the
+ * record still shows HOW the call authenticated; a bare-key header
+ * (`x-api-key`, `api-key`, …) becomes the placeholder alone, because there is
+ * no scheme to preserve and inventing one would misrepresent the wire.
+ */
+export function redactHeaderValue(name: string, value: unknown): string {
+  if (!REDACTED_HEADERS.has(name)) return String(value)
+  return BEARER_HEADERS.has(name) ? `Bearer ${REDACTED_VALUE}` : REDACTED_VALUE
+}
+
+/**
  * Normalize a Headers-like value (Headers instance, plain object, or entry
- * array) into a plain lowercase-keyed object, redacting `authorization`.
+ * array) into a plain lowercase-keyed object, redacting every credential
+ * header named in {@link REDACTED_HEADERS}.
  */
 export function redactedHeaders(headers: unknown): HeaderMap {
   const out: HeaderMap = {}
   const set = (key: unknown, value: unknown) => {
     const k = String(key).toLowerCase()
-    out[k] = k === 'authorization' ? 'Bearer ***redacted***' : String(value)
+    out[k] = redactHeaderValue(k, value)
   }
   if (headers === null || headers === undefined) return out
   // Array MUST be checked before the forEach duck-type below: every array

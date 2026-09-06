@@ -7,6 +7,7 @@
  */
 
 import type { WireRecord } from '../shared/record-shape.js'
+import { BEARER_HEADERS, REDACTED_HEADERS } from './constants.js'
 
 /**
  * Single-quote one shell argument, POSIX-safe (bash/zsh/sh): close the quote,
@@ -56,6 +57,7 @@ export const CURL_OVERRIDE_ENV = 'DSH_CURL_KEY'
  */
 export const KNOWN_HOST_CREDENTIAL_ENV = new Map<string, string>([
   ['api.deepseek.com', 'DEEPSEEK_API_KEY'],
+  ['api.anthropic.com', 'ANTHROPIC_API_KEY'],
 ])
 
 export interface CredentialProvider {
@@ -114,17 +116,23 @@ export async function resolveRealApiKey(
 /**
  * Render one wire-trace record as a runnable `curl` command.
  *
- * The stored `authorization` header is always the redacted placeholder (this
- * plugin never keeps a real secret at rest), so the header line is rebuilt
- * fresh here, one of two ways:
+ * Any stored credential header is always the redacted placeholder (this
+ * plugin never keeps a real secret at rest), so each such header line is
+ * rebuilt fresh here, one of two ways:
  *
  * - a real value was resolved (from `DSH_CURL_KEY` or a known provider's own
  *   credential): inline it directly, single-quoted like every other header —
  *   paste-and-run.
- * - nothing was found: render `"authorization: Bearer $DSH_CURL_KEY"` —
- *   double-quoted so the shell expands the variable at run time, always this
- *   one plugin-owned name regardless of which provider or host the record is
- *   for.
+ * - nothing was found: reference `$DSH_CURL_KEY` — double-quoted so the shell
+ *   expands the variable at run time, always this one plugin-owned name
+ *   regardless of which provider or host the record is for.
+ *
+ * The header's ORIGINAL scheme is preserved either way: an `authorization`
+ * line is rebuilt as `Bearer <key>`, while a bare-key header such as
+ * Anthropic's `x-api-key` is rebuilt as the key alone. Sending a bare key
+ * under a `Bearer` prefix (or the reverse) would be rejected by the provider,
+ * which would make the copied command look broken rather than the credential
+ * look missing.
  *
  * Never the literal `***redacted***` text, which would not even look like a
  * plausible key.
@@ -133,11 +141,12 @@ export function buildCurl(record: WireRecord, resolved: ResolvedCredential | und
   const lines = [`curl ${shQuote(record.request.url)} \\`, `  -X ${shQuote(record.request.method)} \\`]
   for (const [key, value] of Object.entries(record.request.headers)) {
     if (CURL_SKIP_HEADERS.has(key)) continue
-    if (key === 'authorization') {
+    if (REDACTED_HEADERS.has(key)) {
+      const scheme = BEARER_HEADERS.has(key) ? 'Bearer ' : ''
       if (resolved !== undefined) {
-        lines.push(`  -H ${shQuote(`authorization: Bearer ${resolved.value}`)} \\`)
+        lines.push(`  -H ${shQuote(`${key}: ${scheme}${resolved.value}`)} \\`)
       } else {
-        lines.push(`  -H "${dqEscape(`authorization: Bearer `)}$${CURL_OVERRIDE_ENV}" \\`)
+        lines.push(`  -H "${dqEscape(`${key}: ${scheme}`)}$${CURL_OVERRIDE_ENV}" \\`)
       }
       continue
     }

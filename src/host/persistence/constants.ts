@@ -40,6 +40,17 @@ export const DEFAULT_PAGE_LIMIT = 50
 export const SCAN_BATCH = 16
 
 /**
+ * Writes between retention passes.
+ *
+ * Sweeping enforces the record cap by listing the directory and unlinking the
+ * oldest names — a `readdir` on every single write would cost more than the
+ * write itself, so the pass is amortized across this many saves. The archive
+ * therefore sits at most this far above `DEFAULT_MAX_PERSISTED` between
+ * passes, which is the deliberate trade.
+ */
+export const SWEEP_INTERVAL = 50
+
+/**
  * Only files this module wrote are ever read or deleted.
  *
  * The optional middle group accepts records written before the intra-ms

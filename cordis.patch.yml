@@ -6,6 +6,11 @@
     - id: llm-wire-trace
       name: dsh-llm-trace-plugin
       # config:
-      #   maxRecords: 200       # ring-buffer size
-      #   maxBodyChars: 200000  # per-field character cap before truncation
-      #   routePrefix: /llm-wire-trace
+      #   maxRecords: 200        # in-memory ring-buffer size
+      #   maxBodyChars: 8000000  # per-field character cap before truncation
+      #   persist: true          # false = pure in-memory ring, nothing on disk
+      #   maxPersistedRecords: 300
+      #
+      # The route path (/llm-wire-trace) is NOT configurable: it is part of the
+      # host/client contract, and only the host ever read the old `routePrefix`
+      # option, so setting it silently 404'd every request from the viewer.

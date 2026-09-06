@@ -1,2 +1,12 @@
+# esbuild's install script fetches its platform binary; without this pnpm >=10
+# refuses to run it and the client bundle cannot be built.
 allowBuilds:
   esbuild: true
+
+# Do not install a version of any dependency published less than this many
+# minutes ago. Nearly every npm supply-chain compromise is caught and unpublished
+# within hours, so simply not being first to install a brand-new release removes
+# most of the exposure for free. This project's own release path is already
+# gated on a human approving each staged version; this is the same idea applied
+# to what it consumes.
+minimumReleaseAge: 1440

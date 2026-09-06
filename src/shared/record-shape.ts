@@ -9,11 +9,29 @@
  * @module dsh-llm-trace-plugin/shared/record-shape
  */
 
-/** Redacted, lowercase-keyed header map (see host/http-utils.ts). */
+/**
+ * Redacted, lowercase-keyed header map (see host/http-utils.ts).
+ *
+ * Every credential header named in `REDACTED_HEADERS` is replaced with a
+ * placeholder before a record is ever stored, so no header map — in memory or
+ * on disk — carries a real secret.
+ */
 export type HeaderMap = Record<string, string>
 
 export type WireStatus = 'streaming' | 'ok' | 'http-error' | 'transport-error'
 
+/**
+ * Shared body fields.
+ *
+ * `bodyText` is ALWAYS authoritative: it is the literal text on the wire,
+ * which is what this plugin exists to capture.
+ *
+ * `bodyJson` is a DERIVED convenience parse, not stored state. It is `null` on
+ * a record held in the in-memory ring and is filled in only when a record is
+ * actually read for display (`store.get()` for a live record,
+ * `fromPersisted()` for a restored one). Treat a `null` here as "not derived
+ * yet", never as "this body was not JSON" — ask `bodyText`.
+ */
 export interface WireRequest {
   method: string
   url: string
@@ -75,7 +93,50 @@ export interface WireRecord {
   meta?: boolean
 }
 
-/** The fields a list row actually displays; see host/store.ts `summary()`. */
+/**
+ * A record projected down to just the fields a LIST row displays.
+ *
+ * Reading a stored record for a list costs a `JSON.parse` of its bodies, which
+ * are the bulk of the file — and a list row displays none of them. `toMeta`
+ * (see host/persistence/codec.ts) therefore builds this instead, never
+ * touching the body text at all.
+ *
+ * It is a genuinely narrower shape than {@link WireRecord}, not a WireRecord
+ * with holes: `bodyText` is `null` and `headers` is absent. Modelling that
+ * honestly is what lets a consumer see, from the type alone, that a list row
+ * cannot show a body — rather than discovering it as an unexpected `null` at
+ * runtime.
+ */
+export interface WireRequestMeta {
+  method: string
+  url: string
+  bodyText: null
+  bodyChars: number
+  bodyTruncated: boolean
+  bodyJson: null
+}
+
+export interface WireResponseMeta {
+  status: number
+  statusText: string
+  contentType: string | null
+  bodyText: null
+  bodyChars: number
+  bodyTruncated: boolean
+  bodyJson: null
+}
+
+export interface WireRecordMeta extends Omit<WireRecord, 'request' | 'response' | 'meta'> {
+  request: WireRequestMeta
+  response: WireResponseMeta | null
+  /** Always true, and the discriminant that tells this apart from a full record. */
+  meta: true
+}
+
+/** Either form, as returned by an archive list read. */
+export type AnyWireRecord = WireRecord | WireRecordMeta
+
+/** The fields a list row actually displays; see host/page-grouping.ts. */
 export interface WireRecordSummary {
   id: string
   startedAt: number

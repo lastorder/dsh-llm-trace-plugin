@@ -31,15 +31,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           cache: 'pnpm'
 
@@ -102,7 +102,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create the GitHub Release (marked pre-release until npm approval)
-        uses: softprops/action-gh-release@v2
+        # Pinned to a full commit SHA, not a tag. This is a third-party action
+        # running in a job that holds `contents: write` and `id-token: write`,
+        # so a moved tag on that repository would be a direct path into this
+        # project's release pipeline — the same threat model that motivated
+        # the stage-only npm Trusted Publisher, applied one layer out. The
+        # first-party actions/* and pnpm/* steps above stay on major tags.
+        # Update deliberately: read the diff, then repin.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           body: ${{ steps.release_notes.outputs.body }}
           files: '*.tgz'

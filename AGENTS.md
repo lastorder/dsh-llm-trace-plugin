@@ -6,19 +6,24 @@ This file is for an AI agent (or a human contributor) making a change in this re
 
 ```sh
 pnpm install
-pnpm run build       # tsc -> dist/host/**, esbuild -> dist/client.js
+pnpm run build       # tsc -> dist/host/** (+ .d.ts), esbuild -> dist/client.js
 pnpm run typecheck    # host + client, no emit
 pnpm run test         # tsc -> .test-build, node --test
-pnpm run verify        # build + typecheck + test, in that order — the full self-check
+pnpm run lint          # oxlint over src/ and test/
+pnpm run verify        # build + typecheck + test + lint, in that order — the full self-check
 pnpm run clean          # remove dist/ and .test-build/
 ```
+
+Requires **Node >= 22.6**: `pnpm run test` passes a glob pattern as a test-runner argument, which the runner gained in 22.6. (A plain directory argument is not an alternative — modern Node treats positional test arguments as patterns and no longer recurses a directory.)
+
+Builds with **TypeScript 7**, the native (Go) compiler. `tsserver` no longer ships in the `typescript` package, so editor integration goes through your editor's TS 7 / native-preview support. The migration from 5.9 was verified by diffing emitted output: every file under `dist/` was byte-identical, and `dist/client.js` unchanged.
 
 ## Every change ends with the full self-verification flow
 
 There is no partial-check shortcut for a change that touches `src/`. Before considering any change done:
 
-1. **`pnpm run verify`** (build + typecheck + test) must pass with no errors and no failing tests.
-2. If the change touches `src/host/**`, `src/shared/**`, or a pure-logic client module (`src/client/{constants,format,json-model,sse}.ts`, `src/client/sse-merge/**`): add or update the matching file under `test/` in the **same change** — see "Test coverage is mandatory for pure logic" below. Do not land a logic change and a test change as separate steps.
+1. **`pnpm run verify`** (build + typecheck + test + lint) must pass with no errors, no failing tests, and no lint findings. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs exactly this on Node 22, 24, and 26 for every push and pull request, so a local pass on one version is necessary but not sufficient.
+2. If the change touches `src/host/**`, `src/shared/**`, or a pure-logic client module (`src/client/{constants,format,json-model,sse,strings,view-model}.ts`, `src/client/sse-merge/**`): add or update the matching file under `test/` in the **same change** — see "Test coverage is mandatory for pure logic" below. Do not land a logic change and a test change as separate steps.
 3. If the change touches `src/client/sse-merge/**` (a new or modified provider-format adapter): additionally smoke-test against at least one **real** captured record, not only synthetic fixtures. Connect to a running `dsh web`, fetch a real record from `/llm-wire-trace/list` and `/llm-wire-trace/get`, and feed its `response.bodyText` through the compiled `dist` modules directly (`node -e "import('./dist/...').then(...)"`). Synthetic test fixtures are deliberately minimal and have already missed field combinations real provider traffic exposes — see the regression test in `test/client/sse-merge/index.test.ts` for the exact bug this caught once (a `message` item's own `id` being misread as a tool-call id).
 4. If the change alters any behavior the READMEs describe: update **both** `README.md` and `README.zh.md` in the same change, then refresh `README.i18n.yaml`:
    ```sh
@@ -39,7 +44,7 @@ A change that only touches `docs/`, `AGENTS.md`, or comments needs `pnpm run typ
 
 ## Test coverage is mandatory for pure logic
 
-Every module listed as testable in `docs/architecture.md` (all of `src/host/**`, `src/shared/**`, and the DOM-free client modules: `constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `sse-merge/**`) has a corresponding file under `test/`, mirroring the `src/` path. Adding a new file to any of those directories means adding its test file in the same change; adding a new exported function to an existing file means adding its test cases to the existing test file.
+Every module listed as testable in `docs/architecture.md` (all of `src/host/**`, `src/shared/**`, and the DOM-free client modules: `constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `strings.ts`, `view-model.ts`, `sse-merge/**`) has a corresponding file under `test/`, mirroring the `src/` path. A new DOM-free client module must also be added to `tsconfig.test.json`'s `include` list, or its tests will silently not compile. Adding a new file to any of those directories means adding its test file in the same change; adding a new exported function to an existing file means adding its test cases to the existing test file.
 
 **Deliberately excluded from unit tests** — do not add jsdom or any other DOM-emulation dependency to force coverage here; this is a considered choice, not a gap:
 
@@ -59,7 +64,10 @@ A version bump is still a manual decision: edit `package.json`'s `version`, comm
 - **npm is the only install path that gets a build for free.** `prepublishOnly` (`pnpm run clean && pnpm run build`) runs as part of `npm stage publish`/`npm publish`, so the tarball npm receives always carries a fresh `dist/` built from the exact source being staged. Do **not** add a `prepare` script to try to extend this to git-spec/`link:` installs: pnpm ≥10 requires an explicit `allowBuilds` approval before a git dependency's `prepare` script may run at all, which reopens exactly the "permission to execute this package's code on your machine at install time" prompt this project avoids. A git checkout or local `link:` install gets source only and must run `pnpm run build` itself — see the README's "Install" section for the exact steps that path documents to users.
 - **`dist/` and `.test-build/` are gitignored build artifacts, not repository content.** Never commit them and never remove them from `.gitignore` — regenerate with `pnpm run build` (or let `prepublishOnly` regenerate `dist/` when staging). A stale committed `dist/` would silently diverge from `src/` the moment someone forgot to rebuild before committing; not tracking it removes that failure mode entirely.
 - **`README.md` and `README.zh.md` are a hard-synced pair.** Never edit one without the other, and never let `README.i18n.yaml`'s recorded hashes go stale — a mismatch there means a translation gap slipped through review.
-- **Bodies are stored verbatim in `src/host/persistence/`.** Do not add any transformation that summarizes, redacts beyond `authorization`, or otherwise mutates a captured request/response body before it reaches disk; that guarantee (see the main README's "Persistence" section) is what makes the curl-replay feature and the merged-SSE view trustworthy.
+- **Bodies are stored verbatim in `src/host/persistence/`.** Do not add any transformation that summarizes, redacts, or otherwise mutates a captured request/response **body** before it reaches disk; that guarantee (see the main README's "Persistence" section) is what makes the curl-replay feature and the merged-SSE view trustworthy.
+
+  This constraint is about bodies only. **Credential HEADERS are redacted, and that set is meant to grow**: `REDACTED_HEADERS` in `src/host/constants.ts` covers `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, and `set-cookie`. Adding a provider whose credential rides a header not in that set means adding it there — a name missing from it is a plaintext secret in a file under the user's trace directory. When you add one, extend `buildCurl` too (bearer-scheme vs bare-key rebuild) or curl replay silently breaks for that provider.
+- **Third-party GitHub Actions are pinned to a full commit SHA.** `softprops/action-gh-release` runs in a job holding `contents: write` and `id-token: write`, so a moved tag on that repository would be a direct path into this project's release pipeline — the same threat model that motivates the stage-only Trusted Publisher, one layer out. First-party `actions/*` and `pnpm/*` steps may stay on major tags. Dependabot proposes the new SHA with its version comment updated; read the diff before merging.
 - **The release workflow is the only thing that stages an npm release, and the npm Trusted Publisher stays stage-only.** Do not add a second publish path (a different workflow, a script a contributor runs locally as routine practice), and do not flip the Trusted Publisher's npmjs.com configuration to allow direct `npm publish` from CI — the human approval step on npmjs.com is the deliberate control that limits what a compromised workflow or repository could actually ship.
 
 ## Editing this file

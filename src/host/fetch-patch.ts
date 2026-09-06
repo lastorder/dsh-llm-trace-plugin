@@ -42,6 +42,16 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
 
     const info = describeRequest(input, init)
     const bodyClip = clip(info.bodyText || '', maxBodyChars)
+    // ONE parse of the request body, and only to read `model` off it — which
+    // is the one field a list row needs and the wire URL cannot supply.
+    //
+    // This used to happen twice per call (once for `model`, once to store
+    // `request.bodyJson`), synchronously, in front of every model call. With
+    // `maxBodyChars` sized for a 1M-token context that is two multi-megabyte
+    // `JSON.parse` runs on the event loop the web UI shares.
+    //
+    // The parsed value is deliberately NOT kept: see `bodyJson` below.
+    const requestJson = tryParseJson(info.bodyText)
     // Harness identity of the call this fetch belongs to. Present for every
     // call made through `ctx.llm`; absent for anything else, which is then
     // honestly recorded as unattributed rather than guessed at.
@@ -58,7 +68,7 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       endedAt: null,
       durationMs: null,
       status: 'streaming',
-      model: (tryParseJson(info.bodyText) as any)?.model ?? null,
+      model: (requestJson as any)?.model ?? null,
       // Prefer the async-context session id (works for every provider,
       // including pi-ai) and fall back to the wire header.
       sessionId: (call && call.sessionId) ?? headerSessionId,
@@ -82,7 +92,19 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
         bodyText: bodyClip.text,
         bodyChars: bodyClip.chars,
         bodyTruncated: bodyClip.truncated,
-        bodyJson: tryParseJson(info.bodyText),
+        // Left null ON PURPOSE, and hydrated on read by `store.get()`.
+        //
+        // A parsed body is several times the size of its source text, and the
+        // ring holds up to `maxRecords` of them — so storing it here meant the
+        // process could sit on gigabytes that nothing on the list path ever
+        // reads (`summarizeRecord` touches no body field) and that the
+        // persistence codec re-derives from `bodyText` anyway.
+        //
+        // `bodyText` is the single source of truth; see the note on
+        // `WireRecord.bodyJson`. The archive path already worked exactly this
+        // way (`fromPersisted`), so live and restored records stay identical
+        // to every consumer.
+        bodyJson: null,
       },
       response: null,
       error: null,
@@ -131,9 +153,10 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
         record.response!.bodyText = bodyClipResp.text
         record.response!.bodyChars = bodyClipResp.chars
         record.response!.bodyTruncated = bodyClipResp.truncated
-        if (!record.response!.contentType || !record.response!.contentType!.includes('event-stream')) {
-          record.response!.bodyJson = tryParseJson(text)
-        }
+        // `bodyJson` stays null here for the same reason it does on the
+        // request: it is derived on read from `bodyText`, never retained.
+        // That also removes a full parse of every non-SSE response body from
+        // the mirroring path.
         record.status = response.ok ? 'ok' : 'http-error'
       } catch (error: any) {
         record.recorderError = 'mirror read failed: ' + String((error && error.message) || error)

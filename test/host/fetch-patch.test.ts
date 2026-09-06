@@ -56,7 +56,53 @@ test('wrapFetch: a deepseek-harness/ call is recorded with request fields, and i
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(h.finalized.length, 1)
   assert.equal(h.finalized[0].status, 'ok')
-  assert.deepEqual(h.finalized[0].response!.bodyJson, { ok: true })
+  // The wire TEXT is what capture stores; `bodyJson` is derived later, on
+  // read, by store.get() — never parsed on this hot path. See the note on
+  // WireRecord.bodyJson.
+  assert.equal(h.finalized[0].response!.bodyText, JSON.stringify({ ok: true }))
+  assert.equal(h.finalized[0].response!.bodyJson, null)
+})
+
+test('wrapFetch: bodies are never parsed into the ring — only `model` is read, once', async () => {
+  // Capture used to JSON.parse the request body twice (once for `model`, once
+  // to store `request.bodyJson`) and then hold the parsed result for the life
+  // of the ring. With maxBodyChars sized for a 1M-token context that is two
+  // multi-megabyte synchronous parses in front of every model call, plus a
+  // retained copy several times the size of the text, for a field only the
+  // detail view ever reads.
+  const h = harness()
+  const real = (async () => new Response('{"ok":true}', {
+    headers: { 'content-type': 'application/json' },
+  })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  await patched('https://api.deepseek.com/v1/chat', {
+    method: 'POST',
+    headers: { 'user-agent': 'deepseek-harness/1.0' },
+    body: '{"model":"deepseek-chat","messages":[]}',
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const record = h.records[0]
+  // `model` still comes through: it is the one field a list row needs and the
+  // wire URL cannot supply.
+  assert.equal(record.model, 'deepseek-chat')
+  // ...but nothing parsed is retained on either side.
+  assert.equal(record.request.bodyJson, null)
+  assert.equal(record.request.bodyText, '{"model":"deepseek-chat","messages":[]}')
+  assert.equal(record.response!.bodyJson, null)
+})
+
+test('wrapFetch: an unparseable request body still records, with a null model', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  await patched('https://api.deepseek.com/v1/chat', {
+    method: 'POST',
+    headers: { 'user-agent': 'deepseek-harness/1.0' },
+    body: 'not json at all',
+  })
+  assert.equal(h.records[0].model, null)
+  assert.equal(h.records[0].request.bodyText, 'not json at all')
 })
 
 test('wrapFetch: authorization is redacted in the recorded request headers', async () => {
@@ -106,13 +152,16 @@ test('wrapFetch: the response body is clipped to maxBodyChars and reports trunca
   assert.equal(h.finalized[0].response!.bodyTruncated, true)
 })
 
-test('wrapFetch: an SSE content-type response body is never JSON-parsed as a whole', async () => {
+test('wrapFetch: an SSE response body is stored verbatim as text and never parsed', async () => {
   const h = harness()
   const real = (async () => new Response('data: {"a":1}\n\n', { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
   const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
   await patched('https://api.deepseek.com/v1/chat', { headers: { 'user-agent': 'deepseek-harness/1.0' } })
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(h.finalized[0].response!.bodyJson, null)
+  // The frames themselves are the point of this plugin, so the text is kept
+  // exactly as it arrived; store.get() is what decides never to parse it.
+  assert.equal(h.finalized[0].response!.bodyText, 'data: {"a":1}\n\n')
 })
 
 // -- installFetchPatch --

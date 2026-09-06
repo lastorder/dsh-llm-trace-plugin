@@ -31,9 +31,6 @@ export function createFakeArchive(): RecordArchive & { saved: WireRecord[] } {
     async get(id) {
       return byId.get(id) ?? null
     },
-    async restore() {
-      return [...byId.values()]
-    },
     async sweepTemp() {},
     async clear() {
       const count = byId.size
