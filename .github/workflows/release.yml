@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write # to create the GitHub Release and upload its tarball asset
+  id-token: write # to mint the OIDC token npm's Trusted Publishing exchanges for a publish credential
 
 jobs:
   release:
@@ -51,12 +52,19 @@ jobs:
           fi
 
       - name: Publish to npm
-        # prepublishOnly (pnpm run clean && pnpm run build) runs automatically
-        # as part of `npm publish`, so this always ships a dist/ built fresh
-        # from exactly this tagged commit.
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # No token: this repository's npm package has a Trusted Publisher
+        # configured (npmjs.com package Settings -> Trusted Publisher ->
+        # GitHub Actions -> this repo + this exact workflow filename). npm
+        # CLI >=11.5.1 (ensured by the `npm install -g npm@latest` step
+        # below) exchanges the OIDC token the `id-token: write` permission
+        # lets this job mint for a short-lived, workflow-scoped publish
+        # credential — nothing long-lived to leak, rotate, or store as a
+        # repository secret. prepublishOnly (pnpm run clean && pnpm run
+        # build) still runs automatically as part of `npm publish`, so this
+        # always ships a dist/ built fresh from exactly this tagged commit.
+        run: |
+          npm install -g npm@latest
+          npm publish
 
       - name: Pack the published tarball for the GitHub Release
         run: npm pack
