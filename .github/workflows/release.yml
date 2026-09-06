@@ -4,8 +4,19 @@ name: Release
 # convention this repository's release commits already follow
 # (`git tag -a vX.Y.Z -m "..."` after a `Release vX.Y.Z: ...` commit).
 # Nothing here changes how a release is decided or versioned; it only
-# automates the three steps that used to happen by hand after the tag was
-# pushed: verify, publish to npm, and create the matching GitHub Release.
+# automates the steps that used to happen by hand after the tag was pushed:
+# verify, stage the package on npm, and create a matching GitHub Release
+# marked as a pre-release until a maintainer approves the npm stage.
+#
+# This repository's npm Trusted Publisher is configured stage-only (no
+# "publish directly" permission), so `npm publish` from this workflow would
+# be rejected outright — only `npm stage publish` is accepted. A maintainer
+# must separately approve the staged version on npmjs.com (or via
+# `npm stage approve` locally, with 2FA) before it becomes installable. That
+# manual step is the deliberate point of staged publishing: even if this
+# workflow or the repository were compromised, an attacker could get a
+# malicious version as far as the stage queue, never onto the registry,
+# without a human's 2FA approval.
 on:
   push:
     tags:
@@ -13,7 +24,7 @@ on:
 
 permissions:
   contents: write # to create the GitHub Release and upload its tarball asset
-  id-token: write # to mint the OIDC token npm's Trusted Publishing exchanges for a publish credential
+  id-token: write # to mint the OIDC token npm's Trusted Publishing exchanges for a stage credential
 
 jobs:
   release:
@@ -41,8 +52,8 @@ jobs:
       - name: Check the tag matches package.json's version
         # A mismatch here means the tag was cut against the wrong commit, or
         # package.json's version was never bumped — fail loudly before
-        # anything is published, rather than shipping a version nobody meant
-        # to ship.
+        # anything is staged, rather than staging a version nobody meant to
+        # ship.
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
@@ -51,22 +62,23 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to npm
+      - name: Stage on npm
         # No token: this repository's npm package has a Trusted Publisher
         # configured (npmjs.com package Settings -> Trusted Publisher ->
-        # GitHub Actions -> this repo + this exact workflow filename). npm
-        # CLI >=11.5.1 (ensured by the `npm install -g npm@latest` step
-        # below) exchanges the OIDC token the `id-token: write` permission
-        # lets this job mint for a short-lived, workflow-scoped publish
-        # credential — nothing long-lived to leak, rotate, or store as a
-        # repository secret. prepublishOnly (pnpm run clean && pnpm run
-        # build) still runs automatically as part of `npm publish`, so this
-        # always ships a dist/ built fresh from exactly this tagged commit.
+        # GitHub Actions -> this repo + this exact workflow filename),
+        # restricted to stage-only. npm CLI >=11.15.0 (ensured by
+        # `npm install -g npm@latest` below) exchanges the OIDC token the
+        # `id-token: write` permission lets this job mint for a short-lived,
+        # workflow-scoped stage credential — nothing long-lived to leak,
+        # rotate, or store as a repository secret. prepublishOnly (pnpm run
+        # clean && pnpm run build) still runs automatically as part of
+        # `npm stage publish`, so the staged tarball is always built fresh
+        # from exactly this tagged commit.
         run: |
           npm install -g npm@latest
-          npm publish
+          npm stage publish
 
-      - name: Pack the published tarball for the GitHub Release
+      - name: Pack a tarball for the GitHub Release
         run: npm pack
 
       - name: Read the release notes from the tagged commit
@@ -82,11 +94,16 @@ jobs:
           {
             echo 'body<<RELEASE_NOTES_EOF'
             git log -1 --format=%B "$GITHUB_SHA"
+            echo ''
+            echo '---'
+            echo ''
+            echo '⚠️ Staged on npm, awaiting maintainer approval before it installs — see https://www.npmjs.com/package/dsh-llm-trace-plugin?activeTab=versions or run `npm stage ls`.'
             echo 'RELEASE_NOTES_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create the GitHub Release
+      - name: Create the GitHub Release (marked pre-release until npm approval)
         uses: softprops/action-gh-release@v2
         with:
           body: ${{ steps.release_notes.outputs.body }}
           files: '*.tgz'
+          prerelease: true
