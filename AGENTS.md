@@ -1,7 +1,5 @@
 # AGENTS.md
 
-English | [中文](AGENTS.zh.md)
-
 This file is for an AI agent (or a human contributor) making a change in this repository. It states the exact self-verification flow every change must complete, the module boundaries the codebase already relies on, and the hard constraints that protect properties this project has deliberately chosen. See [`docs/architecture.md`](docs/architecture.md) before restructuring anything under `src/`, and [`docs/plugin-development.md`](docs/plugin-development.md) before changing anything that touches Cordis/DSH extension points.
 
 ## Commands
@@ -48,13 +46,20 @@ Every module listed as testable in `docs/architecture.md` (all of `src/host/**`,
 - `src/host/index.ts`, `src/client/entry.ts` — pure Cordis/`ModuleLoader` glue; verified by `pnpm run typecheck` and `pnpm run build` succeeding, not by mocking an entire Cordis `Context`.
 - `src/client/api-client.ts`, `src/client/styles.ts`, `src/client/json-view.ts`, `src/client/wire-trace-view.ts` — depend on real DOM/React. Verify these by hand using the "fake React + fake `window.__ModuleLoader__` + real compiled `dist/client.js`" pattern already exercised in this project's development history: build a minimal `ReactLike` object with `useState`/`useEffect`/etc. as plain JS, capture the factory's exports, and call `apply(ctx)` with a fake `ctx`. State the exact steps taken when reporting the change.
 
+## Releasing
+
+Publishing is automated by [`.github/workflows/release.yml`](.github/workflows/release.yml): pushing a `vX.Y.Z` tag (the same `git tag -a vX.Y.Z -m "..."` convention every release commit already uses) triggers `pnpm run verify`, then `npm publish` (via the existing `prepublishOnly` script, so the published `dist/` is always built fresh from that exact tagged commit), then creates the matching GitHub Release with the `npm pack` tarball attached. The workflow fails closed before publishing if `pnpm run verify` fails, or if the tag doesn't match `package.json`'s `version`.
+
+A version bump is still a manual decision: edit `package.json`'s `version`, commit as `Release vX.Y.Z: <summary>` (this commit message becomes the GitHub Release body verbatim), tag, and push the tag. Do not run `npm publish` by hand except to recover from a CI outage — and even then, run `pnpm run verify` first.
+
 ## Hard constraints (do not undo these deliberately-made decisions)
 
 - **npm is the only install path that gets a build for free.** `prepublishOnly` (`pnpm run clean && pnpm run build`) runs locally on the publisher's machine as part of `npm publish`/`pnpm publish`, so the tarball on the registry always carries a fresh `dist/` built from the exact source being published. Do **not** add a `prepare` script to try to extend this to git-spec/`link:` installs: pnpm ≥10 requires an explicit `allowBuilds` approval before a git dependency's `prepare` script may run at all, which reopens exactly the "permission to execute this package's code on your machine at install time" prompt this project avoids. A git checkout or local `link:` install gets source only and must run `pnpm run build` itself — see the README's "Install" section for the exact steps that path documents to users.
 - **`dist/` and `.test-build/` are gitignored build artifacts, not repository content.** Never commit them and never remove them from `.gitignore` — regenerate with `pnpm run build` (or let `prepublishOnly` regenerate `dist/` at publish time). A stale committed `dist/` would silently diverge from `src/` the moment someone forgot to rebuild before committing; not tracking it removes that failure mode entirely.
 - **`README.md` and `README.zh.md` are a hard-synced pair.** Never edit one without the other, and never let `README.i18n.yaml`'s recorded hashes go stale — a mismatch there means a translation gap slipped through review.
 - **Bodies are stored verbatim in `src/host/persistence/`.** Do not add any transformation that summarizes, redacts beyond `authorization`, or otherwise mutates a captured request/response body before it reaches disk; that guarantee (see the main README's "Persistence" section) is what makes the curl-replay feature and the merged-SSE view trustworthy.
+- **The release workflow is the only thing that runs `npm publish`.** Do not add a second publish path (a different workflow, a script a contributor runs locally as routine practice) — one path means one place enforces the version-matches-tag check and the `pnpm run verify` gate before anything reaches the registry.
 
 ## Editing this file
 
-`AGENTS.md` and `AGENTS.zh.md` are a bilingual pair like the READMEs — update both together. Keep this file scoped to what an agent needs to decide *where a change goes* and *how to verify it*; move anything that explains *why* a design choice was made into `docs/architecture.md` or the module's own doc comment, and link to it instead of duplicating it here.
+`AGENTS.md` has no Chinese counterpart by design — unlike the READMEs and `docs/`, it is not user-facing product documentation, and is expected to be read primarily by tooling and English-first contributors. Keep this file scoped to what an agent needs to decide *where a change goes* and *how to verify it*; move anything that explains *why* a design choice was made into `docs/architecture.md` or the module's own doc comment, and link to it instead of duplicating it here.

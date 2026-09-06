@@ -4,6 +4,7 @@
   "description": "Capture the literal HTTP request/response of every LLM provider call (by patching globalThis.fetch) and show them in a Wire Trace session tab",
   "license": "MIT",
   "type": "module",
+  "packageManager": "pnpm@11.22.0",
   "main": "dist/host/index.js",
   "exports": {
     ".": "./dist/host/index.js",
@@ -19,7 +20,6 @@
     "README.md",
     "README.zh.md",
     "AGENTS.md",
-    "AGENTS.zh.md",
     "LICENSE"
   ],
   "scripts": {

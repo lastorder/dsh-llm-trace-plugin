@@ -83,12 +83,12 @@ sse.ts（解析）──帧──► sse-merge/（重组）──合并后的 JS
 
 上面每一处拆分背后都贯穿着两条规则，值得带到任何新插件里去，不论那个插件具体做什么：
 
-1. **框架胶水代码每个半边只留一个文件**（`src/host/index.ts`、`src/client/entry.ts`）。其余每个模块都是普通 TypeScript，直接 import 进来调用函数就能测试——不需要 Cordis context、不需要 DOM、不需要跑起来一个 DSH 进程。正是这一点让本插件整个重写过程（见本仓库的开发历史）能够通过 `node -e "..."` 把真实抓到的记录直接灌进编译后的模块来验证，而不是只能靠点开一个真正运行的界面去检查。`test/` 让这一点从理论变成了具体事实：它逐文件对应同一条边界（`test/host/**` 对应 `src/host/**`，`test/client/**` 对应不含 DOM 的 `src/client/*.ts`），边界这一侧的每个模块都有一份真实的 `node:test` 用例在验证它——确切规则和刻意排除在外的模块见 [`AGENTS.zh.md`](../AGENTS.zh.md)。
+1. **框架胶水代码每个半边只留一个文件**（`src/host/index.ts`、`src/client/entry.ts`）。其余每个模块都是普通 TypeScript，直接 import 进来调用函数就能测试——不需要 Cordis context、不需要 DOM、不需要跑起来一个 DSH 进程。正是这一点让本插件整个重写过程（见本仓库的开发历史）能够通过 `node -e "..."` 把真实抓到的记录直接灌进编译后的模块来验证，而不是只能靠点开一个真正运行的界面去检查。`test/` 让这一点从理论变成了具体事实：它逐文件对应同一条边界（`test/host/**` 对应 `src/host/**`，`test/client/**` 对应不含 DOM 的 `src/client/*.ts`），边界这一侧的每个模块都有一份真实的 `node:test` 用例在验证它——确切规则和刻意排除在外的模块见 [`AGENTS.md`](../AGENTS.md)（英文）。
 2. **一个关注点一旦会强迫两件不相关的事情被迫一起改动，它就该有自己的文件。** `persistence/naming.ts` 和 `archive.ts` 的对比是最清楚的例子：以前文件名格式的改动和保留策略清理的改动要动同一个函数；拆开之后，改其中一个都不会让另一个的测试跑错断言。
 
 ## 接下来看什么
 
 - [`plugin-development.zh.md`](plugin-development.zh.md) —— 同一份代码库里 DSH/Cordis 相关的那一侧（服务、事件、Slot，以及为什么 `fetch` 补丁必须是已安装的包）。
-- [`AGENTS.zh.md`](../AGENTS.zh.md) —— 一次改动必须走完的自验证流程，以及它强制执行的模块边界/硬性约束。
+- [`AGENTS.md`](../AGENTS.md)（英文） —— 一次改动必须走完的自验证流程，以及它强制执行的模块边界/硬性约束。
 - [主 README，"Repository layout"](../README.zh.md#仓库结构) —— 本文档图示所概括的、逐文件的平铺列表。
 - [主 README，"How it works"](../README.zh.md#工作原理) —— 这些模块实现的运行时行为，与它们如何被拆分无关。

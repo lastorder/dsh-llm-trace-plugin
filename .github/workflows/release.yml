@@ -1,0 +1,84 @@
+name: Release
+
+# Triggered by pushing an annotated tag matching v*.*.* — the same tagging
+# convention this repository's release commits already follow
+# (`git tag -a vX.Y.Z -m "..."` after a `Release vX.Y.Z: ...` commit).
+# Nothing here changes how a release is decided or versioned; it only
+# automates the three steps that used to happen by hand after the tag was
+# pushed: verify, publish to npm, and create the matching GitHub Release.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write # to create the GitHub Release and upload its tarball asset
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify (build + typecheck + test)
+        run: pnpm run verify
+
+      - name: Check the tag matches package.json's version
+        # A mismatch here means the tag was cut against the wrong commit, or
+        # package.json's version was never bumped — fail loudly before
+        # anything is published, rather than shipping a version nobody meant
+        # to ship.
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $PACKAGE_VERSION"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        # prepublishOnly (pnpm run clean && pnpm run build) runs automatically
+        # as part of `npm publish`, so this always ships a dist/ built fresh
+        # from exactly this tagged commit.
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Pack the published tarball for the GitHub Release
+        run: npm pack
+
+      - name: Read the release notes from the tagged commit
+        # github.event.head_commit is not reliably populated for a tag push
+        # (it depends on how the tag was created), so read the message
+        # directly from git instead of trusting the event payload. This
+        # repository's release commits are already written as standalone
+        # release notes ("Release vX.Y.Z: <summary>" plus a prose body), so
+        # reusing that message verbatim is more useful than GitHub's
+        # auto-generated commit-list notes.
+        id: release_notes
+        run: |
+          {
+            echo 'body<<RELEASE_NOTES_EOF'
+            git log -1 --format=%B "$GITHUB_SHA"
+            echo 'RELEASE_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.release_notes.outputs.body }}
+          files: '*.tgz'

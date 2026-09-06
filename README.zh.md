@@ -464,7 +464,7 @@ pnpm run verify       # build + typecheck + test —— 认为一次改动完成
 
 刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
 
-一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持是 gitignore 掉的构建产物、body 逐字存储），见 [`AGENTS.zh.md`](AGENTS.zh.md)。
+一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持是 gitignore 掉的构建产物、body 逐字存储），见 [`AGENTS.md`](AGENTS.md)（英文）。
 
 关于本项目自身如何使用 DSH/Cordis 插件框架——服务、事件、Slot，以及只有已安装包才能做的那一件事（补丁 `fetch`）——的简短讲解，见 [`docs/plugin-development.zh.md`](docs/plugin-development.zh.md)。关于本项目自己的模块为什么这样拆分、数据如何在它们之间流动，见 [`docs/architecture.zh.md`](docs/architecture.zh.md)。
 
