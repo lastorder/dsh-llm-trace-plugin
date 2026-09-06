@@ -1,22 +1,39 @@
 {
   "name": "dsh-llm-trace-plugin",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Capture the literal HTTP request/response of every LLM provider call (by patching globalThis.fetch) and show them in a Wire Trace session tab",
   "license": "MIT",
   "type": "module",
-  "main": "src/index.js",
+  "main": "dist/host/index.js",
   "exports": {
-    ".": "./src/index.js",
-    "./client": "./src/client.js",
+    ".": "./dist/host/index.js",
+    "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },
   "files": [
+    "dist",
     "src",
+    "test",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "README.zh.md",
+    "AGENTS.md",
+    "AGENTS.zh.md",
     "LICENSE"
   ],
+  "scripts": {
+    "build": "tsc -p tsconfig.host.json && node build-client.mjs",
+    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json",
+    "test": "tsc -p tsconfig.test.json && node --test \".test-build/**/*.test.js\"",
+    "verify": "pnpm run build && pnpm run typecheck && pnpm run test",
+    "clean": "rm -rf dist .test-build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lastorder/dsh-llm-trace-plugin.git"
@@ -38,7 +55,9 @@
     "node": ">=20"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [

@@ -50,7 +50,7 @@ dsh plugin --profile web remove dsh-llm-trace-plugin
 
 - `dsh plugin` 会转发给 pnpm，随后根据*已安装状态*回填 `$DSH_HOME/profiles/web/package.json` 里的 `dsh.profile.bundles`，因此 git 形式的安装会以本包真实的名字 `dsh-llm-trace-plugin` 登记。
 - **安装后需要重启 `dsh web`。** 已安装的包不是开发态 checkout，没有客户端插件的 HMR 监听。
-- 本插件只包含纯 JavaScript，且**没有声明 `prepare` 脚本**，所以 git 安装不需要在 profile 的 `pnpm-workspace.yaml` 里添加 `allowBuilds` 条目 —— git 插件通常会触发的构建放行提示在这里不适用。
+- 本插件的源码是 TypeScript，但发布/安装的包只包含编译后的纯 JavaScript `dist/` 产物 —— 并且**没有声明 `prepare` 脚本**，所以 git 安装不需要在 profile 的 `pnpm-workspace.yaml` 里添加 `allowBuilds` 条目 —— git 插件通常会触发的构建放行提示在这里不适用。
 - 包名已从 `dsh-llm-wire-trace-plugin` 改为 `dsh-llm-trace-plugin`。如果你之前是按旧名字安装的，请先卸载：`dsh plugin --profile web remove dsh-llm-wire-trace-plugin`。
 
 ## 配置
@@ -201,7 +201,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 折叠后的容器会收成一行占位符，并保留其尾随逗号，例如 `"messages": [ … 12 items ],`。完全展开时，该视图就是合法的 JSON：经 `JSON.parse` 可原样还原为捕获到的值。
 
-包含 Request 和 Response 两个标签页。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体会被按帧解析成一个个对象，使整条流读起来就是一个 JSON 数组（见下）。
+包含 Request 和 Response 两个标签页。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体默认会被*重新组装*——把散落的 delta 增量合并回一份完整、可读的结构，再用同一套 JSON 视图显示（见下）。
 
 > 应用内的按钮文案目前是中文。
 
@@ -251,9 +251,106 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 作为兜底：如果首次加载发现本 session 一条可归属记录都没有、却存在无归属记录，就会自动回退到「全部 Session」并说明原因。该回退最多发生一次，你只要自己动过那个开关，它就不再生效。
 
-### Response：把 SSE 显示为 JSON 数组
+### Response：合并后的 SSE，以及底下的原始线路文本
 
-`event-stream` 类型的响应体会被逐帧解析成一个 JSON 数组，并使用与其他响应体相同的视图显示。每一帧成为一个对象，其键名就是 SSE 协议自身的字段名：
+原始 SSE 流本身几乎没法直接阅读：一次回复通常被拆成几十到几百个帧，每一帧只带一两个字符的文本。所以本插件默认会*重新组装*一个 `event-stream` 响应再展示 —— 把每个 delta 增量合并回**该 provider 自己非流式响应本来的形状**，再用与 Request 完全相同的 JSON 树展示（同样的折叠、同样的复制/下载）。特意复用官方形状：读者只要已经熟悉一个普通的 Anthropic 或 OpenAI 响应长什么样，看合并后的结果就不需要学任何新词汇。
+
+每个 provider 形状对应一个小小的独立适配器模块（`sse-merge/anthropic.ts`、`sse-merge/openai-responses.ts`、`sse-merge/openai-chat-completions.ts`），每一帧都会依次交给它们尝试，谁认得出这个形状就由谁合并进去。以后要支持第四种 provider 形状，只需要新增一个适配器文件——其他任何地方都不用改。目前能识别三种结构，无需告诉插件这是哪个 provider：
+
+**OpenAI/DeepSeek Chat Completions**（带顶层 `choices` 数组的对象）合并进 `chatCompletion`，形状与 SDK 自己的 `ChatCompletion` 一致：
+
+```json
+{
+  "anthropic": null,
+  "responses": null,
+  "chatCompletion": {
+    "id": "chatcmpl-...",
+    "object": "chat.completion",
+    "model": "deepseek-...",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "拼接自每个 delta.content 增量的完整回复正文",
+          "reasoning_content": "如果 provider 发送了推理内容（DeepSeek 自己的扩展字段），这里是完整的推理正文",
+          "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "search", "arguments": "{\"q\":\"...\"}" }, "argumentsJson": { "q": "..." } }
+          ]
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": { }
+  },
+  "frameCount": 137,
+  "recognizedFrameCount": 135,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+content 和 reasoning-content 的增量按线路顺序拼接；工具调用被拆分的 `function.arguments` 同样按顺序拼接，最后整体解析一次，合入（并非官方字段、但几乎总是读者接下来想要的）`argumentsJson` 便利字段——而不是某个片段的局部解析结果。
+
+**Anthropic Messages API**（按 `event:` 类型分帧 —— `message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`）合并进 `anthropic`，形状与非流式的 `POST /v1/messages` 响应一致：
+
+```json
+{
+  "anthropic": {
+    "id": "msg_...",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-...",
+    "content": [
+      { "type": "text", "text": "拼接自每个 text_delta 增量的完整回复正文" },
+      { "type": "thinking", "thinking": "如果模型使用了扩展思考，这里是完整的思考正文", "signature": "..." },
+      { "type": "tool_use", "id": "toolu_...", "name": "bash", "input": { "command": "..." }, "inputJsonText": "{\"command\":\"...\"}" }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": { }
+  },
+  "responses": null,
+  "chatCompletion": null,
+  "frameCount": 19,
+  "recognizedFrameCount": 17,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+每个 content block 的 `text` / `thinking` / `partial_json` 增量按线路顺序拼接，以 block 自身的 index 为归属；`tool_use` block 被拆分的 `partial_json` 会整体解析一次，合入官方字段 `input`，解析失败时原始拼接文本仍保留在 `inputJsonText` 里。`message_start` 里的顶层字段（id、model、role、usage 等）会被收进来，`message_delta` 追加的内容（包括 provider 私有的额外字段）也会一并合入——所以真实记录里的 `copilot_usage` 之类扩展字段依然会出现，只是作为官方字段之外的额外字段。
+
+**OpenAI Responses API**（同样按 `event:` 类型分帧，但用的是另一套名字 —— `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.function_call_arguments.delta` / `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` / … / `response.completed`）合并进 `responses`，形状与非流式的 `POST /v1/responses` 响应一致：
+
+```json
+{
+  "anthropic": null,
+  "responses": {
+    "id": "resp_...",
+    "object": "response",
+    "model": "gpt-5...",
+    "status": "completed",
+    "output": [
+      { "type": "reasoning", "id": "rs_...", "summary": [ { "type": "summary_text", "text": "..." } ], "content": null },
+      { "type": "message", "id": "msg_...", "role": "assistant", "content": [ { "type": "output_text", "text": "完整的回复正文" } ] },
+      { "type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "search", "arguments": "{\"q\":\"...\"}", "argumentsJson": { "q": "..." } }
+    ],
+    "usage": { }
+  },
+  "chatCompletion": null,
+  "frameCount": 11,
+  "recognizedFrameCount": 11,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+每个 output item 以自己的 `output_index` 为归属，合并进对应的官方 item 形状（`message` / `reasoning` / `function_call`）。`reasoning` item 的 `summary[]`（来自 `response.reasoning_summary_text.delta`）和 `content[]`（来自 `response.reasoning_text.delta`）是两个各自独立的官方字段——具体哪个会被填充取决于模型/账号，只有 provider 实际发送的那个才会有内容，另一个保持 `null`/`[]`，不会被凭空编造。`function_call` 的 `arguments` 按线路顺序拼接，最后整体解析一次合入 `argumentsJson` 便利字段；`response.output_item.done` 还额外提供了一份兜底的整体读取，覆盖本插件的增量处理可能遗漏的字段，因此无论哪种情况调用参数都能完整呈现。
+
+任何这三套结构都识别不了的东西都不会被强行凑进去 —— 错误事件、无法识别的 `event:` 类型、`[DONE]` 哨兵、无法解析的载荷，都会原样进入 `unrecognized`，保证插件看不懂的内容也绝不会被悄悄丢弃。
+
+一个开关（`原始 SSE` / `优化展示`）可以切换到线路上真实的帧序列 —— 每一帧一个对象，键名就是 SSE 协议自身的字段名，与捕获时完全一致 —— 当你确实需要原始字节时使用：
 
 ```json
 [
@@ -264,9 +361,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 ]
 ```
 
-`data:` 在载荷可解析时存放解析后的 JSON，否则存放原始字符串，因此像 `[DONE]` 这样的哨兵不会被丢弃而是照常可见；`event:` / `id:` / `retry:` 作为同级键并列，注释行（`: keep-alive`）则成为 `comment`。同一帧内重复出现的 `data:` 行会先按 SSE 规范用换行符拼接再解析。任何内容都不会被丢弃 —— 无法解析的载荷会以字符串形式逐字保留。
-
-`SSE 原始文本` 开关可切换到线路上真实的帧序列，而这正是本插件存在的意义。在该模式下只有每一帧的 `data:` 载荷会被重新缩进；帧结构（`event:` / `id:` / `retry:` 字段、注释行、空行分隔符，以及非 JSON 哨兵）完全保持原样。
+`data:` 在载荷可解析时存放解析后的 JSON，否则存放原始字符串，因此像 `[DONE]` 这样的哨兵不会被丢弃而是照常可见；`event:` / `id:` / `retry:` 作为同级键并列，注释行（`: keep-alive`）则成为 `comment`。同一帧内重复出现的 `data:` 行会先按 SSE 规范用换行符拼接再解析。任何内容都不会被丢弃 —— 无法解析的载荷会以字符串形式逐字保留。该模式下只有每一帧的 `data:` 载荷会被重新缩进；帧结构完全保持原样。
 
 ### 复制为 curl
 
@@ -301,15 +396,77 @@ harness 坐标（turn / step）另有一层不同的依赖：它们来自 `llm/s
 
 ## 仓库结构
 
+源码使用 TypeScript 按职责拆分模块；`dist/` 是真正被安装和加载的、编译后的纯 JavaScript 产物 —— 见下方[开发](#开发)一节。
+
 ```
-src/index.js       host 半边 —— fetch 补丁、记录存储与 HTTP 路由
-src/persistence.js 持久化存储 —— 一条记录一个 JSON 文件、保留策略与恢复
-src/client.js      浏览器半边 —— Wire Trace 标签页，手写的 bundle 格式
-cordis.patch.yml   host 组合中的插件行（dsh.bundle.patch）
-package.json       dsh.bundle 与 dsh.client 声明
+src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
+  index.ts                    apply(ctx, config) —— 把各模块组装起来
+  constants.ts                共享常量（user-agent 前缀、header 名、默认值）
+  http-utils.ts               header 脱敏、请求解析、JSON/body 裁剪
+  call-context.ts             围绕 llm/stream 的 AsyncLocalStorage 绑定（turn/step/purpose/provider）
+  step-tracker.ts              基于 session/event 的 turn/step 跟踪
+  fetch-patch.ts                globalThis.fetch 补丁本身
+  curl.ts                       curl 命令渲染与密钥解析
+  store.ts                      内存环与持久化归档的合并视图
+  page-grouping.ts              列表分页分组（turn、辅助调用、无归属统计）
+  routes.ts                     HTTP 路由处理（list/stats/get/curl/clear）
+  persistence/                  一条记录一个文件的持久化存储
+    naming.ts                   文件命名与 trace 目录解析
+    codec.ts                    记录 ⇄ 持久化 JSON 互转
+    archive.ts                  实际的文件 I/O（save/list/get/restore/sweep/clear）
+    constants.ts
+src/client/                   浏览器半边（由 esbuild 打包为单个经典脚本）
+  entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹
+  wire-trace-view.ts            WireTraceView 组件（状态与渲染）
+  json-view.ts                   可折叠 JSON 树组件
+  json-model.ts                   纯 JSON 展平数据模型（不含 DOM）
+  format.ts                       标签/格式化函数（turn 徽标、session 标签、时间戳）
+  sse.ts                           原始 SSE 帧解析/美化打印
+  sse-merge/                        按 provider 拆分的适配器，把 SSE 增量合并回该 provider 自己的非流式响应形状
+    shared.ts                        适配器公共接口 + JSON 解析工具函数
+    anthropic.ts                     Anthropic Messages API 适配器
+    openai-responses.ts              OpenAI Responses API 适配器
+    openai-chat-completions.ts       OpenAI/DeepSeek Chat Completions 适配器
+    index.ts                         把每一帧分发给各适配器，汇总成统一结果
+  api-client.ts                     本插件自身路由的 fetch 封装
+  styles.ts                         标签页样式
+  constants.ts
+src/shared/
+  record-shape.ts              两个半边共享的仅类型记录结构
+dist/                         编译产物 —— 真正发布和加载的内容
+  host/**                      tsc 输出，逐文件对应
+  client.js                     esbuild 打包 src/client/** 后的单个 IIFE
+cordis.patch.yml              host 组合中的插件行（dsh.bundle.patch）
+package.json                  dsh.bundle 与 dsh.client 声明
+test/                          node:test 测试套件，与 src/host/** 及不含 DOM 的 src/client/*.ts 逐文件对应
+AGENTS.md                      给 agent/贡献者看的自验证流程、模块边界与硬性约束
+docs/plugin-development.zh.md 本仓库如何使用 DSH/Cordis 插件框架
+docs/architecture.zh.md       本仓库自己的模块为什么这样拆分
 ```
 
-没有构建步骤：两个半边都是纯 JavaScript，原样提供与加载。
+## 开发
+
+```sh
+pnpm install
+pnpm run build       # tsc -> dist/host/**，esbuild -> dist/client.js
+pnpm run typecheck   # host + client，仅类型检查不产出文件
+pnpm run test        # tsc -> .test-build，node --test
+pnpm run verify       # build + typecheck + test —— 认为一次改动完成前的完整自验证
+```
+
+`dist/` 纳入版本控制（并包含在发布的 `files` 里），所以无论是从 npm 还是 `git+https://...` 安装都不需要执行构建。这是刻意的设计：**本包依然不声明 `prepare` 脚本**，所以 git 安装依然不需要在 profile 的 `pnpm-workspace.yaml` 里添加 `allowBuilds` 条目 —— git 插件通常会触发的构建放行提示在这里不适用。只有从源码构建的贡献者才需要 Node + `pnpm run build`；安装这个包的用户拿到的始终是编译好的纯 JavaScript。
+
+本地开发时，每次改动源码后运行一次 `pnpm run build`，然后重新安装 `link:.` checkout（或者直接重启 `dsh web`，因为被链接的包的 `dist/` 不在 client-plugin 的 HMR 监听范围内）。
+
+### 测试
+
+`test/` 与 `src/host/**`、`src/shared/**`，以及不含 DOM 的 client 模块（`format.ts`、`json-model.ts`、`sse.ts`、`sse-merge/**`）逐文件对应，用 Node 内置的测试运行器（`node:test`）——不引入任何测试框架依赖。覆盖范围包括：内存 store 与伪造 archive 的合并逻辑、持久化层用真实临时目录做的文件 I/O、turn/step 归属用到的 `AsyncLocalStorage` 上下文绑定，以及每个 SSE 合并适配器针对合成数据和一个本项目真实修过的 bug 的精确复现（一个 `message` item 自己的 id 被误判成 tool-call id）。
+
+刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
+
+一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持纳入版本控制、body 逐字存储），见 [`AGENTS.zh.md`](AGENTS.zh.md)。
+
+关于本项目自身如何使用 DSH/Cordis 插件框架——服务、事件、Slot，以及只有已安装包才能做的那一件事（补丁 `fetch`）——的简短讲解，见 [`docs/plugin-development.zh.md`](docs/plugin-development.zh.md)。关于本项目自己的模块为什么这样拆分、数据如何在它们之间流动，见 [`docs/architecture.zh.md`](docs/architecture.zh.md)。
 
 ## 许可证
 

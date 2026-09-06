@@ -1,0 +1,137 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { createRouteHandler } from '../../src/host/routes.js'
+import { fakeRequest, fakeResponse } from './fake-http.js'
+import { makeRecord } from './fixtures.js'
+import type { WireTraceStore } from '../../src/host/store.js'
+
+function fakeStore(overrides: Partial<WireTraceStore> = {}): WireTraceStore {
+  return {
+    records: [],
+    wrapFetch: (real) => real,
+    list: () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0 }),
+    listAll: async () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0, persistence: false, truncated: false, historyPending: false }),
+    stats: async () => ({ persistence: false, memory: 0 }),
+    get: async () => null,
+    clear: async () => ({ removed: 0, removedFiles: 0 }),
+    ...overrides,
+  }
+}
+
+const ROUTE_PREFIX = '/llm-wire-trace'
+
+test('list: forwards limit/sessionId/source=memory to store.listAll', async () => {
+  let seenOptions: any = null
+  const store = fakeStore({
+    listAll: async (options) => {
+      seenOptions = options
+      return { items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0, persistence: false, truncated: false, historyPending: false }
+    },
+  })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/list?limit=25&sessionId=s1&source=memory`), res)
+  assert.equal(captured.status, 200)
+  assert.deepEqual(seenOptions, { limit: 25, sessionId: 's1', memoryOnly: true })
+})
+
+test('list: an absent sessionId degrades to the empty-string filter (no filter), not undefined', async () => {
+  let seenOptions: any = null
+  const store = fakeStore({
+    listAll: async (options) => { seenOptions = options; return { items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0, persistence: false, truncated: false, historyPending: false } },
+  })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/list`), res)
+  assert.equal(seenOptions.sessionId, '')
+})
+
+test('stats: returns store.stats() as-is', async () => {
+  const store = fakeStore({ stats: async () => ({ persistence: true, memory: 3 }) })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/stats`), res)
+  assert.equal(captured.status, 200)
+  assert.deepEqual(captured.json(), { persistence: true, memory: 3 })
+})
+
+test('get: returns store.get(id) for the given id', async () => {
+  const record = makeRecord({ id: 'r1' })
+  const store = fakeStore({ get: async (id) => (id === 'r1' ? record : null) })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/get?id=r1`), res)
+  assert.equal((captured.json() as any).id, 'r1')
+})
+
+test('curl: 404s with no such record when the id does not exist', async () => {
+  const store = fakeStore({ get: async () => null })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/curl?id=nope`), res)
+  assert.equal(captured.status, 404)
+})
+
+test('curl: reports auth.kind=env when no credential was resolved', async () => {
+  delete process.env.DSH_CURL_KEY
+  const record = makeRecord()
+  const store = fakeStore({ get: async () => record })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/curl?id=${record.id}`), res)
+  const body = captured.json() as any
+  assert.equal(body.auth.kind, 'env')
+  assert.ok(typeof body.command === 'string' && body.command.startsWith('curl '))
+})
+
+test('curl: reports auth.kind=value when DSH_CURL_KEY resolves a real credential', async () => {
+  process.env.DSH_CURL_KEY = 'sk-test'
+  try {
+    const record = makeRecord()
+    const store = fakeStore({ get: async () => record })
+    const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+    const { res, captured } = fakeResponse()
+    await handler(fakeRequest(`${ROUTE_PREFIX}/curl?id=${record.id}`), res)
+    const body = captured.json() as any
+    assert.equal(body.auth.kind, 'value')
+  } finally {
+    delete process.env.DSH_CURL_KEY
+  }
+})
+
+test('clear: reads keepPersisted from the JSON body and forwards it', async () => {
+  let seenOptions: any = null
+  const store = fakeStore({ clear: async (options) => { seenOptions = options; return { removed: 1, removedFiles: 0 } } })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/clear`, ['{"keepPersisted":true}']), res)
+  assert.deepEqual(seenOptions, { keepPersisted: true })
+  assert.deepEqual(captured.json(), { removed: 1, removedFiles: 0 })
+})
+
+test('clear: an empty body defaults keepPersisted to false', async () => {
+  let seenOptions: any = null
+  const store = fakeStore({ clear: async (options) => { seenOptions = options; return { removed: 0, removedFiles: 0 } } })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/clear`, []), res)
+  assert.deepEqual(seenOptions, { keepPersisted: false })
+})
+
+test('unknown method: 404s with a descriptive error', async () => {
+  const store = fakeStore()
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/bogus`), res)
+  assert.equal(captured.status, 404)
+  assert.match((captured.json() as any).error, /bogus/)
+})
+
+test('a thrown store error becomes a 500 with its message, never an unhandled rejection', async () => {
+  const store = fakeStore({ stats: async () => { throw new Error('disk exploded') } })
+  const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
+  const { res, captured } = fakeResponse()
+  await handler(fakeRequest(`${ROUTE_PREFIX}/stats`), res)
+  assert.equal(captured.status, 500)
+  assert.equal((captured.json() as any).error, 'disk exploded')
+})

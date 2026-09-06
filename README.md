@@ -50,7 +50,7 @@ Notes:
 
 - `dsh plugin` forwards to pnpm and then reconciles `dsh.profile.bundles` in `$DSH_HOME/profiles/web/package.json` from the *installed* state, so a git spec registers under this package's real name, `dsh-llm-trace-plugin`.
 - **Restart `dsh web` after installing.** An installed package is not a dev checkout, so there is no client-plugin HMR watcher.
-- This plugin ships plain JavaScript and declares **no `prepare` script**, so a git install needs no `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — the build-approval prompt that git-hosted plugins usually trigger does not apply here.
+- This plugin's source is TypeScript, but the published/installed package ships only the compiled, plain-JavaScript `dist/` output — and declares **no `prepare` script**, so a git install needs no `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — the build-approval prompt that git-hosted plugins usually trigger does not apply here.
 - The package name changed from `dsh-llm-wire-trace-plugin` to `dsh-llm-trace-plugin`. If you installed it under the old name, remove that first: `dsh plugin --profile web remove dsh-llm-wire-trace-plugin`.
 
 ## Configuration
@@ -201,7 +201,7 @@ Using the global stepper resets the baseline and clears any per-row folds, so th
 
 A folded container collapses to a one-line placeholder that keeps its trailing comma, e.g. `"messages": [ … 12 items ],`. Fully expanded, the view is valid JSON: it round-trips through `JSON.parse` to exactly the captured value.
 
-Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is parsed into one object per SSE frame so the whole stream reads as a JSON array (see below).
+Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is, by default, *reassembled* — its scattered delta fragments merged back into one complete, readable structure — and shown through the same JSON view (see below).
 
 > The in-app button labels are currently Chinese; the English names below are given alongside them.
 
@@ -251,9 +251,106 @@ Two consequences worth knowing:
 
 As a safety net, if the first load finds nothing attributable to this session while unattributed records exist, the tab falls back to **全部 Session** and says why. This fires at most once, and touching the toggle yourself disables it.
 
-### Response: SSE as a JSON array
+### Response: merged SSE, and the raw wire text underneath
 
-An `event-stream` body is parsed frame by frame into a JSON array and shown with the same view as any other body. Each frame becomes one object keyed by its own SSE field names:
+A raw SSE stream is close to unreadable directly: one reply is typically split across dozens to hundreds of frames, each carrying only a character or two of text. So by default this plugin *reassembles* an `event-stream` response before showing it — folding every delta fragment back into **the exact shape that provider's own non-streamed response would have had**, then rendering that structure through the exact same JSON tree Request uses (same folding, same copy/download). Reusing the official shape is deliberate: a reader who already knows what a normal Anthropic or OpenAI response looks like needs no new vocabulary to read the merged result.
+
+One small adapter module per provider shape (`sse-merge/anthropic.ts`, `sse-merge/openai-responses.ts`, `sse-merge/openai-chat-completions.ts`) is offered every frame in turn; whichever one recognizes a frame's shape folds it in. Adding a fourth provider shape means adding one more adapter file — nothing else changes. Three shapes are recognized today, auto-detected per frame so a stream never has to be told which provider it came from:
+
+**OpenAI/DeepSeek Chat Completions** (an object with a top-level `choices` array) reassembles into `chatCompletion`, shaped like the SDK's own `ChatCompletion`:
+
+```json
+{
+  "anthropic": null,
+  "responses": null,
+  "chatCompletion": {
+    "id": "chatcmpl-...",
+    "object": "chat.completion",
+    "model": "deepseek-...",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "the complete reply text, concatenated from every delta.content fragment",
+          "reasoning_content": "the complete reasoning text, if the provider sent one (DeepSeek's own extension)",
+          "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "search", "arguments": "{\"q\":\"...\"}" }, "argumentsJson": { "q": "..." } }
+          ]
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": { }
+  },
+  "frameCount": 137,
+  "recognizedFrameCount": 135,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+Content and reasoning-content fragments are concatenated in wire order; a tool call's fragmented `function.arguments` is concatenated the same way and then parsed once as a whole into the (non-standard, but almost always what a reader wants next) `argumentsJson` convenience field — never a per-fragment partial parse.
+
+**Anthropic Messages API** (framed by `event:` type — `message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`) reassembles into `anthropic`, shaped like a non-streamed `POST /v1/messages` response:
+
+```json
+{
+  "anthropic": {
+    "id": "msg_...",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-...",
+    "content": [
+      { "type": "text", "text": "the complete reply text, concatenated from every text_delta fragment" },
+      { "type": "thinking", "thinking": "the complete extended-thinking text, if the model used it", "signature": "..." },
+      { "type": "tool_use", "id": "toolu_...", "name": "bash", "input": { "command": "..." }, "inputJsonText": "{\"command\":\"...\"}" }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": { }
+  },
+  "responses": null,
+  "chatCompletion": null,
+  "frameCount": 19,
+  "recognizedFrameCount": 17,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+Each content block's `text` / `thinking` / `partial_json` fragments are concatenated in wire order, addressed by the block's own index; a `tool_use` block's fragmented `partial_json` is parsed once, as a whole, into `input` (the official field), with the raw accumulated text kept alongside as `inputJsonText` for when parsing fails. `message_start`'s top-level fields (id, model, role, usage, …) are captured, and anything `message_delta` adds (including provider-specific extras) is folded in alongside them — so a real record's `copilot_usage` or similar extension still shows up, just as an extra field beside the official ones.
+
+**OpenAI Responses API** (also framed by `event:` type, but a different set of names — `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.function_call_arguments.delta` / `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` / … / `response.completed`) reassembles into `responses`, shaped like a non-streamed `POST /v1/responses` response:
+
+```json
+{
+  "anthropic": null,
+  "responses": {
+    "id": "resp_...",
+    "object": "response",
+    "model": "gpt-5...",
+    "status": "completed",
+    "output": [
+      { "type": "reasoning", "id": "rs_...", "summary": [ { "type": "summary_text", "text": "..." } ], "content": null },
+      { "type": "message", "id": "msg_...", "role": "assistant", "content": [ { "type": "output_text", "text": "the complete reply text" } ] },
+      { "type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "search", "arguments": "{\"q\":\"...\"}", "argumentsJson": { "q": "..." } }
+    ],
+    "usage": { }
+  },
+  "chatCompletion": null,
+  "frameCount": 11,
+  "recognizedFrameCount": 11,
+  "sawDone": true,
+  "unrecognized": []
+}
+```
+
+Each output item is addressed by its own `output_index` and reassembled into the matching official item shape (`message` / `reasoning` / `function_call`). A `reasoning` item's `summary[]` (from `response.reasoning_summary_text.delta`) and `content[]` (from `response.reasoning_text.delta`) are two independent, official fields — which one actually fills in depends on model/account, and only the one the provider actually sent is populated; the other stays `null`/`[]` rather than being invented. A `function_call`'s `arguments` is concatenated in wire order and parsed once, as a whole, into the `argumentsJson` convenience field; `response.output_item.done` additionally supplies a fallback whole-value read for any field this plugin's delta handling might have missed, so a call still comes through complete either way.
+
+Nothing recognizable is guessed at: a frame that fits none of these three shapes — an error event, an unrecognized `event:` type, the `[DONE]` sentinel, an unparseable payload — is never forced into any of them, and lands verbatim in `unrecognized` instead, so nothing this plugin doesn't understand is ever silently dropped.
+
+A toggle (`原始 SSE` / `优化展示`) switches to the literal frame sequence on the wire — one object per SSE frame, keyed by its own SSE field names, exactly as captured — for when the raw bytes themselves are what you need:
 
 ```json
 [
@@ -264,9 +361,7 @@ An `event-stream` body is parsed frame by frame into a JSON array and shown with
 ]
 ```
 
-`data:` holds the parsed JSON when the payload is parseable and the raw string otherwise, so sentinels like `[DONE]` stay visible rather than being dropped; `event:` / `id:` / `retry:` sit alongside it, and comment lines (`: keep-alive`) become `comment`. Repeated `data:` lines within one frame are joined with newlines first, as the SSE spec requires. Nothing is discarded — a malformed payload is kept verbatim as a string.
-
-An `SSE 原始文本` toggle switches to the literal frame sequence on the wire, which is what this plugin exists to show. Only each frame's `data:` payload is re-indented there; frame structure (`event:` / `id:` / `retry:` fields, comment lines, blank separators, and non-JSON sentinels) is left completely untouched.
+`data:` holds the parsed JSON when the payload is parseable and the raw string otherwise, so sentinels like `[DONE]` stay visible rather than being dropped; `event:` / `id:` / `retry:` sit alongside it, and comment lines (`: keep-alive`) become `comment`. Repeated `data:` lines within one frame are joined with newlines first, as the SSE spec requires. Nothing is discarded — a malformed payload is kept verbatim as a string. Only each frame's `data:` payload is re-indented there; frame structure is left completely untouched.
 
 ### Copy as curl
 
@@ -299,15 +394,77 @@ This plugin depends on the implementation detail that every current provider ada
 
 ## Repository layout
 
+Source is TypeScript, organized by concern; `dist/` holds the compiled, plain-JavaScript output that is actually installed and loaded — see [Development](#development) below.
+
 ```
-src/index.js       host half — the fetch patch, record store, and HTTP routes
-src/persistence.js durable store — one JSON file per record, retention, restore
-src/client.js      browser half — the Wire Trace tab, hand-authored bundle format
-cordis.patch.yml   the host composition row (dsh.bundle.patch)
-package.json       dsh.bundle + dsh.client declarations
+src/host/                    host half (Node ESM, compiled 1:1 by tsc)
+  index.ts                   apply(ctx, config) — wires everything together
+  constants.ts                shared constants (user-agent prefix, header name, defaults)
+  http-utils.ts               header redaction, request description, JSON/body clipping
+  call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider)
+  step-tracker.ts              turn/step tracking from session/event
+  fetch-patch.ts               the globalThis.fetch patch itself
+  curl.ts                      curl-command rendering + credential resolution
+  store.ts                     in-memory ring merged with the durable archive
+  page-grouping.ts             list-page grouping (turns, auxiliary, unattributed)
+  routes.ts                    HTTP route handlers (list/stats/get/curl/clear)
+  persistence/                 durable, file-per-record store
+    naming.ts                  file-name generation and trace-dir resolution
+    codec.ts                   record ⇄ persisted-JSON conversions
+    archive.ts                 the actual file I/O (save/list/get/restore/sweep/clear)
+    constants.ts
+src/client/                  browser half (bundled by esbuild into one classic script)
+  entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper
+  wire-trace-view.ts           the WireTraceView component (state + rendering)
+  json-view.ts                 the collapsible JSON tree component
+  json-model.ts                 pure JSON-flattening data model (no DOM)
+  format.ts                     labels/formatters (turn badge, session label, timestamps)
+  sse.ts                        raw SSE frame parsing/pretty-printing
+  sse-merge/                     per-provider adapters that merge SSE deltas into that provider's own non-streamed shape
+    shared.ts                    shared adapter interface + JSON-parse helper
+    anthropic.ts                  Anthropic Messages API adapter
+    openai-responses.ts           OpenAI Responses API adapter
+    openai-chat-completions.ts    OpenAI/DeepSeek Chat Completions adapter
+    index.ts                      dispatches frames to every adapter, assembles the unified result
+  api-client.ts                  fetch wrappers for this plugin's own routes
+  styles.ts                      the tab's CSS
+  constants.ts
+src/shared/
+  record-shape.ts             type-only record shapes shared by both halves
+dist/                        compiled output — what actually ships and loads
+  host/**                     tsc output, one file per source module
+  client.js                    esbuild bundle of src/client/**, single IIFE
+cordis.patch.yml             the host composition row (dsh.bundle.patch)
+package.json                 dsh.bundle + dsh.client declarations
+test/                        node:test suites mirroring src/host/** and the DOM-free src/client/*.ts
+AGENTS.md                     self-verification flow, module boundaries, and hard constraints for agents/contributors
+docs/plugin-development.md   how this codebase uses the DSH/Cordis plugin framework
+docs/architecture.md         why this codebase's own modules are split the way they are
 ```
 
-There is no build step: both halves are plain JavaScript, served and loaded as-is.
+## Development
+
+```sh
+pnpm install
+pnpm run build       # tsc -> dist/host/**, esbuild -> dist/client.js
+pnpm run typecheck   # host + client, no emit
+pnpm run test        # tsc -> .test-build, node --test
+pnpm run verify       # build + typecheck + test — the full self-check before calling a change done
+```
+
+`dist/` is committed to the repository (and shipped in the published `files`), so an install — whether from npm or `git+https://...` — never needs to run a build. That is deliberate: **this package still declares no `prepare` script**, so a git install still needs no `allowBuilds` entry in the profile's `pnpm-workspace.yaml` — the build-approval prompt git-hosted plugins usually trigger does not apply here. Only a contributor building from source needs Node + `pnpm run build`; a user installing the package gets plain JavaScript either way.
+
+For local development, run `pnpm run build` after every source change, then reinstall the `link:.` checkout (or just restart `dsh web`, since a linked package's `dist/` is not covered by the client-plugin HMR watcher).
+
+### Tests
+
+`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`format.ts`, `json-model.ts`, `sse.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, and every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id).
+
+Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
+
+See [`AGENTS.md`](AGENTS.md) for the exact self-verification flow a change must complete before it's done, the module boundaries the test layout depends on, and the hard constraints (no `prepare` script, `dist/` stays committed, bodies stay verbatim) that protect this project's deliberate design choices.
+
+See [`docs/plugin-development.md`](docs/plugin-development.md) for a short walkthrough of how this codebase uses the DSH/Cordis plugin framework itself — services, events, Slots, and the one thing (patching `fetch`) that only an installed package can do. See [`docs/architecture.md`](docs/architecture.md) for why this codebase's own modules are split the way they are and how data flows between them.
 
 ## License
 
