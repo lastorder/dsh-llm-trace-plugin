@@ -1,5 +1,8 @@
 # dsh-llm-trace-plugin
 
+<img width="3024" height="1898" alt="20260907141152_27_365" src="https://github.com/user-attachments/assets/ad398625-d9c6-4b46-99e9-49b0177ad2ec" />
+
+
 English | [中文](README.zh.md)
 
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that captures the **literal HTTP request and response** of every LLM provider call — the exact bytes on the wire, provider-native field names, raw SSE frames — and lets you browse them in a **Wire Trace** session tab.
