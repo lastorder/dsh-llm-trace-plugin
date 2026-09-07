@@ -17,10 +17,10 @@ This works at the *wire* layer. A harness-level tracer observes the normalized `
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-Pin an exact version:
+Pin an exact version (recommended: the latest, `0.3.1`):
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.2.0
+dsh plugin --profile web add dsh-llm-trace-plugin@0.3.1
 ```
 
 Then update or remove it by **package name**:
@@ -45,7 +45,7 @@ Then install the checkout the same way as any local plugin:
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # or, from a git remote pinned to a branch/tag/commit:
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.2.0
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.3.1
 ```
 
 A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
@@ -138,7 +138,7 @@ Capture starts immediately, and a slow or failing disk cannot delay the fetch pa
 
 ### Privacy: bodies are stored verbatim
 
-Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `cookie`, and `set-cookie`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
+Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `cookie`, and `set-cookie`. A credential riding the URL's own query string (e.g. Google Gemini's `?key=`) is redacted the same way before the URL ever reaches memory or disk — see `REDACTED_QUERY_PARAMS` in `constants.ts`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
 
 Clearing from the viewer deletes the persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
 
@@ -163,6 +163,7 @@ The wrapper is written to hold these properties:
 - A provider call's caller still reads the complete, unmodified response body — the mirror never contends with it.
 - A transport failure (the underlying `fetch` throws) is recorded and **rethrown unchanged** — never swallowed.
 - Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.
+- A credential riding the URL's own query string (`?key=`, `?access_token=`, and similar — see `REDACTED_QUERY_PARAMS` in `constants.ts`) is redacted the same way, case-insensitively, before the URL is stored, displayed, or used to build a curl command. Every other query parameter, and the path, are left untouched.
 - The destructive `clear` route is `POST`-only and rejects a cross-origin request (`Sec-Fetch-Site`), so a page open elsewhere in your browser cannot wipe your trace history.
 - Re-activating the plugin cannot double-wrap an already-patched `fetch` (it throws loudly instead); stopping restores the exact original reference.
 
@@ -206,7 +207,7 @@ A folded container collapses to a one-line placeholder that keeps its trailing c
 
 Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is, by default, *reassembled* — its scattered delta fragments merged back into one complete, readable structure — and shown through the same JSON view (see below).
 
-> The in-app button labels are currently Chinese; the English names below are given alongside them.
+> The tab's language follows DSH's own Settings → General → Language switch (the `@deepseek-ai/dsh-client-locale` service), so every button, tooltip, and notice renders in Chinese or English to match. This plugin registers its dictionaries under the `llm-wire-trace` namespace; a future language pack targeting this plugin can extend that namespace through the locale service's own `addLanguage` extension point.
 
 ### Harness coordinates (turn / step)
 
@@ -353,7 +354,7 @@ Each output item is addressed by its own `output_index` and reassembled into the
 
 Nothing recognizable is guessed at: a frame that fits none of these three shapes — an error event, an unrecognized `event:` type, the `[DONE]` sentinel, an unparseable payload — is never forced into any of them, and lands verbatim in `unrecognized` instead, so nothing this plugin doesn't understand is ever silently dropped.
 
-A toggle (`原始 SSE` / `优化展示`) switches to the literal frame sequence on the wire — one object per SSE frame, keyed by its own SSE field names, exactly as captured — for when the raw bytes themselves are what you need:
+A toggle (`Show raw SSE` / `Show merged view` — the label always names what clicking it switches TO, not what is currently shown) switches to the literal frame sequence on the wire — one object per SSE frame, keyed by its own SSE field names, exactly as captured — for when the raw bytes themselves are what you need:
 
 ```json
 [
@@ -397,6 +398,16 @@ The left record list and the right detail pane are meant to scroll independently
 
 This plugin depends on the implementation detail that every current provider adapter calls the bare, unimported `fetch`. A future adapter that instead uses its own HTTP client (e.g. an SDK bundling its own `undici` instance) would be invisible to this patch — silently, not as an error. That is an inherent limit of the fetch-patch approach, not a bug in this plugin.
 
+**The `globalThis.fetch` slot is shared process-wide, and this patch is only effective while it stays the active one.** Node's built-in `fetch` and npm's `undici` package share the same global dispatcher slot (`Symbol.for('undici.globalDispatcher.*')`), so merely `import('undici')` **anywhere else in the process** — another plugin, a future adapter, a transitive dependency — can silently replace `globalThis.fetch` or its dispatcher *after* this plugin has already installed its wrapper. When that happens, capture stops with no error and no warning: the adapter keeps working exactly as before, it just stops appearing in the trace. The reverse ordering has the same effect: if this plugin installs its patch before another party swaps the slot, this plugin's wrapper is the one silently bypassed.
+
+Concretely, this means:
+
+- **Do not install this plugin alongside another plugin that also patches `globalThis.fetch`.** There is no reliable way for either plugin to detect that the other has done so — the existing "already patched" guard (`installFetchPatch`'s `PATCH_MARK` symbol) only catches this *same* plugin trying to reinstall itself, not a different implementation wrapping the same global. Whichever one wraps last silently wins the slot; the other's capture goes dark with no diagnostic.
+- **A provider routed through its own SDK-bundled transport** (verify this for any provider you add — `dsh-llm-pi-ai` routes through the `pi-ai` SDK, whose transport should be checked to confirm it actually resolves the global `fetch` rather than a bundled one) is invisible the same way.
+- **The practical way to notice either failure mode**: `GET /llm-wire-trace/stats` reports a `coverage` object — per-provider call counts since process start (`{ provider, calls, attributedCalls, lastSeenAt }`), sorted busiest-first. A provider you know is actively making calls but that shows zero (or an unexpectedly low) count here is the observable symptom of this patch having lost the global slot, or of that provider's traffic never reaching `globalThis.fetch` at all. This counter is intentionally process-lifetime only — it is a live health signal, not history, and is not reset by clearing the trace.
+
+Because of this, treat this plugin as belonging to a debugging profile rather than a permanent installation, and be deliberate about what else in that same profile also touches `fetch`.
+
 ## Repository layout
 
 Source is TypeScript, organized by concern; `dist/` holds the compiled, plain-JavaScript output that is actually installed and loaded — see [Development](#development) below.
@@ -408,6 +419,7 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
   http-utils.ts               header redaction, request description, JSON/body clipping
   call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider)
   step-tracker.ts              turn/step tracking from session/event
+  coverage.ts                  per-provider capture-health counters, exposed via stats()
   fetch-patch.ts               the globalThis.fetch patch itself
   curl.ts                      curl-command rendering + credential resolution
   store.ts                     in-memory ring merged with the durable archive
@@ -419,13 +431,13 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
     archive.ts                 the actual file I/O (save/list/get/sweep/clear)
     constants.ts
 src/client/                  browser half (bundled by esbuild into one classic script)
-  entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper
+  entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper; the one file binding strings.ts to DSH's ctx.locale service
   wire-trace-view.ts           the WireTraceView component (state + rendering)
   view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
-  strings.ts                   every user-visible string in one place
+  strings.ts                   bilingual (zh/en) locale dictionaries for every user-visible string, registered with ctx.locale
   json-view.ts                 the collapsible JSON tree component
   json-model.ts                 pure JSON-flattening data model (no DOM)
-  format.ts                     labels/formatters (turn badge, session label, timestamps)
+  format.ts                     labels/formatters (turn badge, session label, timestamps); takes the active-locale t as a parameter
   sse.ts                        raw SSE frame parsing/pretty-printing
   sse-merge/                     per-provider adapters that merge SSE deltas into that provider's own non-streamed shape
     shared.ts                    shared adapter interface + JSON-parse helper

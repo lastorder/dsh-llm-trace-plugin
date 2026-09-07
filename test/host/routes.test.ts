@@ -12,7 +12,7 @@ function fakeStore(overrides: Partial<WireTraceStore> = {}): WireTraceStore {
     wrapFetch: (real) => real,
     list: () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0 }),
     listAll: async () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0, persistence: false, truncated: false, historyPending: false }),
-    stats: async () => ({ persistence: false, memory: 0 }),
+    stats: async () => ({ persistence: false, memory: 0, coverage: { since: 0, providers: [] } }),
     get: async () => null,
     clear: async () => ({ removed: 0, removedFiles: 0 }),
     ...overrides,
@@ -47,12 +47,12 @@ test('list: an absent sessionId degrades to the empty-string filter (no filter),
 })
 
 test('stats: returns store.stats() as-is', async () => {
-  const store = fakeStore({ stats: async () => ({ persistence: true, memory: 3 }) })
+  const store = fakeStore({ stats: async () => ({ persistence: true, memory: 3, coverage: { since: 0, providers: [] } }) })
   const handler = createRouteHandler({ store, routePrefix: ROUTE_PREFIX, getCredentials: () => undefined })
   const { res, captured } = fakeResponse()
   await handler(fakeRequest(`${ROUTE_PREFIX}/stats`), res)
   assert.equal(captured.status, 200)
-  assert.deepEqual(captured.json(), { persistence: true, memory: 3 })
+  assert.deepEqual(captured.json(), { persistence: true, memory: 3, coverage: { since: 0, providers: [] } })
 })
 
 test('get: returns store.get(id) for the given id', async () => {

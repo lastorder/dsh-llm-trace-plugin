@@ -1,17 +1,19 @@
 /**
  * Small formatting/labeling helpers used by the list rows and detail header.
  *
+ * Every function here takes the active-locale `t` as an explicit parameter
+ * rather than importing a dictionary directly — that is what keeps this
+ * module DOM/Cordis-free and directly unit-testable (a test passes a fake
+ * `t`), while still being locale-aware. Binding `t` to DSH's `ctx.locale`
+ * service happens in `entry.ts` only; see that file's doc comment.
+ *
  * @module dsh-llm-trace-plugin/client/format
  */
 
 import type { WireRecordSummary, WireStatus } from '../shared/record-shape.js'
-import {
-  auxiliaryBadgeTitle,
-  foreignSessionLabel,
-  stepBadgeTitle,
-  turnOnlyBadgeTitle,
-  UI,
-} from './strings.js'
+
+/** Translate a dictionary key with optional `{name}` template params. */
+export type Translate = (key: string, params?: Record<string, unknown>) => string
 
 export function fmtTime(ms: number | null | undefined): string {
   if (typeof ms !== 'number') return '-'
@@ -51,19 +53,19 @@ export function shortSessionId(sessionId: string): string {
  * session shows a truncated id purely so two different foreign sessions stay
  * visibly distinct — it is a label, never something to match on.
  */
-export function sessionLabel(sessionId: string | null | undefined, currentSessionId: string | null): string {
-  if (sessionId === null || sessionId === undefined || sessionId === '') return UI.session.none
-  if (sessionId === currentSessionId) return UI.session.current
-  return foreignSessionLabel(shortSessionId(sessionId))
+export function sessionLabel(sessionId: string | null | undefined, currentSessionId: string | null, t: Translate): string {
+  if (sessionId === null || sessionId === undefined || sessionId === '') return t('session.none')
+  if (sessionId === currentSessionId) return t('session.current')
+  return t('session.foreignLabel', { shortId: shortSessionId(sessionId) })
 }
 
 /**
  * Human label for a call's `purpose`: why the harness made this request at
  * all. An ordinary conversation step has none.
  */
-export function purposeLabel(purpose: string | null | undefined): string | null {
-  if (purpose === 'session-title') return UI.purpose.sessionTitle
-  if (purpose === 'compaction') return UI.purpose.compaction
+export function purposeLabel(purpose: string | null | undefined, t: Translate): string | null {
+  if (purpose === 'session-title') return t('purpose.sessionTitle')
+  if (purpose === 'compaction') return t('purpose.compaction')
   if (typeof purpose === 'string' && purpose.length > 0) return purpose
   return null
 }
@@ -81,29 +83,29 @@ export interface StepBadge {
  *   - an ordinary loop call     -> `T1·S0`
  *   - a purposed auxiliary call -> its purpose label (it has no step, by
  *     design: it is not part of the conversation loop)
- *   - a call the plugin could not attribute at all -> `无归属`
+ *   - a call the plugin could not attribute at all -> the "unattributed" label
  */
-export function stepBadge(item: Pick<WireRecordSummary, 'purpose' | 'turn' | 'step' | 'attributed'>): StepBadge {
-  const aux = purposeLabel(item.purpose)
+export function stepBadge(item: Pick<WireRecordSummary, 'purpose' | 'turn' | 'step' | 'attributed'>, t: Translate): StepBadge {
+  const aux = purposeLabel(item.purpose, t)
   if (aux !== null) {
-    return { text: aux, kind: 'aux', title: auxiliaryBadgeTitle(aux) }
+    return { text: aux, kind: 'aux', title: t('badge.auxiliaryTitle', { label: aux }) }
   }
   if (typeof item.turn === 'number' && typeof item.step === 'number') {
     return {
       text: 'T' + item.turn + '·S' + item.step,
       kind: 'step',
-      title: stepBadgeTitle(item.turn, item.step),
+      title: t('badge.stepTitle', { turn: item.turn, step: item.step }),
     }
   }
   if (typeof item.turn === 'number') {
-    return { text: 'T' + item.turn, kind: 'step', title: turnOnlyBadgeTitle(item.turn) }
+    return { text: 'T' + item.turn, kind: 'step', title: t('badge.turnOnlyTitle', { turn: item.turn }) }
   }
   return {
-    text: UI.badge.unattributed,
+    text: t('badge.unattributed'),
     kind: 'none',
     title: item.attributed === false
-      ? UI.badge.unattributedNoLlm
-      : UI.badge.unattributedOutsideTurn,
+      ? t('badge.unattributedNoLlm')
+      : t('badge.unattributedOutsideTurn'),
   }
 }
 

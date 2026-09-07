@@ -14,10 +14,10 @@
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-指定精确版本：
+指定精确版本（推荐使用最新版 `0.3.1`）：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.2.0
+dsh plugin --profile web add dsh-llm-trace-plugin@0.3.1
 ```
 
 之后按**包名**更新或卸载：
@@ -42,7 +42,7 @@ pnpm run build      # 产出 dist/host/** 与 dist/client.js
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # 或者，从固定到某个分支/tag/commit 的 git 远程安装：
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.2.0
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.3.1
 ```
 
 git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都要重新 `pnpm run build`，因为没有任何东西会替你自动构建。
@@ -135,7 +135,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 ### 隐私：请求体按原样落盘
 
-凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`cookie` 和 `set-cookie`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
+凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`cookie` 和 `set-cookie`。URL 自身查询字符串中携带的凭据（例如 Google Gemini 的 `?key=`）在其到达内存或磁盘之前也会以同样方式脱敏 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
 
 在查看器中执行「清空」时，磁盘上的副本也会一并删除 —— 否则「清空」会在下次重启后自己变回来。
 
@@ -160,6 +160,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 - 提供方调用的调用方依然能读到完整、未经修改的响应体 —— 镜像永远不会与之争抢。
 - 传输失败（底层 `fetch` 抛错）会被记录并**原样重新抛出** —— 绝不吞掉。
 - 所有凭据类请求头在存储或展示前一律脱敏：`authorization` 与 `proxy-authorization` 变为 `Bearer ***redacted***`，而裸密钥类请求头（`x-api-key`、`api-key`、`x-goog-api-key`、`cookie`、`set-cookie`）变为 `***redacted***`，不会凭空加上并不存在的 scheme。其他请求头不作任何改动。
+- URL 自身查询字符串中携带的凭据（`?key=`、`?access_token=` 及类似参数 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`）在 URL 被存储、展示或用于构建 curl 命令之前，会以同样方式脱敏，大小写不敏感。其余查询参数与路径部分保持原样。
 - 具有破坏性的 `clear` 路由仅接受 `POST`，并会拒绝跨源请求（依据 `Sec-Fetch-Site`），因此浏览器里打开的其他页面无法清空你的追踪历史。
 - 重新激活插件不会对已经打过补丁的 `fetch` 二次包装（而是显式抛错）；停止时会恢复那个确切的原始引用。
 
@@ -203,7 +204,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 包含 Request 和 Response 两个标签页。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体默认会被*重新组装*——把散落的 delta 增量合并回一份完整、可读的结构，再用同一套 JSON 视图显示（见下）。
 
-> 应用内的按钮文案目前是中文。
+> 本标签页的语言跟随 DSH 自身的 Settings → General → Language 开关（`@deepseek-ai/dsh-client-locale` 服务），因此每个按钮、提示和通知都会相应地以中文或英文渲染。本插件的词典注册在 `llm-wire-trace` 命名空间下；未来若有语言包想为本插件扩展语言，可以通过 locale 服务自身的 `addLanguage` 扩展点。
 
 ### harness 坐标（turn / step）
 
@@ -350,7 +351,7 @@ content 和 reasoning-content 的增量按线路顺序拼接；工具调用被�
 
 任何这三套结构都识别不了的东西都不会被强行凑进去 —— 错误事件、无法识别的 `event:` 类型、`[DONE]` 哨兵、无法解析的载荷，都会原样进入 `unrecognized`，保证插件看不懂的内容也绝不会被悄悄丢弃。
 
-一个开关（`原始 SSE` / `优化展示`）可以切换到线路上真实的帧序列 —— 每一帧一个对象，键名就是 SSE 协议自身的字段名，与捕获时完全一致 —— 当你确实需要原始字节时使用：
+一个开关（`显示原始 SSE` / `显示合并结果` —— 按钮文案始终描述点击后会切换到的目标状态，而不是当前正在展示的内容）可以切换到线路上真实的帧序列 —— 每一帧一个对象，键名就是 SSE 协议自身的字段名，与捕获时完全一致 —— 当你确实需要原始字节时使用：
 
 ```json
 [
@@ -394,6 +395,16 @@ content 和 reasoning-content 的增量按线路顺序拼接；工具调用被�
 
 本插件依赖于这样一个实现细节：当前所有的提供方适配器都调用裸的、未经 import 的 `fetch`。如果未来某个适配器改用自带的 HTTP 客户端（例如某个 SDK 内置了自己的 `undici` 实例），它对本补丁就是不可见的 —— 而且是静默不可见，不会报错。这是 fetch 补丁这一方案的固有局限，而非本插件的缺陷。
 
+**`globalThis.fetch` 这个槽位是整个进程共享的，本补丁只有在它始终保持「当前生效」时才有效。** Node 内置的 `fetch` 与 npm 的 `undici` 包共用同一个全局 dispatcher 槽位（`Symbol.for('undici.globalDispatcher.*')`），因此进程中**任何其他地方**——另一个插件、未来的某个适配器、某个传递依赖——只要 `import('undici')`，就可能在本插件已经装好包装函数**之后**，悄悄替换掉 `globalThis.fetch` 或它的 dispatcher。一旦发生，抓包会无声无息地停止：适配器照常工作，只是不再出现在 trace 里而已。顺序反过来也是同样的效果：如果本插件先装上补丁，随后另一方才替换掉该槽位，那么被悄悄绕过的就是本插件自己的包装函数。
+
+具体而言：
+
+- **不要把本插件与另一个同样会给 `globalThis.fetch` 打补丁的插件一起安装。** 双方都没有可靠的办法察觉对方也这么做了——现有的「已打补丁」防护（`installFetchPatch` 的 `PATCH_MARK` symbol）只能拦住*本插件自身*的重复安装，拦不住另一个实现包装同一个全局对象。谁后包装，谁就悄悄赢得那个槽位；另一方的抓包无声无息地失效，没有任何诊断信息。
+- **某个通过自带 SDK 传输层路由的提供方**（为你新增的任何提供方都应验证这一点——`dsh-llm-pi-ai` 通过 `pi-ai` SDK 路由，应确认其传输层确实解析的是全局 `fetch`，而不是内置的另一份）同样是不可见的，原因相同。
+- **察觉上述任一失效情形的实际办法**：`GET /llm-wire-trace/stats` 会汇报一个 `coverage` 对象——自进程启动以来按提供方统计的调用计数（`{ provider, calls, attributedCalls, lastSeenAt }`），按调用量从多到少排序。如果某个你确知正在发起调用的提供方在这里显示为零（或明显偏低），这就是本补丁失去全局槽位、或者该提供方流量根本没有经过 `globalThis.fetch` 的可观测症状。这个计数器刻意只在进程生命周期内有效——它是一个实时健康信号，不是历史记录，也不会因为清空 trace 而被重置。
+
+因此，请把本插件当作调试 profile 的一部分，而非永久安装项；并且要谨慎考虑同一 profile 里还有什么其他东西也在动 `fetch`。
+
 harness 坐标（turn / step）另有一层不同的依赖：它们来自 `llm/stream` 与 `session/event` 两个通道，而不是 fetch。因此**不经过 `ctx.llm` 的调用可以被抓包、却无法被归属**（记为 `attributed: false`）；反过来，某个绕开裸 `fetch` 的适配器会同时丢失抓包与坐标。两者都属于如实报告的缺口，不会被猜测填补。
 
 ## 仓库结构
@@ -407,6 +418,7 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
   http-utils.ts               header 脱敏、请求解析、JSON/body 裁剪
   call-context.ts             围绕 llm/stream 的 AsyncLocalStorage 绑定（turn/step/purpose/provider）
   step-tracker.ts              基于 session/event 的 turn/step 跟踪
+  coverage.ts                   按提供方统计的抓包健康计数器，经 stats() 暴露
   fetch-patch.ts                globalThis.fetch 补丁本身
   curl.ts                       curl 命令渲染与密钥解析
   store.ts                      内存环与持久化归档的合并视图
@@ -418,13 +430,13 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
     archive.ts                  实际的文件 I/O（save/list/get/sweep/clear）
     constants.ts
 src/client/                   浏览器半边（由 esbuild 打包为单个经典脚本）
-  entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹
+  entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹；唯一把 strings.ts 绑定到 DSH ctx.locale 服务的文件
   wire-trace-view.ts            WireTraceView 组件（状态与渲染）
   view-model.ts                 视图背后的纯列表/详情逻辑（不依赖 DOM，有单元测试）
-  strings.ts                    所有面向用户的文案，集中一处
+  strings.ts                    双语（zh/en）locale 词典，覆盖每一条面向用户的文案，注册进 ctx.locale
   json-view.ts                   可折叠 JSON 树组件
   json-model.ts                   纯 JSON 展平数据模型（不含 DOM）
-  format.ts                       标签/格式化函数（turn 徽标、session 标签、时间戳）
+  format.ts                       标签/格式化函数（turn 徽标、session 标签、时间戳）；以参数形式接收当前 locale 的 t
   sse.ts                           原始 SSE 帧解析/美化打印
   sse-merge/                        按 provider 拆分的适配器，把 SSE 增量合并回该 provider 自己的非流式响应形状
     shared.ts                        适配器公共接口 + JSON 解析工具函数

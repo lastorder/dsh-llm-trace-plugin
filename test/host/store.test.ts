@@ -249,10 +249,57 @@ test('clear: keepPersisted leaves the archive untouched', async () => {
 
 test('stats: reports persistence=false with no archive, true with one', async () => {
   const withoutArchive = createWireTraceStore()
-  assert.deepEqual(await withoutArchive.stats(), { persistence: false, memory: 0 })
+  const stats = await withoutArchive.stats()
+  assert.equal(stats.persistence, false)
+  assert.equal(stats.memory, 0)
+  assert.deepEqual(stats.coverage, { since: stats.coverage.since, providers: [] })
 
   const archive = createFakeArchive()
   const withArchive = createWireTraceStore({ archive })
-  const stats = await withArchive.stats()
-  assert.equal(stats.persistence, true)
+  const statsWithArchive = await withArchive.stats()
+  assert.equal(statsWithArchive.persistence, true)
+})
+
+// -- stats: coverage counters --
+//
+// A cheap health signal so a reader can tell "this provider produced zero
+// captures" apart from "it's simply quiet" — see coverage.ts.
+
+test('stats: coverage counts calls made through wrapFetch, bucketed by provider', async () => {
+  const store = createWireTraceStore()
+  const fakeReal = (async () => new Response('{}', { headers: { 'content-type': 'application/json' } })) as typeof fetch
+  const wrapped = store.wrapFetch(fakeReal)
+  await wrapped('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'user-agent': 'deepseek-harness/1.0' },
+    body: '{"model":"claude-x"}',
+  })
+  const stats = await store.stats()
+  const anthropic = stats.coverage.providers.find((p) => p.provider === 'api.anthropic.com')
+  assert.ok(anthropic, 'unattributed call buckets by hostname')
+  assert.equal(anthropic!.calls, 1)
+  assert.equal(anthropic!.attributedCalls, 0)
+})
+
+test('stats: coverage leaves non-provider (non-matching user-agent) calls uncounted', async () => {
+  const store = createWireTraceStore()
+  const fakeReal = (async () => new Response('{}')) as typeof fetch
+  const wrapped = store.wrapFetch(fakeReal)
+  await wrapped('https://example.com/whatever', { method: 'GET' })
+  const stats = await store.stats()
+  assert.deepEqual(stats.coverage.providers, [])
+})
+
+test('stats: coverage is not reset by clear()', async () => {
+  const store = createWireTraceStore()
+  const fakeReal = (async () => new Response('{}')) as typeof fetch
+  const wrapped = store.wrapFetch(fakeReal)
+  await wrapped('https://api.deepseek.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'user-agent': 'deepseek-harness/1.0' },
+    body: '{}',
+  })
+  await store.clear()
+  const stats = await store.stats()
+  assert.equal(stats.coverage.providers.length, 1)
 })

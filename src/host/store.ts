@@ -10,6 +10,7 @@ import { ARCHIVE_CACHE_TTL_MS, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_RECORDS, LIST
 import { wrapFetch } from './fetch-patch.js'
 import { capacity, summarizePage, summarizeRecord } from './page-grouping.js'
 import { tryParseJson } from './http-utils.js'
+import { createCoverageTracker, providerKeyForRecord, type CoverageSnapshot } from './coverage.js'
 import type { ArchiveListResult, RecordArchive } from './persistence/archive.js'
 
 export interface WireTraceStoreOptions {
@@ -41,6 +42,8 @@ export interface StoreStats {
   maxRecords?: number
   writes?: number
   failures?: number
+  /** Per-provider capture-health counters since process start; see coverage.ts. */
+  coverage: CoverageSnapshot
 }
 
 export interface WireTraceStore {
@@ -63,8 +66,10 @@ export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): Wire
   const maxBodyChars = storeOptions?.maxBodyChars || DEFAULT_MAX_BODY_CHARS
   const archive = storeOptions?.archive ?? null
   const records: WireRecord[] = []
+  const coverage = createCoverageTracker()
 
   function push(record: WireRecord) {
+    coverage.record(providerKeyForRecord(record.provider, record.request.url), record.attributed)
     records.push(record)
     while (records.length > maxRecords) records.shift()
   }
@@ -261,8 +266,8 @@ export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): Wire
     },
 
     async stats() {
-      if (archive === null) return { persistence: false, memory: records.length }
-      return { persistence: true, memory: records.length, ...(await archive.stats()) }
+      if (archive === null) return { persistence: false, memory: records.length, coverage: coverage.snapshot() }
+      return { persistence: true, memory: records.length, ...(await archive.stats()), coverage: coverage.snapshot() }
     },
 
     /**

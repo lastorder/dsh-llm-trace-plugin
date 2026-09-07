@@ -7,7 +7,7 @@
  */
 
 import type { HeaderMap } from '../shared/record-shape.js'
-import { BEARER_HEADERS, REDACTED_HEADERS, REDACTED_VALUE } from './constants.js'
+import { BEARER_HEADERS, REDACTED_HEADERS, REDACTED_QUERY_PARAMS, REDACTED_VALUE } from './constants.js'
 
 export interface ClippedText {
   text: string
@@ -81,6 +81,39 @@ export function outgoingUserAgent(input: unknown, init: RequestInit | undefined)
   return ''
 }
 
+/**
+ * Redact every query-string parameter named in {@link REDACTED_QUERY_PARAMS}
+ * (matched case-insensitively) from a URL, replacing its value with
+ * {@link REDACTED_VALUE} while leaving every other parameter, the path, and
+ * parameter order untouched.
+ *
+ * Falls back to returning the input unchanged if it fails to parse as a URL
+ * — this runs on the capture hot path, and a malformed/relative URL must
+ * never throw out of it. A parameter repeated more than once (`?key=a&key=b`)
+ * has every occurrence redacted, not just the first.
+ */
+export function redactUrl(url: string): string {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    return url
+  }
+  let changed = false
+  // A plain array copy of the names, not a live iteration over the iterator:
+  // this loop mutates `parsed.searchParams` while iterating, and iterating a
+  // URLSearchParams while calling .set()/.append() on it is unspecified.
+  const names = Array.from(parsed.searchParams.keys())
+  for (const name of names) {
+    if (!REDACTED_QUERY_PARAMS.has(name.toLowerCase())) continue
+    changed = true
+    const count = parsed.searchParams.getAll(name).length
+    parsed.searchParams.set(name, REDACTED_VALUE)
+    for (let i = 1; i < count; i += 1) parsed.searchParams.append(name, REDACTED_VALUE)
+  }
+  return changed ? parsed.toString() : url
+}
+
 export interface DescribedRequest {
   method: string
   url: string
@@ -94,7 +127,7 @@ export interface DescribedRequest {
  */
 export function describeRequest(input: unknown, init: RequestInit | undefined): DescribedRequest {
   const isRequestLike = input !== null && typeof input === 'object' && typeof (input as Request).url === 'string'
-  const url = isRequestLike ? (input as Request).url : String(input)
+  const url = redactUrl(isRequestLike ? (input as Request).url : String(input))
   const method = (init && init.method) || (isRequestLike ? (input as Request).method : undefined) || 'GET'
   const headers = redactedHeaders((init && init.headers) || (isRequestLike ? (input as Request).headers : undefined))
   let bodyText: string | null = null

@@ -53,6 +53,32 @@ export const BEARER_HEADERS = new Set(['authorization', 'proxy-authorization'])
 export const REDACTED_VALUE = '***redacted***'
 
 /**
+ * URL query-parameter names whose value is a credential and must never reach
+ * disk or the curl-replay command, matched case-insensitively.
+ *
+ * Headers are not the only place a credential rides: Google's Gemini API
+ * accepts `?key=`, and OAuth-style redirects carry `access_token`/`code` in
+ * the query string. Every captured URL is persisted and displayed verbatim
+ * otherwise (see `redactUrl` in http-utils.ts), so a name missing from this
+ * set is a plaintext secret in a file under the user's trace directory —
+ * exactly the same failure mode `REDACTED_HEADERS` exists to close for
+ * headers. This list is expected to grow the same way that one does.
+ */
+export const REDACTED_QUERY_PARAMS = new Set([
+  'key',
+  'api_key',
+  'apikey',
+  'access_token',
+  'token',
+  'auth',
+  'authorization',
+  'secret',
+  'client_secret',
+  'signature',
+  'sig',
+])
+
+/**
  * Request header `dsh-llm-deepseek` stamps with the harness SessionId of the
  * request's owning session — the ONLY harness identity that reaches the wire.
  *

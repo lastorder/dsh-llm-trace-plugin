@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { clip, describeRequest, outgoingUserAgent, redactedHeaders, redactHeaderValue, tryParseJson } from '../../src/host/http-utils.js'
+import { clip, describeRequest, outgoingUserAgent, redactedHeaders, redactHeaderValue, redactUrl, tryParseJson } from '../../src/host/http-utils.js'
 
 // -- clip --
 
@@ -106,6 +106,51 @@ test('outgoingUserAgent: reads from a Request instance when input carries header
 test('outgoingUserAgent: returns empty string when no user-agent is present anywhere', () => {
   const ua = outgoingUserAgent('https://api.example.com', undefined)
   assert.equal(ua, '')
+})
+
+// -- redactUrl --
+//
+// A credential is not only ever a header: Google's Gemini API accepts
+// `?key=`, and an OAuth-style redirect can carry `access_token`/`code` in the
+// query string. Every captured URL is persisted and shown verbatim otherwise,
+// so a name missing from REDACTED_QUERY_PARAMS is a plaintext secret on disk
+// — the same failure mode REDACTED_HEADERS closes for headers.
+
+test('redactUrl: redacts a matching query parameter, case-insensitively, leaves the rest untouched', () => {
+  const result = redactUrl('https://generativelanguage.googleapis.com/v1/models/gemini?Key=sk-secret&alt=sse')
+  const url = new URL(result)
+  assert.equal(url.searchParams.get('Key'), '***redacted***')
+  assert.equal(url.searchParams.get('alt'), 'sse')
+})
+
+test('redactUrl: redacts every occurrence of a repeated parameter name', () => {
+  const result = redactUrl('https://api.example.com/x?key=a&key=b')
+  const url = new URL(result)
+  assert.deepEqual(url.searchParams.getAll('key'), ['***redacted***', '***redacted***'])
+})
+
+test('redactUrl: a URL with no matching parameter is returned unchanged', () => {
+  const input = 'https://api.deepseek.com/v1/chat/completions?stream=true'
+  assert.equal(redactUrl(input), input)
+})
+
+test('redactUrl: redacts multiple different credential-bearing parameter names in one URL', () => {
+  const result = redactUrl('https://example.com/oauth?access_token=abc&client_secret=def&state=keep-me')
+  const url = new URL(result)
+  assert.equal(url.searchParams.get('access_token'), '***redacted***')
+  assert.equal(url.searchParams.get('client_secret'), '***redacted***')
+  assert.equal(url.searchParams.get('state'), 'keep-me')
+})
+
+test('redactUrl: a malformed/relative URL is returned unchanged rather than throwing', () => {
+  assert.equal(redactUrl('not a url'), 'not a url')
+  assert.equal(redactUrl('/v1/chat?key=secret'), '/v1/chat?key=secret')
+})
+
+test('redactUrl: describeRequest applies redaction to the captured URL', () => {
+  const result = describeRequest('https://example.com/v1?api_key=super-secret', { method: 'GET' })
+  assert.ok(!result.url.includes('super-secret'))
+  assert.ok(result.url.includes('***redacted***'))
 })
 
 // -- describeRequest --

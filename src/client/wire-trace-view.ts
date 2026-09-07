@@ -11,23 +11,11 @@
  */
 
 import { apiGet, apiPost, copy, download } from './api-client.js'
-import { fmtDuration, fmtTime, purposeLabel, sessionLabel, shortSessionId, statusKind, stepBadge, stringify } from './format.js'
+import { fmtDuration, fmtTime, purposeLabel, sessionLabel, shortSessionId, statusKind, stepBadge, stringify, type Translate } from './format.js'
 import { fmtCount, maxDepthOf } from './json-model.js'
 import { parseSseFrames, prettySseText } from './sse.js'
 import { mergeSseChunks } from './sse-merge/index.js'
 import { createJsonView, type ReactLike as MinimalReactLike } from './json-view.js'
-import {
-  curlCopiedWithEnvRef,
-  curlFailed,
-  depthLabel,
-  fullSessionIdTitle,
-  hiddenUnattributedNotice,
-  sessionTitle,
-  truncatedBodyNotice,
-  turnGroupLabel,
-  turnGroupMeta,
-  UI,
-} from './strings.js'
 import {
   describeBodyNotice,
   groupRows,
@@ -45,9 +33,18 @@ import {
 } from './view-model.js'
 import type { WireRecord, WireRecordSummary } from '../shared/record-shape.js'
 
-/** Minimal shape of the plugin `ctx` this view needs (an `interval` timer helper). */
+/**
+ * Minimal shape of the plugin `ctx` this view needs: an `interval` timer
+ * helper, plus the locale seat — `t` translates this plugin's own namespace
+ * (see `strings.ts`), and `subscribeLocale` re-renders this component when
+ * the user flips DSH's language setting while the tab is already mounted
+ * (mirrors the pattern `@deepseek-ai/dsh-client-ui-conversation` uses for the
+ * same purpose).
+ */
 export interface ViewContext {
   interval(fn: () => void, ms: number): () => void
+  t: Translate
+  subscribeLocale(fn: () => void): () => void
 }
 
 /** The full React runtime surface this component tree needs. */
@@ -77,6 +74,12 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
    */
   return function WireTraceView(props: WireTraceViewProps) {
     const currentSessionId = (props && props.sessionId) ? String(props.sessionId) : null
+    const { t } = ctx
+    // Bumped by ctx.locale's subscribe whenever the active locale changes, so
+    // an already-mounted tab re-renders with the new language immediately
+    // instead of only after the next remount.
+    const [, forceLocaleRefresh] = React.useState(0)
+    React.useEffect(() => ctx.subscribeLocale(() => forceLocaleRefresh((n: number) => n + 1)), [])
     const [auto, setAuto] = React.useState(true)
     // Default to the current session: a wire trace opened from inside a
     // session is almost always being read about THAT session. The toggle
@@ -297,14 +300,14 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           copy(result.command)
           const auth = result.auth || { kind: 'env', envName: 'DSH_CURL_KEY' }
           if (auth.kind === 'value') {
-            setCurlNotice(UI.curl.copiedWithKey)
+            setCurlNotice(t('curl.copiedWithKey'))
           } else {
-            setCurlNotice(curlCopiedWithEnvRef(auth.envName))
+            setCurlNotice(t('curl.copiedWithEnvRef', { envName: auth.envName }))
           }
         },
         (reason: any) => {
           setCurlBusy(false)
-          setCurlNotice(curlFailed(String((reason && reason.message) || reason)))
+          setCurlNotice(t('curl.failed', { message: String((reason && reason.message) || reason) }))
         },
       )
     }
@@ -362,8 +365,8 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     const bodyNotice = notice.kind === 'none'
       ? null
       : (notice.kind === 'truncated'
-        ? truncatedBodyNotice(fmtCount(notice.totalChars), fmtCount(notice.keptChars))
-        : UI.notice.notJson)
+        ? t('notice.truncatedBody', { totalChars: fmtCount(notice.totalChars), keptChars: fmtCount(notice.keptChars) })
+        : t('notice.notJson'))
     // The raw view shows the literal bytes only when the reader explicitly
     // asked to see them (`!sseMerged`); the merged view — including the
     // frame-list fallback if merging ever needed one — stays on the JSON
@@ -403,7 +406,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           // The coordinate leads the row: "which call is this" is the first
           // question a reader has, before model or status.
           (() => {
-            const badge = stepBadge(item)
+            const badge = stepBadge(item, t)
             return h('span', { className: 'wt-step', 'data-k': badge.kind, key: 'st', title: badge.title }, badge.text)
           })(),
           h('span', { className: 'wt-model', key: 'm' }, item.model || item.url),
@@ -423,9 +426,9 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           filtering ? null : h('span', {
             key: 'sid',
             title: item.sessionId === null || item.sessionId === undefined
-              ? UI.session.noneTitle
-              : sessionTitle(item.sessionId),
-          }, sessionLabel(item.sessionId, currentSessionId)),
+              ? t('session.noneTitle')
+              : t('session.title', { sessionId: item.sessionId }),
+          }, sessionLabel(item.sessionId, currentSessionId, t)),
         ].filter(Boolean)),
       ],
     ))
@@ -434,12 +437,14 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     // the list (newest-first, so turns descend). Grouping rules live in
     // `view-model.ts`; this only renders them.
     const groupHeaderContent = (group: { key: string, turn: number | null }) => {
-      if (group.key === 'aux') return { text: UI.group.auxiliary, meta: UI.group.auxiliaryMeta }
-      if (group.key === 'none') return { text: UI.group.unattributed, meta: UI.group.unattributedMeta }
+      if (group.key === 'aux') return { text: t('group.auxiliary'), meta: t('group.auxiliaryMeta') }
+      if (group.key === 'none') return { text: t('group.unattributed'), meta: t('group.unattributedMeta') }
       const stat = turnStatFor(turns, group.turn)
       return {
-        text: turnGroupLabel(group.turn as number),
-        meta: stat === null ? '' : turnGroupMeta(stat.calls, stat.steps),
+        text: t('turn.groupLabel', { turn: group.turn as number }),
+        meta: stat === null ? '' : (stat.steps > 0
+          ? t('turn.groupMetaWithSteps', { calls: stat.calls, steps: stat.steps })
+          : t('turn.groupMetaNoSteps', { calls: stat.calls })),
       }
     }
     const groupedRows: any[] = []
@@ -459,7 +464,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
             className: 'wt-btn',
             key: 'auto',
             'data-on': auto ? '1' : '0',
-            title: auto ? UI.toolbar.autoOnTitle : UI.toolbar.autoOffTitle,
+            title: auto ? t('toolbar.autoOnTitle') : t('toolbar.autoOffTitle'),
             onClick: () => {
               const next = !auto
               setAuto(next)
@@ -470,15 +475,15 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                 setHistoryTick((n: number) => n + 1)
               }
             },
-          }, auto ? UI.toolbar.autoOn : UI.toolbar.autoOff),
+          }, auto ? t('toolbar.autoOn') : t('toolbar.autoOff')),
           h('button', {
             className: 'wt-btn',
             key: 'scope',
             'data-on': filtering ? '1' : '0',
             disabled: currentSessionId === null,
             title: currentSessionId === null
-              ? UI.toolbar.scopeUnavailableTitle
-              : (filtering ? UI.toolbar.scopeFilteringTitle : UI.toolbar.scopeAllTitle),
+              ? t('toolbar.scopeUnavailableTitle')
+              : (filtering ? t('toolbar.scopeFilteringTitle') : t('toolbar.scopeAllTitle')),
             onClick: () => {
               if (currentSessionId === null) return
               // An explicit choice ends the automatic fallback for good.
@@ -486,11 +491,11 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
               setAutoFellBack(false)
               setOnlySession(!onlySession)
             },
-          }, filtering ? UI.toolbar.scopeSession : UI.toolbar.scopeAll),
+          }, filtering ? t('toolbar.scopeSession') : t('toolbar.scopeAll')),
           h('button', {
             className: 'wt-btn',
             key: 'clear',
-            title: UI.toolbar.clearTitle,
+            title: t('toolbar.clearTitle'),
             onClick: () => {
               apiPost('clear', {}).then(() => {
                 setSelected(null)
@@ -500,118 +505,124 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                 setHistoryTick((n: number) => n + 1)
               }, (reason: any) => setError(String(reason)))
             },
-          }, UI.toolbar.clear),
+          }, t('toolbar.clear')),
           h('span', {
             className: 'wt-meta',
             key: 'meta',
-            title: filtering ? UI.toolbar.metaFilteredTitle : UI.toolbar.metaAllTitle,
+            title: filtering ? t('toolbar.metaFilteredTitle') : t('toolbar.metaAllTitle'),
           }, (filtering ? matched : items.length) + ' / ' + total
             + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
-            + (auxiliary > 0 ? ' · ' + auxiliary + UI.toolbar.auxiliarySuffix : '')),
+            + (auxiliary > 0 ? ' · ' + auxiliary + t('toolbar.auxiliarySuffix') : '')),
         ]),
         error === null ? null : h('div', { className: 'wt-err', key: 'err' }, error),
         h('div', { className: 'wt-list', key: 'list' },
           items.length === 0
-            ? h('div', { className: 'wt-empty' }, filtering ? UI.empty.filtered : UI.empty.all)
+            ? h('div', { className: 'wt-empty' }, filtering ? t('empty.filtered') : t('empty.all'))
             : [
               ...groupedRows,
               // Live records are already on screen; the disk half is still
               // arriving. Say so, so an incomplete list is never mistaken for
               // the whole history.
               historyLoading
-                ? h('div', { className: 'wt-jnotice', key: '#history' }, UI.notice.historyLoading)
+                ? h('div', { className: 'wt-jnotice', key: '#history' }, t('notice.historyLoading'))
                 : null,
               // The provider never stamped a session id, so the default
               // filter was dropped. Explain it where it was noticed.
               autoFellBack
-                ? h('div', { className: 'wt-jnotice', key: '#fallback' }, UI.notice.autoFellBack)
+                ? h('div', { className: 'wt-jnotice', key: '#fallback' }, t('notice.autoFellBack'))
                 : null,
               // Records with no session identity are hidden by the filter,
               // but never silently: say how many, and where to see them.
               filtering && unattributed > 0
-                ? h('div', { className: 'wt-jnotice', key: '#unattributed' }, hiddenUnattributedNotice(fmtCount(unattributed)))
+                ? h('div', { className: 'wt-jnotice', key: '#unattributed' }, t('notice.hiddenUnattributed', { count: fmtCount(unattributed), scopeAll: t('toolbar.scopeAll') }))
                 : null,
               // Say so rather than implying the page showed everything: a
               // filtered history read stops at a bounded scan budget.
               truncated
-                ? h('div', { className: 'wt-jnotice', key: '#truncated' }, UI.notice.truncatedHistory)
+                ? h('div', { className: 'wt-jnotice', key: '#truncated' }, t('notice.truncatedHistory'))
                 : null,
             ].filter(Boolean)),
       ].filter(Boolean)),
       h('div', { className: 'wt-right', key: 'right' }, [
         h('div', { className: 'wt-tabs', key: 'tabs' }, [
-          h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, UI.tabs.request),
-          h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, UI.tabs.response),
+          h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, t('tabs.request')),
+          h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, t('tabs.response')),
           h('span', { className: 'wt-div', key: 'div' }),
           isSse && tab === 'response'
             ? h('button', {
               className: 'wt-btn',
               key: 'sse',
-              'data-on': sseMerged ? '1' : '0',
-              title: sseMerged ? UI.tabs.sseMergedTitle : UI.tabs.sseRawTitle,
+              // No data-on here, unlike this toolbar's other toggles.
+              // Those (auto-refresh, session scope, Request/Response) keep a
+              // FIXED label and use the highlight to show which state is
+              // active. This button's label already IS the state indicator
+              // — it always names the mode you'd switch TO — so a highlight
+              // on top would just be redundant with the text, with no
+              // stable "on" state to anchor it to.
+              title: sseMerged ? t('tabs.sseShowRawTitle') : t('tabs.sseShowMergedTitle'),
               onClick: () => setSseMerged(!sseMerged),
-            }, sseMerged ? UI.tabs.sseMerged : UI.tabs.sseRaw)
+            }, sseMerged ? t('tabs.sseShowRaw') : t('tabs.sseShowMerged'))
             : null,
           h('button', {
             className: 'wt-btn wt-btn-step',
             key: 'less',
-            title: UI.tabs.collapseTitle,
+            title: t('tabs.collapseTitle'),
             onClick: () => step(-1),
             disabled: detail === null || showRaw || depth <= 0,
-          }, UI.tabs.collapse),
+          }, t('tabs.collapse')),
           h('button', {
             className: 'wt-btn wt-btn-step',
             key: 'more',
-            title: UI.tabs.expandTitle,
+            title: t('tabs.expandTitle'),
             onClick: () => step(1),
             disabled: detail === null || showRaw || depth >= contentDepth,
-          }, UI.tabs.expand),
-          h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : depthLabel(depth, contentDepth)),
+          }, t('tabs.expand')),
+          h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : t('depth.label', { depth, contentDepth })),
           h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.request.method + ' ' + detail.request.url),
           h('button', {
             className: 'wt-btn',
             key: 'curl',
             disabled: detail === null || curlBusy,
-            title: UI.tabs.curlTitle,
+            title: t('tabs.curlTitle'),
             onClick: copyCurl,
-          }, curlBusy ? UI.tabs.curlBusy : UI.tabs.curl),
-          h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, UI.tabs.copy),
-          h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, UI.tabs.download),
+          }, curlBusy ? t('tabs.curlBusy') : t('tabs.curl')),
+          h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, t('tabs.copy')),
+          h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, t('tabs.download')),
         ].filter(Boolean)),
         // Always-visible coordinate strip for the selected record: the
         // harness facts that the wire bytes below can never tell you.
         detail === null ? null : (() => {
-          const badge = stepBadge(detail)
-          const aux = purposeLabel(detail.purpose)
+          const badge = stepBadge(detail, t)
+          const aux = purposeLabel(detail.purpose, t)
           const coord = (label: string, value: string, title: string) => h('span', { className: 'wt-coord', key: label, title }, [
             h('span', { key: 'l' }, label),
             h('b', { key: 'v' }, value),
           ])
           const parts: any[] = []
           if (aux !== null) {
-            parts.push(coord(UI.coord.purpose, aux, UI.coord.purposeTitle))
+            parts.push(coord(t('coord.purpose'), aux, t('coord.purposeTitle')))
           } else if (typeof detail.turn === 'number') {
-            parts.push(coord(UI.coord.turn, String(detail.turn), UI.coord.turnTitle))
+            parts.push(coord(t('coord.turn'), String(detail.turn), t('coord.turnTitle')))
             parts.push(h('span', { className: 'wt-coord-sep', key: 's1' }))
-            parts.push(coord(UI.coord.step, detail.step === null ? UI.coord.none : String(detail.step), UI.coord.stepTitle))
+            parts.push(coord(t('coord.step'), detail.step === null ? t('coord.none') : String(detail.step), t('coord.stepTitle')))
           } else {
-            parts.push(coord(UI.coord.attribution, badge.text, badge.title))
+            parts.push(coord(t('coord.attribution'), badge.text, badge.title))
           }
           if (detail.provider !== null && detail.provider !== undefined) {
             parts.push(h('span', { className: 'wt-coord-sep', key: 's2' }))
-            parts.push(coord(UI.coord.provider, String(detail.provider), UI.coord.providerTitle))
+            parts.push(coord(t('coord.provider'), String(detail.provider), t('coord.providerTitle')))
           }
           if (detail.sessionId) {
             parts.push(h('span', { className: 'wt-coord-sep', key: 's3' }))
-            parts.push(coord(UI.coord.session, shortSessionId(detail.sessionId), fullSessionIdTitle(detail.sessionId)))
+            parts.push(coord(t('coord.session'), shortSessionId(detail.sessionId), t('session.fullIdTitle', { sessionId: detail.sessionId })))
           }
           return h('div', { className: 'wt-coords', key: 'coords' }, parts)
         })(),
         curlNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'curl-notice', style: { padding: '4px 12px' } }, curlNotice),
         detail === null
-          ? h('div', { className: 'wt-empty', key: 'empty' }, UI.empty.noSelection)
+          ? h('div', { className: 'wt-empty', key: 'empty' }, t('empty.noSelection'))
           : (tab === 'response' && detail.response === null)
-            ? h('div', { className: 'wt-empty', key: 'pending' }, UI.empty.responsePending)
+            ? h('div', { className: 'wt-empty', key: 'pending' }, t('empty.responsePending'))
             : showRaw
               ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
               : h(React.Fragment, { key: 'json' }, [
@@ -632,6 +643,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
                     longOpen,
                     onToggle: toggle,
                     onToggleLong: toggleLong,
+                    t,
                   }),
               ].filter(Boolean)),
       ]),

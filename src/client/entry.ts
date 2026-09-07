@@ -14,11 +14,20 @@
  * through `React.createElement`, matching the runtime constraint that this
  * file is loaded as-is, with no bundler-driven JSX transform.
  *
+ * Locale: this is the ONE file that binds `strings.ts`'s bilingual
+ * dictionaries to DSH's own `@deepseek-ai/dsh-client-locale` service
+ * (`ctx.locale`) — the same "framework glue lives in exactly one file per
+ * half" rule this file already follows for Slots. Every other client module
+ * receives a plain `t(key, params?)` function as a parameter and has no idea
+ * `ctx.locale` exists, so the tab's language now follows DSH's own Settings →
+ * General → Language switch instead of always rendering Chinese.
+ *
  * @module dsh-llm-trace-plugin/client/entry
  */
 
 import { insertStyles } from './styles.js'
 import { createWireTraceView, type WireTraceReact, type ViewContext } from './wire-trace-view.js'
+import { zh, en } from './strings.js'
 
 declare const window: any
 
@@ -31,11 +40,30 @@ interface SlotsService {
   register(meta: { name: string, id: string, priority?: number, order?: number, label: () => string }, component: any): () => void
 }
 
+/** Translate a dictionary key with optional `{name}` template params. */
+type Translate = (key: string, params?: Record<string, unknown>) => string
+
+/** Minimal shape of the client `locale` service (`@deepseek-ai/dsh-client-locale`). */
+interface LocaleService {
+  register(ns: string, dicts: Record<string, Record<string, string>>): () => void
+  bind(ns: string): Translate
+  subscribe(fn: () => void): () => void
+}
+
 /** Minimal shape of the plugin root context. */
 interface RootContext {
   effect<T>(fn: () => T, label?: string): T
   slots: SlotsService
+  locale: LocaleService
+  interval(fn: () => void, ms: number): () => void
 }
+
+/**
+ * Namespace this plugin registers its dictionaries under. Must not collide
+ * with any other plugin's namespace; matches this plugin's own route prefix
+ * slug for consistency (`ROUTE_PREFIX` in the host half's constants.ts).
+ */
+const NS = 'llm-wire-trace'
 
 window.__ModuleLoader__.load({
   id: 'dsh-llm-trace-plugin',
@@ -44,7 +72,7 @@ window.__ModuleLoader__.load({
 
     const React: WireTraceReact = require('react')
 
-    const inject = ['slots', 'timer']
+    const inject = ['slots', 'timer', 'locale']
 
     /**
      * @param ctx - client root context.
@@ -57,7 +85,23 @@ window.__ModuleLoader__.load({
      */
     function apply(ctx: RootContext & ViewContext) {
       ctx.effect(() => insertStyles(), 'llm-wire-trace: stylesheet')
-      const WireTraceView = createWireTraceView(React, ctx)
+      ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'llm-wire-trace: locale dictionaries')
+      // Bound once and reused: the locale service resolves the ACTIVE locale
+      // at call time, so this single reference stays correct across a
+      // language switch — nothing needs to re-bind when the user flips it.
+      const t = ctx.locale.bind(NS)
+      // Built as an object literal referencing `ctx` by closure, NOT a
+      // `{ ...ctx }` spread: Cordis exposes services like `interval` through
+      // the context's prototype chain, so a shallow spread (own enumerable
+      // properties only) silently drops them, leaving `ctx.interval` (and
+      // anything else the view needs from the real ctx) undefined at
+      // runtime — the "not a function" crash this shape exists to avoid.
+      const viewCtx: ViewContext = {
+        interval: (fn: () => void, ms: number) => ctx.interval(fn, ms),
+        t,
+        subscribeLocale: (fn: () => void) => ctx.locale.subscribe(fn),
+      }
+      const WireTraceView = createWireTraceView(React, viewCtx)
       ctx.slots.inject('conversation.view', () =>
         ctx.slots.register({
           name: 'conversation.view',
@@ -74,3 +118,4 @@ window.__ModuleLoader__.load({
     return module.exports
   },
 })
+

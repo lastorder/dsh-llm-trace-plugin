@@ -15,8 +15,7 @@
 import { LONG_STRING, MAX_ROWS } from './constants.js'
 import { flattenJq, isLongString, oneLine, collapsedSummary, fmtCount, type JsonLine } from './json-model.js'
 import { copy } from './api-client.js'
-import { stringify } from './format.js'
-import { jsonTruncatedNotice, UI } from './strings.js'
+import { stringify, type Translate } from './format.js'
 
 /** The subset of the React runtime this module needs. */
 export interface ReactLike {
@@ -31,6 +30,7 @@ export interface JsonViewProps {
   longOpen: Set<string>
   onToggle: (path: string, depth: number) => void
   onToggleLong: (path: string) => void
+  t: Translate
 }
 
 /** Build the `JsonView` component bound to one React runtime. */
@@ -38,7 +38,7 @@ export function createJsonView(React: ReactLike) {
   const h = React.createElement
 
   return function JsonView(props: JsonViewProps) {
-    const { value, isOpen, longOpen, onToggle, onToggleLong } = props
+    const { value, isOpen, longOpen, onToggle, onToggleLong, t } = props
     const flat = React.useMemo(() => flattenJq(value, isOpen), [value, isOpen])
 
     /** `"key": ` / `` (array elements carry no label in jq output). */
@@ -113,7 +113,7 @@ export function createJsonView(React: ReactLike) {
         line.type === 'close' ? null : h('button', {
           className: 'wt-jcopy',
           key: 'cp',
-          title: UI.json.copyNode,
+          title: t('json.copyNode'),
           onClick: (event: any) => {
             event.stopPropagation()
             copy(typeof line.value === 'string' ? line.value : stringify(line.value))
@@ -125,14 +125,14 @@ export function createJsonView(React: ReactLike) {
         elements.push(h('div', {
           className: 'wt-jblock',
           key: line.path + '#full',
-          title: UI.json.collapseBlock,
+          title: t('json.collapseBlock'),
           onClick: () => onToggleLong(line.path),
         }, line.value))
       }
     }
 
     if (flat.truncated) {
-      elements.push(h('div', { className: 'wt-jnotice', key: '#truncated' }, jsonTruncatedNotice(fmtCount(MAX_ROWS))))
+      elements.push(h('div', { className: 'wt-jnotice', key: '#truncated' }, t('json.truncatedNotice', { rows: fmtCount(MAX_ROWS) })))
     }
 
     return h('div', { className: 'wt-json' }, [

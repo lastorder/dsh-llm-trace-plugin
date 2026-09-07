@@ -99,6 +99,28 @@ Two things about this half are specific to *this* plugin's distribution constrai
 
 For Slot registration details beyond this example (exact prop shapes, other extension points, theme tokens), inspect the live Slot tree and its registration contract rather than guessing — that is what the `cordis-plugin-development` Skill and its Inspect Providers are for when working inside a DSH session.
 
+## 3a. The `locale` service: making the tab's language follow DSH's own setting
+
+DSH ships a first-party client plugin, `@deepseek-ai/dsh-client-locale`, providing a `ctx.locale` service. This plugin injects it (`inject: ['slots', 'timer', 'locale']`) so the Wire Trace tab's text switches with DSH's own Settings → General → Language toggle, instead of rendering one hardcoded language regardless of that setting:
+
+```ts
+// src/client/entry.ts (abridged)
+const NS = 'llm-wire-trace'
+
+function apply(ctx) {
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'llm-wire-trace: locale dictionaries')
+  const t = ctx.locale.bind(NS)
+  // t is then handed to the rest of the client half as a plain parameter —
+  // no other module touches ctx.locale directly.
+}
+```
+
+- **`ctx.locale.register(ns, { zh, en })`** registers one namespace's two dictionaries — flat `Record<key, string>` maps with `{name}`-style placeholders (see `src/client/strings.ts`). The typed call site requires both locales to declare exactly the same key set, so a missing translation is a compile error, not a silently blank label.
+- **`ctx.locale.bind(ns)`** returns a stable `t(key, params?)` function that reads the *currently active* locale at call time — bind it once and reuse the same reference; there is no need to re-bind after a language switch.
+- **`ctx.locale.subscribe(fn)`** fires whenever the active locale changes. `wire-trace-view.ts` uses it to force a re-render of the already-mounted tab the moment the user flips the language, rather than only picking up the change on the next remount — the same pattern `@deepseek-ai/dsh-client-ui-conversation` (already injected by this plugin's `dsh.client.inject`) uses for its own views.
+
+Every other client module (`format.ts`, `json-view.ts`, `wire-trace-view.ts`) receives `t` as an ordinary function parameter and has no idea `ctx.locale` exists — `entry.ts` is the only file that touches it, following the same "framework glue in exactly one file" rule this repository already applies to Slots and to the host's Cordis usage. See [`architecture.md`](architecture.md#client-half-data-model--adapters--view) for how `strings.ts`/`format.ts` are split to make that possible.
+
 ## 4. Events used by this plugin: `llm/stream` and `session/event`
 
 Per [Event system](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/events), an event can be a plain broadcast or a **waterfall** — a chain where each listener wraps the next and can transform what passes through. `llm/stream` is a waterfall around every model call; this plugin's listener rewraps the returned stream to bind async-context identity around every pull:

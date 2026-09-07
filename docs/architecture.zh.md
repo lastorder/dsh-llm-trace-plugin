@@ -42,7 +42,7 @@ index.ts（apply）把以上所有模块组装进 ctx.effect()/ctx.on()
 
 - **`fetch-patch.ts`** 是抓包层：只知道如何包裹一个 `fetch` 函数并产出一个 `WireRecord`，别的什么都不知道。它把 `push`/`finalize` 回调作为参数接收，而不是直接 import store——这样就能用一个伪造的 `fetch` 单独对它做单元测试，完全不需要真的 store。
 - **`call-context.ts`** / **`step-tracker.ts`** 是*归属*层：回答"这次调用属于哪个 turn/session/purpose"，与 HTTP、存储完全无关。`step-tracker.ts` 尤其干净——零 Cordis、零 Node 依赖，就是一个基于 `Map` 的状态机，测试方式和任何普通 TypeScript 模块一样。
-- **`store.ts`** 是编排层：内存环与可选的持久化 `archive` 实时合并。它依赖 `fetch-patch.ts`（构造包裹后的 `fetch`）和 `persistence/`（持久化/恢复），但对 HTTP 一无所知。
+- **`store.ts`** 是编排层：内存环与可选的持久化 `archive` 实时合并。它依赖 `fetch-patch.ts`（构造包裹后的 `fetch`）和 `persistence/`（持久化/恢复），但对 HTTP 一无所知。它还会把每条被 push 的记录的提供方/主机信息喂给 **`coverage.ts`**——一个小巧、无依赖的计数器，回答"自本进程启动以来，各提供方分别产生了多少次调用"这一问题，它是一个健康信号，不是记录本身的一部分，只读地经由 `stats()` 暴露出去。它存在的原因是：fetch 补丁的覆盖率只有在 `globalThis.fetch` 在整个进程生命周期内始终保持为生效引用时才可信；某个本该产生流量的提供方在这里显示为零，就是全局槽位被本补丁不知不觉之间悄悄换掉的可观测症状（参见 README 的"已知限制"一节）。
 - **`persistence/`** 自己又拆成三份，因为"存一条记录"、"给文件起名字"、"把记录重新组织成适合落盘的形状"是三个不同的关注点——在这次重构之前它们挤在一个 689 行的文件里：
   - `naming.ts` —— 把时间戳变成全局唯一、按时间可排序的文件名（不涉及 I/O）。
   - `codec.ts` —— 在内存记录形状与磁盘 JSON 形状之间互转（不涉及 I/O）。
@@ -74,13 +74,13 @@ sse.ts（解析）──帧──► sse-merge/（重组）──合并后的 JS
 
   以后要支持第四种 provider 形状，只需要在这三个文件旁边新增一个文件，再把它的工厂函数注册进 `index.ts` 的 `ADAPTER_FACTORIES` 数组——模块里的其他任何地方都不用改。这正是拆分存在的原因：之前的单文件版本把"怎么识别这一帧"和"怎么渲染它"混在一起，导致新增一个 provider 意味着改一个不断膨胀的函数，而不是新增一个文件。
 - **`json-model.ts`** 是 JSON 树展平算法（`flattenJq`、折叠/展开状态记录），不含 DOM、不含 React——正是它让 request 面板、合并后的 response 面板、原始帧面板都能走同一套可折叠树来渲染。
-- **`format.ts`** 是纯展示层的字符串格式化（turn 徽标、session 标签、时间戳），无状态、无副作用。
-- **`strings.ts`** 收纳了标签页中所有面向用户的文案，以及少量把值插入文案的辅助函数。它并不是一套 i18n 框架 —— 只有一种语言，表本身就是一个普通对象 —— 但把文案集中一处，才使得审阅整个标签页的措辞不必翻三个文件，也让那些插值辅助函数变得可测；在它们还是散落在 `React.createElement` 调用里的字符串拼接时，这是做不到的。
+- **`format.ts`** 是纯展示层的字符串格式化（turn 徽标、session 标签、时间戳），无状态、无副作用。每个产出面向用户文案的函数都把当前 locale 的 `t(key, params?)` 作为显式参数接收，而不是直接 import 某个词典——这正是让它保持无框架依赖、可直接单元测试（测试传入一个小小的伪造 `t`）、同时又具备 locale 感知能力的原因。
+- **`strings.ts`** 收纳了两份扁平的双语（`zh`/`en`）locale 词典——标签页中所有面向用户的文案，以及每一条需要插值的消息，都由同一个 key（`toolbar.autoOn`、`notice.truncatedBody` 等）寻址，用 `{name}` 风格的占位符。这正是 DSH 自身的 `@deepseek-ai/dsh-client-locale` 服务所期望的形状：`entry.ts` 通过 `ctx.locale.register` 把两份词典注册进本插件自己的命名空间，其他每个 client 模块都以参数形式接收绑定好的 `t`，而不是直接 import 这个文件的词典——因此标签页的语言会跟随 DSH 自身的语言设置，而不是永远渲染固定的一种语言。
 - **`view-model.ts`** 是标签页背后的纯列表/详情逻辑：合并内存与历史这两条竞争读取路径（`mergeSummaryPages`）、判断何时必须放弃 session 过滤（`shouldFallBackToAllSessions`）、按 turn 分组（`groupRows`），以及决定每个页签渲染哪份 body（`selectRequestBody`/`selectResponseBody`/`describeBodyNotice`）。其中没有任何一处触碰 React、`window` 或 `document`。它之所以存在，是因为这部分逻辑是 client 半边里最微妙的 —— 那次合并正是防止一次迟到的轮询把已加载的历史记录抹掉的关键 —— 而当它还待在组件内部时，完全没有任何测试覆盖。
 - **`api-client.ts`** 是本插件自身 `/llm-wire-trace/*` 路由的薄 `fetch` 封装（与 host 侧的 `routes.ts` 对应），外加两个无关的浏览器工具函数（`download`、`copy`）。
 - **`json-view.ts`** 是唯一的展示型 React 组件，参数化在一个最小的 `ReactLike` 接口之上，而不是直接 import `react`——因为按 `plugin-development.zh.md` 里讲的经典脚本约束，`react` 只在运行时通过 factory 的 `require` 才存在，永远不会是静态 import。
 - **`wire-trace-view.ts`** 是唯一持有状态（`React.useState`/`useEffect`）、把以上所有模块编排成标签页实际行为的文件——轮询、过滤、合并/原始切换。它是 `src/client/` 里体量最大的文件，这是有意为之：状态编排本来就不像纯计算那样能被干净拆解；凡是*能*被提取成纯逻辑的部分都已经提取出去了（进了 `view-model.ts`/`json-model.ts`/`format.ts`/`strings.ts`/`sse-merge/`），剩下留在这个文件里的，就只是那些真正关于"这个组件此刻该做什么"的部分。剩下的内容绝大多数是 `React.createElement` 树 —— 这也是为什么把逻辑提取出去之后，文件行数缩减得远不如受测面积增长得多。
-- **`entry.ts`** 是唯一接触 `window.__ModuleLoader__` 或 Cordis Slot 注册的文件——与 host 侧的 `index.ts` 是同一种"框架胶水代码只留在一个文件里"的模式。
+- **`entry.ts`** 是唯一接触 `window.__ModuleLoader__`、Cordis Slot 注册、或 `ctx.locale` 服务的文件——与 host 侧的 `index.ts` 是同一种"框架胶水代码只留在一个文件里"的模式。`strings.ts` 的 `zh`/`en` 词典就是在这里被注册并绑定成 `t` 函数，再以普通参数的形式交给其他每个 client 模块。
 
 ## 为什么是这个形状，从更普遍的角度看
 

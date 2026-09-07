@@ -99,6 +99,28 @@ function apply(ctx) {
 
 关于 Slot 注册的更多细节（精确的 prop 结构、其他扩展点、主题 token），应该去查看实际运行中的 Slot 树及其注册契约，而不是靠猜——在 DSH 会话里工作时，这正是 `cordis-plugin-development` Skill 及其 Inspect Provider 存在的意义。
 
+## 3a. `locale` 服务：让标签页的语言跟随 DSH 自身的设置
+
+DSH 自带一个第一方 client 插件 `@deepseek-ai/dsh-client-locale`，提供一个 `ctx.locale` 服务。本插件注入了它（`inject: ['slots', 'timer', 'locale']`），这样 Wire Trace 标签页的文案就会跟随 DSH 自身 Settings → General → Language 开关切换，而不是无论那个设置是什么都渲染同一种固定语言：
+
+```ts
+// src/client/entry.ts（节选）
+const NS = 'llm-wire-trace'
+
+function apply(ctx) {
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'llm-wire-trace: locale dictionaries')
+  const t = ctx.locale.bind(NS)
+  // t 之后以普通参数的形式交给 client 半边的其余部分——
+  // 没有其他模块直接接触 ctx.locale。
+}
+```
+
+- **`ctx.locale.register(ns, { zh, en })`** 注册一个命名空间的两份词典——扁平的 `Record<key, string>` 映射，支持 `{name}` 风格的占位符（见 `src/client/strings.ts`）。带类型的调用点要求两种语言必须声明完全相同的 key 集合，因此漏翻译一条是编译期错误，而不是一个悄悄留白的标签。
+- **`ctx.locale.bind(ns)`** 返回一个稳定的 `t(key, params?)` 函数，在调用时读取*当前生效*的 locale——绑定一次，全程复用同一个引用即可；语言切换后不需要重新绑定。
+- **`ctx.locale.subscribe(fn)`** 在生效 locale 改变时触发。`wire-trace-view.ts` 用它来强制刷新已经挂载的标签页，让用户切换语言那一刻立即生效，而不是等到下次重新挂载才生效——这和 `@deepseek-ai/dsh-client-ui-conversation`（本插件的 `dsh.client.inject` 已经注入它）自身视图使用的是同一种模式。
+
+其他每个 client 模块（`format.ts`、`json-view.ts`、`wire-trace-view.ts`）都以普通函数参数的形式接收 `t`，完全不知道 `ctx.locale` 的存在——只有 `entry.ts` 接触它，遵循的是本仓库已经用在 Slot 和 host 侧 Cordis 用法上的同一条"框架胶水代码只留在一个文件里"规则。`strings.ts`/`format.ts` 为什么能被拆成这样，见 [`architecture.zh.md`](architecture.zh.md#client-半边数据模型--适配器--视图)。
+
 ## 4. 本插件用到的事件：`llm/stream` 与 `session/event`
 
 按照 [Event system](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/events) 的说法，一个事件既可以是普通广播，也可以是 **waterfall**——一条链，每个监听器包裹下一个，可以对流经的内容做变换。`llm/stream` 是包裹每次模型调用的 waterfall；本插件的监听器重新包裹了返回的流，在每次拉取时都绑定异步上下文身份：
