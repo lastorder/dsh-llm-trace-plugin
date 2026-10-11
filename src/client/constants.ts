@@ -16,6 +16,15 @@
 export const ROUTE = '/llm-wire-trace'
 export const STYLE_ID = 'dsh-llm-trace-plugin/wire-trace.css'
 
+/**
+ * This package's own npm name, matching `package.json`'s `name` and
+ * `cordis.patch.yml`'s `name:`. MUST stay identical to `PACKAGE_NAME` in
+ * `src/host/constants.ts`, for the same cross-boundary-duplication reason as
+ * `ROUTE` above: it is the `plugins.bundle.config` Slot key `entry.ts`
+ * registers under, which DSH's Plugins page keys by package name.
+ */
+export const PACKAGE_NAME = 'dsh-llm-trace-plugin'
+
 export const PATH_SEP = '\u0000'
 export const ROOT_PATH = '$'
 export const LONG_STRING = 120

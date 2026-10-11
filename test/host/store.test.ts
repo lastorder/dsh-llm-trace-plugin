@@ -247,6 +247,36 @@ test('clear: keepPersisted leaves the archive untouched', async () => {
   assert.equal(stats.retained, 1)
 })
 
+// -- clear: a sessionId scopes the clear to one session, in memory AND archive --
+
+test('clear: a sessionId removes only that session\'s records from memory', async () => {
+  const store = createWireTraceStore()
+  ;(store as any).records.push(makeRecord({ id: 'mine', sessionId: 'mine' }))
+  ;(store as any).records.push(makeRecord({ id: 'theirs', sessionId: 'theirs' }))
+  const result = await store.clear({ sessionId: 'mine' })
+  assert.equal(result.removed, 1)
+  assert.deepEqual((store as any).records.map((r: any) => r.id), ['theirs'])
+})
+
+test('clear: a sessionId forwards to archive.clear() scoped, leaving other sessions\' files', async () => {
+  const archive = createFakeArchive()
+  await archive.save(makeRecord({ id: 'mine', sessionId: 'mine' }))
+  await archive.save(makeRecord({ id: 'theirs', sessionId: 'theirs' }))
+  const store = createWireTraceStore({ archive })
+  const result = await store.clear({ sessionId: 'mine' })
+  assert.equal(result.removedFiles, 1)
+  const stats = await archive.stats()
+  assert.equal(stats.retained, 1)
+})
+
+test('clear: an empty-string sessionId behaves exactly like an absent one (clears everything)', async () => {
+  const store = createWireTraceStore()
+  ;(store as any).records.push(makeRecord({ id: 'r1', sessionId: 'mine' }))
+  const result = await store.clear({ sessionId: '' })
+  assert.equal(result.removed, 1)
+  assert.equal((store as any).records.length, 0)
+})
+
 test('stats: reports persistence=false with no archive, true with one', async () => {
   const withoutArchive = createWireTraceStore()
   const stats = await withoutArchive.stats()

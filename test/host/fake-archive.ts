@@ -32,10 +32,23 @@ export function createFakeArchive(): RecordArchive & { saved: WireRecord[] } {
       return byId.get(id) ?? null
     },
     async sweepTemp() {},
-    async clear() {
-      const count = byId.size
-      byId.clear()
-      return count
+    async clear(options) {
+      const sessionId = typeof options?.sessionId === 'string' && options.sessionId.length > 0
+        ? options.sessionId
+        : null
+      if (sessionId === null) {
+        const count = byId.size
+        byId.clear()
+        return count
+      }
+      let removed = 0
+      for (const [id, record] of byId) {
+        if (record.sessionId === sessionId) {
+          byId.delete(id)
+          removed += 1
+        }
+      }
+      return removed
     },
     async sweep() {},
     async stats() {

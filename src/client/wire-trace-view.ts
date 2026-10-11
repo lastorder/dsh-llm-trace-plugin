@@ -478,26 +478,17 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           }, auto ? t('toolbar.autoOn') : t('toolbar.autoOff')),
           h('button', {
             className: 'wt-btn',
-            key: 'scope',
-            'data-on': filtering ? '1' : '0',
-            disabled: currentSessionId === null,
-            title: currentSessionId === null
-              ? t('toolbar.scopeUnavailableTitle')
-              : (filtering ? t('toolbar.scopeFilteringTitle') : t('toolbar.scopeAllTitle')),
-            onClick: () => {
-              if (currentSessionId === null) return
-              // An explicit choice ends the automatic fallback for good.
-              fallbackUsed.current = true
-              setAutoFellBack(false)
-              setOnlySession(!onlySession)
-            },
-          }, filtering ? t('toolbar.scopeSession') : t('toolbar.scopeAll')),
-          h('button', {
-            className: 'wt-btn',
             key: 'clear',
             title: t('toolbar.clearTitle'),
             onClick: () => {
-              apiPost('clear', {}).then(() => {
+              // Scoped to the current session: a page-wide wipe lives on the
+              // plugin management page instead (see `plugin-manage-view.ts`),
+              // so this button can never surprise-delete another session's
+              // history. The rare case with no session id at all (this slot
+              // is session-scoped, so that "shouldn't happen") still clears
+              // everything, matching this button's old behavior, rather than
+              // silently doing nothing.
+              apiPost('clear', currentSessionId === null ? {} : { sessionId: currentSessionId }).then(() => {
                 setSelected(null)
                 setTick((n: number) => n + 1)
                 // Clearing deletes files, so the history half must be re-read

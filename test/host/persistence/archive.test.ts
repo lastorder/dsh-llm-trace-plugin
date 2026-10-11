@@ -140,6 +140,31 @@ test('clear removes every persisted record and reports the count', async () => {
   })
 })
 
+test('clear with a sessionId removes only that session\'s files, leaving the rest', async () => {
+  await withTempDir(async (dir) => {
+    const archive = createRecordArchive({ dir })
+    await archive.save(makeRecord({ id: buildRecordName(1000).slice(0, -5), startedAt: 1000, sessionId: 'mine' }))
+    await archive.save(makeRecord({ id: buildRecordName(2000).slice(0, -5), startedAt: 2000, sessionId: 'theirs' }))
+    const removed = await archive.clear({ sessionId: 'mine' })
+    assert.equal(removed, 1)
+    const stats = await archive.stats()
+    assert.equal(stats.retained, 1)
+    const page = await archive.list({ limit: 10 })
+    assert.deepEqual(page.records.map((r) => r.sessionId), ['theirs'])
+  })
+})
+
+test('clear with an empty-string sessionId behaves like an absent one (clears everything)', async () => {
+  await withTempDir(async (dir) => {
+    const archive = createRecordArchive({ dir })
+    await archive.save(makeRecord({ id: buildRecordName(1000).slice(0, -5), startedAt: 1000, sessionId: 'mine' }))
+    const removed = await archive.clear({ sessionId: '' })
+    assert.equal(removed, 1)
+    const stats = await archive.stats()
+    assert.equal(stats.retained, 0)
+  })
+})
+
 test('stats reports dir/retained/maxRecords/writes/failures', async () => {
   await withTempDir(async (dir) => {
     const archive = createRecordArchive({ dir, maxRecords: 5 })

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { ROUTE } from '../../src/client/constants.js'
-import { ROUTE_PREFIX } from '../../src/host/constants.js'
+import { PACKAGE_NAME, ROUTE } from '../../src/client/constants.js'
+import { PACKAGE_NAME as HOST_PACKAGE_NAME, ROUTE_PREFIX } from '../../src/host/constants.js'
 
 // The host and the browser half are separate builds and `src/shared/` is
 // type-only, so the route prefix cannot be imported across the boundary. It is
@@ -19,4 +19,11 @@ test('the route prefix is absolute and carries no trailing slash', () => {
   // the prefix off the pathname; a trailing slash would break both.
   assert.ok(ROUTE.startsWith('/'))
   assert.ok(!ROUTE.endsWith('/'))
+})
+
+// Same duplication, same risk: a drifted PACKAGE_NAME would register
+// `plugins.bundle.config` under a key the Plugins page never looks up for
+// this bundle, making the management panel silently never render.
+test('the client PACKAGE_NAME matches the host PACKAGE_NAME exactly', () => {
+  assert.equal(PACKAGE_NAME, HOST_PACKAGE_NAME)
 })

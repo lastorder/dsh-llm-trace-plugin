@@ -95,6 +95,21 @@ export const CSS = [
   '.wt-coord{display:flex;align-items:baseline;gap:4px}',
   '.wt-coord b{font-weight:600;color:var(--dsw-alias-label-primary);font-family:var(--ds-font-family-code);font-size:12px}',
   '.wt-coord-sep{width:1px;height:12px;background:var(--dsw-alias-border-l2)}',
+  // ---- plugin management page panel (plugins.bundle.config) ----
+  '.wt-manage{display:flex;flex-direction:column;gap:10px;font-size:13px;color:var(--dsw-alias-label-primary)}',
+  '.wt-manage-stats{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+  '.wt-manage-stats-label{font-weight:600}',
+  '.wt-manage-stats-line{color:var(--dsw-alias-label-secondary);font-size:12px}',
+  '.wt-manage-fields{display:flex;flex-direction:column;gap:10px;padding-top:4px;border-top:1px solid var(--dsw-alias-border-l2)}',
+  '.wt-manage-fields-label{font-weight:600}',
+  '.wt-mfield{display:grid;grid-template-columns:220px minmax(160px,320px);column-gap:12px;row-gap:2px;align-items:center}',
+  '.wt-mfield-label{color:var(--dsw-alias-label-primary);font-size:12px}',
+  '.wt-mfield-input{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:6px;padding:3px 8px;font-size:12px;line-height:18px;width:100%}',
+  '.wt-mfield-input:disabled{opacity:.6}',
+  '.wt-mfield-hint{grid-column:1/-1;color:var(--dsw-alias-label-secondary);font-size:11px}',
+  '.wt-mfield-notice{grid-column:1/-1;font-size:11px}',
+  '.wt-mfield-notice[data-k="ok"]{color:var(--dsw-alias-state-success-primary)}',
+  '.wt-mfield-notice[data-k="err"]{color:var(--dsw-alias-state-error-primary)}',
 ].join('\n')
 
 /** Insert the stylesheet once per document, returning an idempotent disposer. */

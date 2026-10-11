@@ -17,10 +17,10 @@ This works at the *wire* layer. A harness-level tracer observes the normalized `
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-Pin an exact version (recommended: the latest, `0.3.1`):
+Pin an exact version (recommended: the latest, `0.4.0`):
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.3.1
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.0
 ```
 
 Then update or remove it by **package name**:
@@ -45,7 +45,7 @@ Then install the checkout the same way as any local plugin:
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # or, from a git remote pinned to a branch/tag/commit:
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.3.1
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.0
 ```
 
 A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
@@ -58,7 +58,7 @@ Notes:
 
 ## Configuration
 
-The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these optional keys:
+The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these optional keys, validated by this plugin's own runtime schema (`Config`, exported from the host entry point) so a typo'd key or an out-of-range value is rejected at activation rather than silently ignored:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -79,6 +79,16 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
         maxBodyChars: 2000000
         maxPersistedRecords: 5000
 ```
+
+### The plugin management page
+
+Every key above is also editable from DSH's own Plugins page (Settings → Plugins → `dsh-llm-trace-plugin`), which this plugin populates through the `plugins.bundle.config` Slot. That panel shows:
+
+- **Local cache**: how many records are currently held in memory, and (when `persist` is on) how many are persisted on disk, against `maxPersistedRecords`.
+- **Clear all history**: a page-wide wipe of every session's records, memory and disk — distinct from the Wire Trace tab's own `Clear` button, which is scoped to the session it was opened from (see [Filtering by session](#filtering-by-session)).
+- **Every parameter in the table above**, pre-filled with the value currently in effect.
+
+Editing a field there writes it straight back into the profile's own patch document — through the same Loader machinery the `configEditor` service and `dsh plugin configure` use — and the change applies live, without a restart. If the running host exposes no such writer service (a non-Cordis embedding, or one with no `configEditor` plugin loaded), the panel falls back to a read-only report of the values in effect, and says so, rather than pretending a write would work.
 
 ## Persistence
 
@@ -140,7 +150,7 @@ Capture starts immediately, and a slow or failing disk cannot delay the fetch pa
 
 Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `cookie`, and `set-cookie`. A credential riding the URL's own query string (e.g. Google Gemini's `?key=`) is redacted the same way before the URL ever reaches memory or disk — see `REDACTED_QUERY_PARAMS` in `constants.ts`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
 
-Clearing from the viewer deletes the persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
+Clearing (either the Wire Trace tab's session-scoped `Clear`, or the management page's cross-session `Clear all history`) deletes the matching persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
 
 ## Why this must be an installed package, not a dynamic Cordis plugin
 
@@ -242,18 +252,18 @@ Needs the `sessions` and `llm` services. Both are optional: without them capture
 
 ## Filtering by session
 
-The tab opens showing only the current session's calls. A toolbar button switches between **当前 Session** (current session) and **全部 Session** (all records).
+The tab always shows the current session's calls — there is no toggle to switch to every session's records inside the tab itself; see [the management page](#the-plugin-management-page) for a cross-session view (its "Local cache" count) and a cross-session wipe.
 
 The filter matches the record's `sessionId`, which comes from the `llm/stream` context described above (falling back to the `x-deepseek-harness-session-id` header when a call did not go through `ctx.llm`). Because the primary source is the harness call itself rather than the wire, **this works for every provider, including pi-ai routes that put nothing on the wire at all.** Filtering happens on the host side, so other sessions' request and response bodies are never sent to the browser.
 
 Two consequences worth knowing:
 
-- **Not every call is attributable.** A request that never went through `ctx.llm` has no session. Those records are hidden under the filter, but never silently: the list footer reports how many exist and points at **全部 Session**. There, each row is tagged 本 session / session `<id prefix>` / 无 session.
-- **Subagents are separate sessions.** A subagent's LLM calls carry its own session id, so they do not appear in the parent session's filtered view. Switch to **全部 Session** to see them.
+- **Not every call is attributable.** A request that never went through `ctx.llm` has no session. Those records are hidden under the filter, but never silently: the list footer reports how many exist.
+- **Subagents are separate sessions.** A subagent's LLM calls carry its own session id, so they do not appear in the parent session's filtered view.
 
-**清空** (Clear) is unaffected by the filter — it always empties the whole store.
+**Clear** is scoped by the same filter — it deletes only the current session's records (memory and disk). To clear every session's history at once, use the plugin management page's **Clear all history** button instead.
 
-As a safety net, if the first load finds nothing attributable to this session while unattributed records exist, the tab falls back to **全部 Session** and says why. This fires at most once, and touching the toggle yourself disables it.
+As a safety net, if the first load finds nothing attributable to this session while unattributed records exist, the tab falls back automatically to showing every record and says why. This fires at most once per mount.
 
 ### Response: merged SSE, and the raw wire text underneath
 
@@ -415,6 +425,7 @@ Source is TypeScript, organized by concern; `dist/` holds the compiled, plain-Ja
 ```
 src/host/                    host half (Node ESM, compiled 1:1 by tsc)
   index.ts                   apply(ctx, config) — wires everything together
+  config.ts                   PluginConfig + its runtime Config schema, and resolveEffectiveConfig (no Cordis dependency, unit-tested)
   constants.ts                shared constants (user-agent prefix, header name, defaults)
   http-utils.ts               header redaction, request description, JSON/body clipping
   call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider)
@@ -424,15 +435,16 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
   curl.ts                      curl-command rendering + credential resolution
   store.ts                     in-memory ring merged with the durable archive
   page-grouping.ts             list-page grouping (turns, auxiliary, unattributed)
-  routes.ts                    HTTP route handlers (list/stats/get/curl/clear)
+  routes.ts                    HTTP route handlers (list/stats/get/curl/clear/config)
   persistence/                 durable, file-per-record store
     naming.ts                  file-name generation and trace-dir resolution
     codec.ts                   record ⇄ persisted-JSON conversions
-    archive.ts                 the actual file I/O (save/list/get/sweep/clear)
+    archive.ts                 the actual file I/O (save/list/get/sweep/clear, optionally session-scoped)
     constants.ts
 src/client/                  browser half (bundled by esbuild into one classic script)
   entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper; the one file binding strings.ts to DSH's ctx.locale service
   wire-trace-view.ts           the WireTraceView component (state + rendering)
+  plugin-manage-view.ts        the plugin management page panel (cache stats, clear-all, every Config parameter)
   view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
   strings.ts                   bilingual (zh/en) locale dictionaries for every user-visible string, registered with ctx.locale
   json-view.ts                 the collapsible JSON tree component
@@ -446,7 +458,7 @@ src/client/                  browser half (bundled by esbuild into one classic s
     openai-chat-completions.ts    OpenAI/DeepSeek Chat Completions adapter
     index.ts                      dispatches frames to every adapter, assembles the unified result
   api-client.ts                  fetch wrappers for this plugin's own routes
-  styles.ts                      the tab's CSS
+  styles.ts                      the tab's CSS, plus the management panel's
   constants.ts
 src/shared/
   record-shape.ts             type-only record shapes shared by both halves

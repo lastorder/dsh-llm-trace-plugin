@@ -30,10 +30,10 @@ test('every entry in both dictionaries is a non-empty string', () => {
   }
 })
 
-test('covers every section the view renders', () => {
+test('covers every section the view renders, including the management panel', () => {
   // Pins the key set's shape so a whole section cannot be dropped without a
   // test failure — the view reads these by exact key.
-  const prefixes = ['toolbar', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth']
+  const prefixes = ['toolbar', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth', 'manage']
   for (const prefix of prefixes) {
     const hit = Object.keys(en).some((key) => key === prefix || key.startsWith(prefix + '.'))
     assert.ok(hit, `missing any key under "${prefix}"`)
@@ -47,7 +47,35 @@ test('the two SSE toggle labels are distinct, as are the two auto-refresh labels
     assert.notEqual(dict['tabs.sseShowRaw'], dict['tabs.sseShowMerged'])
     assert.notEqual(dict['tabs.sseShowRawTitle'], dict['tabs.sseShowMergedTitle'])
     assert.notEqual(dict['toolbar.autoOn'], dict['toolbar.autoOff'])
-    assert.notEqual(dict['toolbar.scopeSession'], dict['toolbar.scopeAll'])
+  }
+})
+
+test('every manage.field.* config field declares both a label and a hint, in both locales', () => {
+  // Mirrors `CONFIG_FIELDS` in `src/host/config.ts`; the management panel
+  // renders one row per field and reads exactly these keys.
+  const fields = ['maxRecords', 'maxBodyChars', 'persist', 'traceDir', 'maxPersistedRecords', 'historyPageLimit', 'prettyBodyLimit']
+  for (const dict of [zh, en]) {
+    for (const field of fields) {
+      assert.ok(typeof dict[`manage.field.${field}.label`] === 'string', `missing manage.field.${field}.label`)
+      assert.ok(typeof dict[`manage.field.${field}.hint`] === 'string', `missing manage.field.${field}.hint`)
+    }
+  }
+})
+
+test('manage.statsLine/statsLineNoPersist carry their placeholders in both locales', () => {
+  for (const dict of [zh, en]) {
+    assert.ok(dict['manage.statsLine'].includes('{memory}'))
+    assert.ok(dict['manage.statsLine'].includes('{retained}'))
+    assert.ok(dict['manage.statsLine'].includes('{maxRecords}'))
+    assert.ok(dict['manage.statsLineNoPersist'].includes('{memory}'))
+  }
+})
+
+test('manage.fieldSaveFailed/clearAllFailed/statsError carry the message placeholder in both locales', () => {
+  for (const dict of [zh, en]) {
+    assert.ok(dict['manage.fieldSaveFailed'].includes('{message}'))
+    assert.ok(dict['manage.clearAllFailed'].includes('{message}'))
+    assert.ok(dict['manage.statsError'].includes('{message}'))
   }
 })
 
@@ -97,11 +125,10 @@ test('notice.truncatedBody reports both lengths and names the knob, in both loca
   }
 })
 
-test('notice.hiddenUnattributed names the count and the toggle placeholder, in both locales', () => {
+test('notice.hiddenUnattributed names the count, in both locales', () => {
   for (const dict of [zh, en]) {
     const notice = dict['notice.hiddenUnattributed']
     assert.ok(notice.includes('{count}'))
-    assert.ok(notice.includes('{scopeAll}'))
   }
 })
 

@@ -121,6 +121,65 @@ function apply(ctx) {
 
 其他每个 client 模块（`format.ts`、`json-view.ts`、`wire-trace-view.ts`）都以普通函数参数的形式接收 `t`，完全不知道 `ctx.locale` 的存在——只有 `entry.ts` 接触它，遵循的是本仓库已经用在 Slot 和 host 侧 Cordis 用法上的同一条"框架胶水代码只留在一个文件里"规则。`strings.ts`/`format.ts` 为什么能被拆成这样，见 [`architecture.zh.md`](architecture.zh.md#client-半边数据模型--适配器--视图)。
 
+## 3b. `plugins.bundle.config`：本插件在 DSH 插件页上的自有内容，以及通过 `configEditor` 自我编辑 `Config`
+
+三样东西合在一起，才让"DSH 自己的插件页上，每一项 `PluginConfig` 参数都可编辑"这件事成立；其中没有一样是本插件"独立分发"这个约束所特有的——任何 Cordis 插件都能用这三样东西。
+
+**导出 `Config` 是 Cordis 用来提供"已校验、可内省的配置"的通用约定。** `src/host/config.ts` 同时导出 `PluginConfig` 这个 TypeScript 接口，以及一个同名的运行时 schema，用 `@deepseek-ai/schemastery` 构建（这是一个独立发布、体量很小的校验库，与 `@deepseek-ai/cordis` 没有关系——使用它并不会把本插件一直刻意避免的 host 运行时 Cordis 依赖重新引入）：
+
+```ts
+// src/host/config.ts（节选）
+import z from '@deepseek-ai/schemastery'
+
+export interface PluginConfig {
+  maxRecords?: number
+  // ...
+}
+
+export const Config: z<PluginConfig> = z.object({
+  maxRecords: z.number().step(1).min(1).default(200)
+    .description('内存环形缓冲区大小：无论是否持久化，内存中保留的最近记录条数。'),
+  // ...
+})
+```
+
+Cordis 会在插件激活时，用导出的 `Config` 去校验该插件的 `config:`——拼错的字段名或者超出范围的值会被直接拒绝，而不是被悄悄忽略（这正是本插件自己历史上吃过的亏：一个过时的 `routePrefix` 配置项曾经被静默忽略；见 README 的"配置"一节）；`Config` 这个 Inspect provider（`Config.listConfigs`）也是读取同一份 schema 来做内省。`src/host/index.ts` 原样把它重新导出：`export { Config } from './config.js'`。
+
+**`plugins.bundle.config` 是一个自由内容 Slot，而不是自动生成的表单。** 声明 `Config` 只是让*原始*配置变得可校验、可内省，DSH 的插件页并不会据此自动生成输入控件——一个 bundle 的详情页会渲染这个 Slot，以该 bundle 自己的包名为 key，在没有任何插件注册进去之前，这里什么都不显示：
+
+```ts
+// src/client/entry.ts（节选）
+import { PACKAGE_NAME } from './constants.js'
+
+ctx.slots.inject('plugins.bundle.config', () =>
+  ctx.slots.register({ name: 'plugins.bundle.config', key: PACKAGE_NAME }, PluginManageView),
+)
+```
+
+这个 Slot 渲染时携带的 owner props（`{ view: 'summary' | 'page' }`，bundle 级别的这个 Slot 永远只会用到 `'page'`）在 bundle 层级上不携带任何 Host 同步的表单接线——那种更丰富的接线（`ConfigPageForm` 的 `state`/`mutate`）只会提供给 `plugins.row.config`/`plugins.item`，本插件没有用到。所以 `plugin-manage-view.ts` 改为直接对话本插件自己的 `config` 路由（见下文），这与 `wire-trace-view.ts` 对话 `list`/`get`/`clear` 的方式完全一样——和本插件 client 半边通过 `api-client.ts` 读取的其他任何功能相比，没有本质区别。
+
+**自我编辑一个插件自己的配置，走的是通用的 `configEditor` 服务，用插件自己的 Loader entry 寻址。** 这是本功能唯一用到的新 Cordis 表面：`ctx.fiber.entry` 是这次 `apply()` 运行所属的那个组合行的 Loader `Entry` 对象，而 `ctx.get('configEditor')` 是一个*可选*服务（很多 host——包括非 Cordis 的嵌入环境，以及没有加载 `configEditor` 插件的环境——都不提供它）——它负责为一个 entry 持久化新配置，并实时重新协调 Loader，不需要重启：
+
+```ts
+// src/host/index.ts（节选）
+handler: createRouteHandler({
+  // ...
+  getConfigEditor: () => ctx.get('configEditor') as ConfigEditorLike | undefined,
+  getSelfEntry: () => ctx.fiber?.entry,
+})
+```
+
+```ts
+// src/host/routes.ts（节选）—— config 路由的 POST 处理
+await editor.edit(entry, (current) => {
+  const next = { ...current, ...patch }
+  schema(next) // 重新校验合并后的整份配置，用的是与激活时相同的 Config schema
+  return next
+})
+```
+
+因为 `entry` 永远来自*这个插件自己的* `ctx.fiber`，一次写入只能retarget 到这个插件自己的那一行——没有任何办法借这条路由去改另一个插件的配置。两个依赖缺席时都会优雅降级（`config` 路由 `GET` 响应里的 `editable: false`），这与本仓库对待其他每一个可选服务（`ctx.get('sessions')`、`ctx.get('llm')`）的既定模式一致，而不是让整张路由表都绑死在它们身上。
+
 ## 4. 本插件用到的事件：`llm/stream` 与 `session/event`
 
 按照 [Event system](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/events) 的说法，一个事件既可以是普通广播，也可以是 **waterfall**——一条链，每个监听器包裹下一个，可以对流经的内容做变换。`llm/stream` 是包裹每次模型调用的 waterfall；本插件的监听器重新包裹了返回的流，在每次拉取时都绑定异步上下文身份：

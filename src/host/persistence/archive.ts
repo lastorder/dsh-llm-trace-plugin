@@ -93,6 +93,11 @@ export interface ArchiveStats {
   failures: number
 }
 
+export interface ArchiveClearOptions {
+  /** Narrow deletion to one session's files; absent/empty deletes every file. */
+  sessionId?: string
+}
+
 export interface RecordArchive {
   dir: string
   maxRecords: number
@@ -100,7 +105,7 @@ export interface RecordArchive {
   list(query?: ArchiveListQuery): Promise<ArchiveListResult>
   get(id: string, parseJson?: (text: string | null) => unknown): Promise<WireRecord | null>
   sweepTemp(): Promise<void>
-  clear(): Promise<number>
+  clear(options?: ArchiveClearOptions): Promise<number>
   sweep(): Promise<void>
   stats(): Promise<ArchiveStats>
 }
@@ -375,18 +380,49 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
       }
     },
 
-    /** Delete every persisted record. Returns how many files were removed. */
-    async clear() {
+    /**
+     * Delete persisted records. With no `sessionId`, deletes every file (a
+     * pure name operation, no file is opened). With one, only files whose
+     * `sessionId` matches are removed — which DOES require opening every
+     * file, since session identity lives inside it, not in the name; done in
+     * concurrent batches with a yield between them, the same discipline
+     * `list()` uses, so a large archive scan does not stall the event loop
+     * the web UI shares.
+     * @returns how many files were removed.
+     */
+    async clear(clearOptions) {
+      const sessionId = typeof clearOptions?.sessionId === 'string' && clearOptions.sessionId.length > 0
+        ? clearOptions.sessionId
+        : null
       const names = await listNames()
       let removed = 0
-      await Promise.all(names.map(async (name) => {
-        try {
-          await unlink(join(dir, name))
-          removed += 1
-        } catch (error: any) {
-          if (!error || error.code !== 'ENOENT') fail(error)
+      if (sessionId === null) {
+        await Promise.all(names.map(async (name) => {
+          try {
+            await unlink(join(dir, name))
+            removed += 1
+          } catch (error: any) {
+            if (!error || error.code !== 'ENOENT') fail(error)
+          }
+        }))
+      } else {
+        for (let cursor = 0; cursor < names.length; cursor += SCAN_BATCH) {
+          const batch = names.slice(cursor, cursor + SCAN_BATCH)
+          const read = await Promise.all(
+            batch.map(async (name) => ({ name, record: await readRecord(idFromName(name), () => null, true) })),
+          )
+          await Promise.all(read.map(async ({ name, record }) => {
+            if (record === null || record.sessionId !== sessionId) return
+            try {
+              await unlink(join(dir, name))
+              removed += 1
+            } catch (error: any) {
+              if (!error || error.code !== 'ENOENT') fail(error)
+            }
+          }))
+          if (cursor + SCAN_BATCH < names.length) await yieldToLoop()
         }
-      }))
+      }
       await this.sweepTemp()
       return removed
     },

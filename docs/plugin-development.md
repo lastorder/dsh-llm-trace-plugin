@@ -121,6 +121,65 @@ function apply(ctx) {
 
 Every other client module (`format.ts`, `json-view.ts`, `wire-trace-view.ts`) receives `t` as an ordinary function parameter and has no idea `ctx.locale` exists — `entry.ts` is the only file that touches it, following the same "framework glue in exactly one file" rule this repository already applies to Slots and to the host's Cordis usage. See [`architecture.md`](architecture.md#client-half-data-model--adapters--view) for how `strings.ts`/`format.ts` are split to make that possible.
 
+## 3b. `plugins.bundle.config`: this plugin's own content on DSH's Plugins page, and self-editing `Config` through `configEditor`
+
+Three more things combine to make "every `PluginConfig` parameter is editable from DSH's own Plugins page" work, none of them specific to this plugin's standalone-distribution constraint — any Cordis plugin can use all three:
+
+**A `Config` export is the generic Cordis contract for a validated, inspectable configuration.** `src/host/config.ts` exports both the `PluginConfig` TypeScript interface and a runtime schema of the same name, built with `@deepseek-ai/schemastery` (a small, standalone validator published independently of `@deepseek-ai/cordis` — using it does not reintroduce the host-runtime Cordis dependency this plugin otherwise avoids):
+
+```ts
+// src/host/config.ts (abridged)
+import z from '@deepseek-ai/schemastery'
+
+export interface PluginConfig {
+  maxRecords?: number
+  // ...
+}
+
+export const Config: z<PluginConfig> = z.object({
+  maxRecords: z.number().step(1).min(1).default(200)
+    .description('In-memory ring-buffer size: how many recent records stay resident regardless of persistence.'),
+  // ...
+})
+```
+
+Cordis validates a plugin's `config:` against an exported `Config` at activation — a typo'd key or an out-of-range value is rejected loudly instead of silently ignored (the exact failure mode a stale `routePrefix` config key caused before this plugin's `ROUTE_PREFIX` became hardcoded; see the README's "Configuration" section) — and the `Config` Inspect provider (`Config.listConfigs`) reads the same schema back for inspection. `src/host/index.ts` re-exports it unchanged: `export { Config } from './config.js'`.
+
+**`plugins.bundle.config` is a free-form Slot, not an auto-generated form.** Declaring `Config` makes the *raw* config validated and inspectable, but DSH's Plugins page does not generate input fields from a schema automatically — a bundle's detail page renders this Slot, keyed by the bundle's own package name, and shows nothing there until some plugin registers into it:
+
+```ts
+// src/client/entry.ts (abridged)
+import { PACKAGE_NAME } from './constants.js'
+
+ctx.slots.inject('plugins.bundle.config', () =>
+  ctx.slots.register({ name: 'plugins.bundle.config', key: PACKAGE_NAME }, PluginManageView),
+)
+```
+
+The owner props this Slot renders with (`{ view: 'summary' | 'page' }`, only ever `'page'` for the bundle-level Slot) carry no Host-synced form wiring at the bundle level — that richer wiring (`ConfigPageForm`'s `state`/`mutate`) is supplied only for `plugins.row.config`/`plugins.item`, which this plugin does not use. So `plugin-manage-view.ts` talks to this plugin's own `config` route instead (see below), exactly the way `wire-trace-view.ts` talks to `list`/`get`/`clear` — no different, in kind, from any other feature this plugin's client half reads through `api-client.ts`.
+
+**Self-editing a plugin's own config goes through the generic `configEditor` service, addressed by the plugin's own Loader entry.** This is the one new Cordis surface this feature touches: `ctx.fiber.entry` is the Loader `Entry` object for the *exact* composition row this `apply()` run belongs to, and `ctx.get('configEditor')` (an *optional* service — many hosts, including non-Cordis embeddings and ones with no `configEditor` plugin loaded, do not expose one) persists a new config for one entry and reconciles the Loader live, no restart needed:
+
+```ts
+// src/host/index.ts (abridged)
+handler: createRouteHandler({
+  // ...
+  getConfigEditor: () => ctx.get('configEditor') as ConfigEditorLike | undefined,
+  getSelfEntry: () => ctx.fiber?.entry,
+})
+```
+
+```ts
+// src/host/routes.ts (abridged) — the config route's POST handler
+await editor.edit(entry, (current) => {
+  const next = { ...current, ...patch }
+  schema(next) // re-validate the WHOLE merged config, same Config schema as activation
+  return next
+})
+```
+
+Because `entry` always comes from *this plugin's own* `ctx.fiber`, a write can only ever retarget this plugin's own row — there is no way to reach another plugin's configuration through this route. Both dependencies degrade gracefully when absent (`editable: false` in the `config` route's `GET` response), matching this repository's established pattern for every other optional service (`ctx.get('sessions')`, `ctx.get('llm')`) rather than making the whole route table depend on them.
+
 ## 4. Events used by this plugin: `llm/stream` and `session/event`
 
 Per [Event system](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/events), an event can be a plain broadcast or a **waterfall** — a chain where each listener wraps the next and can transform what passes through. `llm/stream` is a waterfall around every model call; this plugin's listener rewraps the returned stream to bind async-context identity around every pull:

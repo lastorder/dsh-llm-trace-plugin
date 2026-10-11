@@ -27,17 +27,25 @@
 
 import { insertStyles } from './styles.js'
 import { createWireTraceView, type WireTraceReact, type ViewContext } from './wire-trace-view.js'
+import { createPluginManageView } from './plugin-manage-view.js'
 import { zh, en } from './strings.js'
+import { PACKAGE_NAME } from './constants.js'
 
 declare const window: any
 
 /** Minimal shape of a CommonJS-style `require` the module loader hands the factory. */
 type Require = (id: string) => any
 
-/** Minimal shape of the client `slots` service this plugin registers into. */
+/**
+ * Minimal shape of the client `slots` service this plugin registers into.
+ * `id` (a `conversation.view` list-slot registration) and `key` (a
+ * `plugins.bundle.config` keyed-slot registration) are each optional because
+ * every registration this plugin makes uses exactly one of the two, never
+ * both — see the two `ctx.slots.register` call sites below.
+ */
 interface SlotsService {
   inject(name: string, register: () => (() => void)): void
-  register(meta: { name: string, id: string, priority?: number, order?: number, label: () => string }, component: any): () => void
+  register(meta: { name: string, id?: string, key?: string, priority?: number, order?: number, label?: () => string }, component: any): () => void
 }
 
 /** Translate a dictionary key with optional `{name}` template params. */
@@ -110,6 +118,15 @@ window.__ModuleLoader__.load({
           order: 110,
           label: () => 'Wire Trace',
         }, WireTraceView),
+      )
+
+      // The plugin management page's own content for this bundle: local
+      // cache stats, a page-wide "clear all history" button, and every
+      // PluginConfig parameter. Keyed by this package's own npm name, per
+      // the `plugins.bundle.config` Slot's contract (see `plugin-manage-view.ts`).
+      const PluginManageView = createPluginManageView(React, viewCtx)
+      ctx.slots.inject('plugins.bundle.config', () =>
+        ctx.slots.register({ name: 'plugins.bundle.config', key: PACKAGE_NAME }, PluginManageView),
       )
     }
 

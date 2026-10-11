@@ -32,6 +32,8 @@ export interface ListAllOptions extends ListOptions {
 
 export interface ClearOptions {
   keepPersisted?: boolean
+  /** Narrow the clear to one session's records; absent/empty clears everything. */
+  sessionId?: string
 }
 
 export interface StoreStats {
@@ -289,13 +291,29 @@ export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): Wire
     /**
      * Clear memory, and by default the persisted copies too — otherwise
      * "clear" would visibly un-clear itself on the next restart.
+     *
+     * `sessionId` narrows both halves to one session's records, for the Wire
+     * Trace tab's own "Clear" button; absent/empty clears everything, for
+     * the plugin management page's "clear all history" button.
      */
     async clear(options) {
-      const removed = records.length
-      records.length = 0
+      const sessionId = typeof options?.sessionId === 'string' && options.sessionId.length > 0
+        ? options.sessionId
+        : null
+      let removed: number
+      if (sessionId === null) {
+        removed = records.length
+        records.length = 0
+      } else {
+        const before = records.length
+        for (let i = records.length - 1; i >= 0; i -= 1) {
+          if (records[i].sessionId === sessionId) records.splice(i, 1)
+        }
+        removed = before - records.length
+      }
       let removedFiles = 0
       if (archive !== null && !(options && options.keepPersisted)) {
-        removedFiles = await archive.clear()
+        removedFiles = await archive.clear(sessionId === null ? undefined : { sessionId })
       }
       // A cached page would otherwise keep serving records that no longer
       // exist, making "clear" look like it silently failed.

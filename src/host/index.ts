@@ -40,24 +40,16 @@ import { createStepTracker } from './step-tracker.js'
 import { bindLlmStream, type LlmStreamOptions } from './call-context.js'
 import { ROUTE_PREFIX } from './constants.js'
 import { createWireTraceStore } from './store.js'
-import { createRouteHandler } from './routes.js'
+import { createRouteHandler, type ConfigEditorLike, type LoaderEntryLike } from './routes.js'
 import { installFetchPatch } from './fetch-patch.js'
 import { createRecordArchive } from './persistence/archive.js'
 import type { CredentialProvider } from './curl.js'
+import { Config, resolveEffectiveConfig, type PluginConfig } from './config.js'
 
 export { createStepTracker } from './step-tracker.js'
 export { createWireTraceStore } from './store.js'
 export { buildRecordName, createRecordArchive } from './persistence/index.js'
-
-export interface PluginConfig {
-  maxRecords?: number
-  maxBodyChars?: number
-  persist?: boolean
-  traceDir?: string
-  maxPersistedRecords?: number
-  historyPageLimit?: number
-  prettyBodyLimit?: number
-}
+export { Config, resolveEffectiveConfig, type PluginConfig, type ResolvedPluginConfig } from './config.js'
 
 /**
  * Minimal shape this plugin needs from the Cordis context. The real `Context`
@@ -72,6 +64,14 @@ export interface PluginContext {
   webServer: {
     register(route: { kind: 'prefix', path: string, handler: (req: any, res: any) => Promise<void> }): () => void
   }
+  /**
+   * The Loader fiber owning this very `apply()` call, when the host exposes
+   * one (every Cordis host does; a dynamic/test harness may not). Its
+   * `entry` is what `ctx.get('configEditor')` needs to edit THIS plugin's
+   * own row — see the `config` route in `routes.ts` for why that is safe:
+   * it only ever targets the entry this exact `apply()` run was given.
+   */
+  fiber?: { entry?: LoaderEntryLike }
 }
 
 export const name = 'llm-trace-plugin'
@@ -153,6 +153,17 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
         store,
         routePrefix: ROUTE_PREFIX,
         getCredentials: () => ctx.get('credentials') as CredentialProvider | undefined,
+        // Live config editing (the "Clear all history" button's neighboring
+        // parameter form; see `plugin-manage-view.ts`) needs both: the
+        // generic profile-config writer service, and the EXACT Loader entry
+        // this `apply()` run belongs to, so a write can only ever retarget
+        // this plugin's own row. Either being absent (a non-Cordis host, or
+        // one with no configEditor plugin loaded) degrades to a read-only
+        // report rather than failing the whole route table.
+        getConfigEditor: () => ctx.get('configEditor') as ConfigEditorLike | undefined,
+        getSelfEntry: () => ctx.fiber?.entry,
+        currentConfig: () => resolveEffectiveConfig(config) as unknown as Record<string, unknown>,
+        schema: Config,
       }),
     }),
   )

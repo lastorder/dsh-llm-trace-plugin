@@ -14,10 +14,10 @@
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-指定精确版本（推荐使用最新版 `0.3.1`）：
+指定精确版本（推荐使用最新版 `0.4.0`）：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.3.1
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.0
 ```
 
 之后按**包名**更新或卸载：
@@ -42,7 +42,7 @@ pnpm run build      # 产出 dist/host/** 与 dist/client.js
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # 或者，从固定到某个分支/tag/commit 的 git 远程安装：
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.3.1
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.0
 ```
 
 git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都要重新 `pnpm run build`，因为没有任何东西会替你自动构建。
@@ -55,7 +55,7 @@ git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都
 
 ## 配置
 
-host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下可选配置项：
+host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下可选配置项；这些配置项由插件自带的运行时 schema（host 入口导出的 `Config`）校验，拼错字段名或传入超出范围的值会在插件激活时就被拒绝，而不是被悄悄忽略：
 
 | 配置项 | 默认值 | 含义 |
 |---|---|---|
@@ -76,6 +76,16 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
         maxBodyChars: 2000000
         maxPersistedRecords: 5000
 ```
+
+### 插件管理页
+
+以上每一项也都可以在 DSH 自带的插件页（设置 → 插件 → `dsh-llm-trace-plugin`）中编辑，这是本插件通过 `plugins.bundle.config` Slot 提供的内容。该面板展示：
+
+- **本地缓存**：当前内存中保留的记录数，以及（`persist` 开启时）磁盘上已持久化的记录数，与 `maxPersistedRecords` 上限对比。
+- **清除全部历史记录**：一键清空所有 session 的记录（内存与磁盘）——这与 Wire Trace 标签页自身的 `Clear` 按钮不同，后者只清空打开该标签页所在的那个 session（见[按 session 过滤](#按-session-过滤)）。
+- **上表中的每一项参数**，预填为当前生效的值。
+
+在该面板中编辑一个字段，会通过与 `configEditor` 服务、`dsh plugin configure` 相同的 Loader 机制，直接写回 profile 自身的 patch 文档，且改动会立即生效，无需重启。如果当前运行的 host 没有提供这样的写入服务（例如非 Cordis 环境，或者没有加载 `configEditor` 插件），面板会退化为只读展示当前生效的值，并明确说明这一点，而不是假装写入会成功。
 
 ## 持久化
 
@@ -137,7 +147,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`cookie` 和 `set-cookie`。URL 自身查询字符串中携带的凭据（例如 Google Gemini 的 `?key=`）在其到达内存或磁盘之前也会以同样方式脱敏 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
 
-在查看器中执行「清空」时，磁盘上的副本也会一并删除 —— 否则「清空」会在下次重启后自己变回来。
+在查看器中执行「清空」（无论是 Wire Trace 标签页里按 session 限定范围的「清空」，还是插件管理页跨 session 的「清除全部历史记录」）时，磁盘上对应的副本也会一并删除 —— 否则「清空」会在下次重启后自己变回来。
 
 ## 为什么必须是已安装的包，而不是动态 Cordis 插件
 
@@ -239,18 +249,18 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 ### 按 session 过滤
 
-标签页打开时默认只显示**当前 session** 的调用。工具栏上有一个按钮，可在「当前 Session」与「全部 Session」之间一键切换。
+标签页始终只显示**当前 session** 的调用 —— 标签页内部没有切换到「全部 session」的开关；如果需要跨 session 的视图，见[插件管理页](#插件管理页)（它的「本地缓存」计数）以及跨 session 的清空操作。
 
 过滤依据是记录上的 `sessionId`，它来自上面说的 `llm/stream` 上下文（若某次调用没走 `ctx.llm`，则回退到 `x-deepseek-harness-session-id` 请求头）。由于主要来源是 harness 调用本身而不是线路，**它对所有 provider 都有效，包括线路上什么都不带的 pi-ai 路线。** 过滤在宿主端完成，因此其他 session 的请求/响应体根本不会传到浏览器。
 
 有两点值得注意：
 
-- **并非每次调用都能归属。** 没有经过 `ctx.llm` 的请求没有 session。这些记录在过滤下会被隐藏，但绝不会悄无声息：列表底部会写明还有多少条，并指向「全部 Session」。在那里，每一行都会标注 本 session / session `<id 前缀>` / 无 session。
-- **子代理是独立的 session。** 子代理的 LLM 调用带的是它自己的 session id，因此不会出现在父会话的过滤视图里。切到「全部 Session」即可看到。
+- **并非每次调用都能归属。** 没有经过 `ctx.llm` 的请求没有 session。这些记录在过滤下会被隐藏，但绝不会悄无声息：列表底部会写明还有多少条。
+- **子代理是独立的 session。** 子代理的 LLM 调用带的是它自己的 session id，因此不会出现在父会话的过滤视图里。
 
-「清空」不受过滤影响 —— 它始终清空全部记录。
+「清空」同样只作用于当前过滤范围内的这个 session —— 只删除当前 session 的记录（内存与磁盘）。要一次清空所有 session 的历史记录，请改用插件管理页的「清除全部历史记录」按钮。
 
-作为兜底：如果首次加载发现本 session 一条可归属记录都没有、却存在无归属记录，就会自动回退到「全部 Session」并说明原因。该回退最多发生一次，你只要自己动过那个开关，它就不再生效。
+作为兜底：如果首次加载发现本 session 一条可归属记录都没有、却存在无归属记录，就会自动回退到显示全部记录并说明原因。该回退每次挂载最多发生一次。
 
 ### Response：合并后的 SSE，以及底下的原始线路文本
 
@@ -414,6 +424,7 @@ harness 坐标（turn / step）另有一层不同的依赖：它们来自 `llm/s
 ```
 src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
   index.ts                    apply(ctx, config) —— 把各模块组装起来
+  config.ts                    PluginConfig 及其运行时 Config schema，以及 resolveEffectiveConfig（不依赖 Cordis，有单元测试）
   constants.ts                共享常量（user-agent 前缀、header 名、默认值）
   http-utils.ts               header 脱敏、请求解析、JSON/body 裁剪
   call-context.ts             围绕 llm/stream 的 AsyncLocalStorage 绑定（turn/step/purpose/provider）
@@ -423,15 +434,16 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
   curl.ts                       curl 命令渲染与密钥解析
   store.ts                      内存环与持久化归档的合并视图
   page-grouping.ts              列表分页分组（turn、辅助调用、无归属统计）
-  routes.ts                     HTTP 路由处理（list/stats/get/curl/clear）
+  routes.ts                     HTTP 路由处理（list/stats/get/curl/clear/config）
   persistence/                  一条记录一个文件的持久化存储
     naming.ts                   文件命名与 trace 目录解析
     codec.ts                    记录 ⇄ 持久化 JSON 互转
-    archive.ts                  实际的文件 I/O（save/list/get/sweep/clear）
+    archive.ts                  实际的文件 I/O（save/list/get/sweep/clear，clear 可选按 session 限定范围）
     constants.ts
 src/client/                   浏览器半边（由 esbuild 打包为单个经典脚本）
   entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹；唯一把 strings.ts 绑定到 DSH ctx.locale 服务的文件
   wire-trace-view.ts            WireTraceView 组件（状态与渲染）
+  plugin-manage-view.ts         插件管理页面板（本地缓存统计、清除全部历史记录、每一项 Config 参数）
   view-model.ts                 视图背后的纯列表/详情逻辑（不依赖 DOM，有单元测试）
   strings.ts                    双语（zh/en）locale 词典，覆盖每一条面向用户的文案，注册进 ctx.locale
   json-view.ts                   可折叠 JSON 树组件
@@ -445,7 +457,7 @@ src/client/                   浏览器半边（由 esbuild 打包为单个经�
     openai-chat-completions.ts       OpenAI/DeepSeek Chat Completions 适配器
     index.ts                         把每一帧分发给各适配器，汇总成统一结果
   api-client.ts                     本插件自身路由的 fetch 封装
-  styles.ts                         标签页样式
+  styles.ts                         标签页样式，以及插件管理面板的样式
   constants.ts
 src/shared/
   record-shape.ts              两个半边共享的仅类型记录结构

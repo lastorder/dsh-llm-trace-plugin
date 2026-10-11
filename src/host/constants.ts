@@ -19,6 +19,14 @@ export const USER_AGENT_PREFIX = 'deepseek-harness/'
 export const ROUTE_PREFIX = '/llm-wire-trace'
 
 /**
+ * This package's own npm name, matching `package.json`'s `name` and
+ * `cordis.patch.yml`'s `name:`. Used as the `plugins.bundle.config` Slot key
+ * the client half registers under (see `entry.ts`) — Slot keys for that Slot
+ * are the bundle's package name, not its Loader row id.
+ */
+export const PACKAGE_NAME = 'dsh-llm-trace-plugin'
+
+/**
  * Request/response header names whose value is a credential and must never
  * reach disk.
  *
