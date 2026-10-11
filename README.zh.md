@@ -14,10 +14,10 @@
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-指定精确版本（推荐使用最新版 `0.4.0`）：
+指定精确版本（推荐使用最新版 `0.4.1`）：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.4.0
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.1
 ```
 
 之后按**包名**更新或卸载：
@@ -42,7 +42,7 @@ pnpm run build      # 产出 dist/host/** 与 dist/client.js
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # 或者，从固定到某个分支/tag/commit 的 git 远程安装：
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.0
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.1
 ```
 
 git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都要重新 `pnpm run build`，因为没有任何东西会替你自动构建。
@@ -86,6 +86,8 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 - **上表中的每一项参数**，预填为当前生效的值。
 
 在该面板中编辑一个字段，会通过与 `configEditor` 服务、`dsh plugin configure` 相同的 Loader 机制，直接写回 profile 自身的 patch 文档，且改动会立即生效，无需重启。如果当前运行的 host 没有提供这样的写入服务（例如非 Cordis 环境，或者没有加载 `configEditor` 插件），面板会退化为只读展示当前生效的值，并明确说明这一点，而不是假装写入会成功。
+
+如果 `config` 这条路由根本无法访问——最常见的原因是当前运行的 host 进程还是这个插件某个更早的构建，尚未包含这条路由（安装或更新插件并不会热重载 host 端代码；需要重启 `dsh web`，见[安装](#安装)）——面板会显示每一项的文档默认值，而不是报错，并附一句简短说明，表明这些只是默认值，不代表当前实际生效的配置。本地缓存统计与清除全部历史记录按钮不受影响，因为它们用的是更早就存在的 `stats`/`clear` 路由。
 
 ## 持久化
 

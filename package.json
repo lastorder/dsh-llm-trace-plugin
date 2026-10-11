@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-trace-plugin",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Capture the literal HTTP request/response of every LLM provider call (by patching globalThis.fetch) and show them in a Wire Trace session tab",
   "license": "MIT",
   "type": "module",
@@ -35,9 +35,9 @@
     "lint": "oxlint src test"
   },
   "devDependencies": {
-    "@types/node": "^26.4.1",
+    "@types/node": "^26.6.5",
     "esbuild": "^0.28.2",
-    "oxlint": "^1.81.0",
+    "oxlint": "^1.87.0",
     "typescript": "^7.0.2"
   },
   "dependencies": {

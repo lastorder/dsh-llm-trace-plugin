@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CONFIG_FIELDS as CLIENT_FIELDS } from '../../src/client/plugin-manage-view.js'
-import { CONFIG_FIELDS as HOST_FIELDS } from '../../src/host/config.js'
+import { CONFIG_FIELD_DEFAULTS, CONFIG_FIELDS as CLIENT_FIELDS } from '../../src/client/plugin-manage-view.js'
+import { CONFIG_FIELDS as HOST_FIELDS, resolveEffectiveConfig } from '../../src/host/config.js'
 
 // Duplicated across the host/client boundary for the same reason `ROUTE` and
 // `PACKAGE_NAME` are (see `test/client/constants.test.ts`): the two builds
@@ -32,4 +32,26 @@ test('traceDir is the only string field; every other non-boolean field is a numb
     if (field.key === 'traceDir') assert.equal(field.type, 'string')
     else if (field.key !== 'persist') assert.equal(field.type, 'number')
   }
+})
+
+// -- CONFIG_FIELD_DEFAULTS: the values shown when `GET config` cannot be
+// read at all (see plugin-manage-view.ts's doc comment on configUsingDefaults)
+// -- must match the host's own resolved defaults, or a reader offline from
+// the host would be shown numbers that do not actually describe this
+// plugin's behavior.
+
+test('CONFIG_FIELD_DEFAULTS declares exactly one entry per CONFIG_FIELDS key', () => {
+  assert.deepEqual(Object.keys(CONFIG_FIELD_DEFAULTS).sort(), [...CLIENT_FIELDS].map((field) => field.key).sort())
+})
+
+test('CONFIG_FIELD_DEFAULTS matches resolveEffectiveConfig(undefined) for every field except traceDir', () => {
+  const resolved = resolveEffectiveConfig(undefined, {}) as unknown as Record<string, unknown>
+  for (const field of CLIENT_FIELDS) {
+    if (field.key === 'traceDir') continue // host-environment-dependent; the client shows blank instead, see the hint text
+    assert.equal(CONFIG_FIELD_DEFAULTS[field.key], String(resolved[field.key]), `${field.key} default drifted from the host's resolveEffectiveConfig`)
+  }
+})
+
+test('CONFIG_FIELD_DEFAULTS.traceDir is blank (the field has no fixed default)', () => {
+  assert.equal(CONFIG_FIELD_DEFAULTS.traceDir, '')
 })

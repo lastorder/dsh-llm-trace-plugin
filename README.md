@@ -17,10 +17,10 @@ This works at the *wire* layer. A harness-level tracer observes the normalized `
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-Pin an exact version (recommended: the latest, `0.4.0`):
+Pin an exact version (recommended: the latest, `0.4.1`):
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.4.0
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.1
 ```
 
 Then update or remove it by **package name**:
@@ -45,7 +45,7 @@ Then install the checkout the same way as any local plugin:
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # or, from a git remote pinned to a branch/tag/commit:
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.0
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.1
 ```
 
 A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
@@ -89,6 +89,8 @@ Every key above is also editable from DSH's own Plugins page (Settings → Plugi
 - **Every parameter in the table above**, pre-filled with the value currently in effect.
 
 Editing a field there writes it straight back into the profile's own patch document — through the same Loader machinery the `configEditor` service and `dsh plugin configure` use — and the change applies live, without a restart. If the running host exposes no such writer service (a non-Cordis embedding, or one with no `configEditor` plugin loaded), the panel falls back to a read-only report of the values in effect, and says so, rather than pretending a write would work.
+
+If the `config` route itself cannot be reached at all — overwhelmingly because the running host process is still on an older build of this plugin that predates this route (installing or updating a plugin does not hot-reload host code; `dsh web` must be restarted, see [Install](#install)) — the panel shows each field's documented default instead of an error, with a short note that these are defaults rather than the values actually in effect. The Local cache stats and Clear all history button are unaffected, since they use the older, already-existing `stats`/`clear` routes.
 
 ## Persistence
 

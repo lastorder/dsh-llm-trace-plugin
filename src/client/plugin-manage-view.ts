@@ -51,6 +51,26 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'prettyBodyLimit', type: 'number' },
 ]
 
+/**
+ * Each field's documented default, as the draft text it would render —
+ * shown when the `config` route cannot be read at all (an older host build
+ * with no such route, a network hiccup, anything), so the panel always has
+ * SOMETHING concrete to show instead of an error with no further action.
+ * Mirrors the defaults `src/host/config.ts`'s `Config` schema declares;
+ * pinned alongside `CONFIG_FIELDS` by `test/client/plugin-manage-view.test.ts`.
+ * `traceDir` has no fixed default (it depends on `$DSH_HOME`), so its row
+ * shows blank here — the field's hint already explains what blank means.
+ */
+export const CONFIG_FIELD_DEFAULTS: Readonly<Record<string, string>> = {
+  maxRecords: '200',
+  maxBodyChars: '8000000',
+  persist: 'true',
+  traceDir: '',
+  maxPersistedRecords: '300',
+  historyPageLimit: '50',
+  prettyBodyLimit: '500000',
+}
+
 /** The owner props DSH's Plugins page renders `plugins.bundle.config` with. */
 export interface PluginManageViewProps {
   view: 'summary' | 'page'
@@ -70,7 +90,14 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
     const [statsTick, setStatsTick] = React.useState(0)
 
     const [configState, setConfigState] = React.useState<{ editable: boolean, values: Record<string, unknown> } | null>(null)
-    const [configError, setConfigError] = React.useState<string | null>(null)
+    // True whenever `GET config` could not be read at all, for ANY reason —
+    // an older host build with no such route (installing/updating a plugin
+    // does not hot-reload host code; see the README's "Install" notes on
+    // restarting `dsh web`), a network hiccup, anything. Rather than
+    // surfacing that failure as an error with no action the reader can take,
+    // the panel falls back to each field's documented default
+    // (`CONFIG_FIELD_DEFAULTS`) so there is always something concrete shown.
+    const [configUsingDefaults, setConfigUsingDefaults] = React.useState(false)
     const [configTick, setConfigTick] = React.useState(0)
     const [drafts, setDrafts] = React.useState<Record<string, string>>({})
     const [savingField, setSavingField] = React.useState<string | null>(null)
@@ -95,7 +122,7 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
           if (!alive) return
           const values = (result && result.values) || {}
           setConfigState({ editable: result && result.editable === true, values })
-          setConfigError(null)
+          setConfigUsingDefaults(false)
           const nextDrafts: Record<string, string> = {}
           for (const field of CONFIG_FIELDS) {
             const value = values[field.key]
@@ -103,7 +130,12 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
           }
           setDrafts(nextDrafts)
         },
-        (reason: any) => { if (alive) setConfigError(String((reason && reason.message) || reason)) },
+        () => {
+          if (!alive) return
+          setConfigState(null)
+          setConfigUsingDefaults(true)
+          setDrafts({ ...CONFIG_FIELD_DEFAULTS })
+        },
       )
       return () => { alive = false }
     }, [configTick])
@@ -173,7 +205,7 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
 
     const fieldRows = CONFIG_FIELDS.map((field) => {
       const draft = drafts[field.key] ?? ''
-      const disabled = configState === null || configState.editable === false || savingField === field.key
+      const disabled = configUsingDefaults || configState === null || configState.editable === false || savingField === field.key
       const input = field.type === 'boolean'
         ? h('input', {
           key: 'input',
@@ -226,8 +258,8 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
       clearNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'clear-notice' }, clearNotice),
       h('div', { className: 'wt-manage-fields', key: 'fields' }, [
         h('div', { className: 'wt-manage-fields-label', key: 'label' }, t('manage.fieldsLabel')),
-        configError !== null
-          ? h('div', { className: 'wt-err', key: 'err' }, t('manage.fieldsError', { message: configError }))
+        configUsingDefaults
+          ? h('div', { className: 'wt-jnotice', key: 'defaults' }, t('manage.fieldsUsingDefaults'))
           : (configState === null
             ? h('div', { className: 'wt-jnotice', key: 'loading' }, t('manage.fieldsLoading'))
             : (configState.editable === false
