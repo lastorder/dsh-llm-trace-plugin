@@ -16,6 +16,7 @@ import { fmtCount, maxDepthOf } from './json-model.js'
 import { parseSseFrames, prettySseText } from './sse.js'
 import { mergeSseChunks } from './sse-merge/index.js'
 import { createJsonView, type ReactLike as MinimalReactLike } from './json-view.js'
+import { LIST_PAGE_LIMIT } from './constants.js'
 import {
   describeBodyNotice,
   groupRows,
@@ -80,7 +81,6 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     // instead of only after the next remount.
     const [, forceLocaleRefresh] = React.useState(0)
     React.useEffect(() => ctx.subscribeLocale(() => forceLocaleRefresh((n: number) => n + 1)), [])
-    const [auto, setAuto] = React.useState(true)
     // Default to the current session: a wire trace opened from inside a
     // session is almost always being read about THAT session. The toggle
     // switches to the full store, which is the only place unattributed
@@ -109,6 +109,8 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     // frames. Toggled off to see the literal bytes on the wire instead.
     const [sseMerged, setSseMerged] = React.useState(true)
     const [curlBusy, setCurlBusy] = React.useState(false)
+    // Whether the toolbar counter's explanation is expanded; see counterText.
+    const [countOpen, setCountOpen] = React.useState(false)
     const [curlNotice, setCurlNotice] = React.useState<string | null>(null)
     // One-shot escape hatch for a provider that never stamps the session
     // header at all (pi-ai puts the id only in an SDK-local option, never on
@@ -206,7 +208,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       let alive = true
       inFlight.current = true
       apiGet('list', {
-        limit: 100,
+        limit: LIST_PAGE_LIMIT,
         source: 'memory',
         sessionId: filtering ? currentSessionId : undefined,
       }).then(
@@ -234,7 +236,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       historyLanded.current = false
       setHistoryLoading(true)
       apiGet('list', {
-        limit: 100,
+        limit: LIST_PAGE_LIMIT,
         sessionId: filtering ? currentSessionId : undefined,
       }).then(
         (result: any) => {
@@ -251,15 +253,14 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       return () => { alive = false }
     }, [historyTick, filtering, currentSessionId, applyPage])
 
-    React.useEffect(() => {
-      if (!auto) return undefined
-      return ctx.interval(() => {
-        // A hidden tab has no reader, so polling it only burns work on a
-        // shared event loop.
-        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
-        setTick((n: number) => n + 1)
-      }, 3000)
-    }, [auto])
+    // Polling is not optional: it is what makes a just-finished call appear
+    // and a still-streaming record refresh. A hidden tab has no reader, so it
+    // is skipped rather than burning work on the event loop the rest of the UI
+    // shares.
+    React.useEffect(() => ctx.interval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      setTick((n: number) => n + 1)
+    }, 3000), [])
 
     const selectedStatus = React.useMemo(() => {
       const found = items.find((item) => item.id === selected)
@@ -393,6 +394,38 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       setOverrides(new Map())
     }
 
+    // What the toolbar counter means, in one place.
+    //
+    // Both numbers describe the STORE, not the screen: the numerator is the
+    // host's match count under the active filter (this session by default),
+    // the denominator is every record the host holds — in-memory ring plus
+    // on-disk history. The row count is deliberately NOT the numerator: one
+    // page renders at most LIST_PAGE_LIMIT rows, so a screen holding 100 of
+    // 368 matches must not read as "100 of 368 exist". When the page is
+    // clipped, the note says how many matched records are not drawn.
+    const shownRows = items.length
+    const hiddenRows = Math.max(0, matched - shownRows)
+    const counterText = fmtCount(matched) + ' / ' + fmtCount(total)
+      + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
+      + (auxiliary > 0 ? ' · ' + fmtCount(auxiliary) + t('toolbar.auxiliarySuffix') : '')
+    const counterNote = [
+      h('div', { key: 'match' }, t('count.helpMatch', {
+        scope: filtering ? t('count.scopeSession') : t('count.scopeAll'),
+        matched: fmtCount(matched),
+      })),
+      h('div', { key: 'total' }, t('count.helpTotal', { total: fmtCount(total) })),
+      h('div', { key: 'rows' }, hiddenRows > 0
+        ? t('count.helpRows', {
+          shown: fmtCount(shownRows),
+          hidden: fmtCount(hiddenRows),
+          limit: fmtCount(LIST_PAGE_LIMIT),
+        })
+        : t('count.helpRowsAll', { shown: fmtCount(shownRows) })),
+      turns.length > 0 ? h('div', { key: 'turns' }, t('count.helpTurns', { turns: turns.length })) : null,
+      auxiliary > 0 ? h('div', { key: 'aux' }, t('count.helpAux', { auxiliary: fmtCount(auxiliary) })) : null,
+      h('div', { key: 'hint', className: 'wt-count-hint' }, t('count.helpHint')),
+    ].filter(Boolean)
+
     const rows = items.map((item) => h(
       'div',
       {
@@ -462,22 +495,6 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
         h('div', { className: 'wt-bar', key: 'bar' }, [
           h('button', {
             className: 'wt-btn',
-            key: 'auto',
-            'data-on': auto ? '1' : '0',
-            title: auto ? t('toolbar.autoOnTitle') : t('toolbar.autoOffTitle'),
-            onClick: () => {
-              const next = !auto
-              setAuto(next)
-              // A manual resume is the user asking to see everything now, so
-              // it re-reads history too, not just the live ring.
-              if (next) {
-                setTick((n: number) => n + 1)
-                setHistoryTick((n: number) => n + 1)
-              }
-            },
-          }, auto ? t('toolbar.autoOn') : t('toolbar.autoOff')),
-          h('button', {
-            className: 'wt-btn',
             key: 'clear',
             title: t('toolbar.clearTitle'),
             onClick: () => {
@@ -497,14 +514,24 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
               }, (reason: any) => setError(String(reason)))
             },
           }, t('toolbar.clear')),
-          h('span', {
-            className: 'wt-meta',
+          // The counter is a button, not a plain span with a `title`: the
+          // native hover tooltip is slow, invisible to keyboard users and
+          // unreliable inside the desktop shell, and this explanation is too
+          // long to sit in one anyway. Clicking expands the note below.
+          h('button', {
+            className: 'wt-count',
             key: 'meta',
-            title: filtering ? t('toolbar.metaFilteredTitle') : t('toolbar.metaAllTitle'),
-          }, (filtering ? matched : items.length) + ' / ' + total
-            + (turns.length > 0 ? ' · ' + turns.length + ' turn' : '')
-            + (auxiliary > 0 ? ' · ' + auxiliary + t('toolbar.auxiliarySuffix') : '')),
+            type: 'button',
+            title: t('count.title'),
+            'data-on': countOpen ? '1' : '0',
+            onClick: () => setCountOpen(!countOpen),
+          }, counterText),
         ]),
+        // Where the two numbers come from, in the same block the other
+        // notices use — expanded on demand so the toolbar stays terse.
+        countOpen
+          ? h('div', { className: 'wt-count-note', key: 'count-note' }, counterNote)
+          : null,
         error === null ? null : h('div', { className: 'wt-err', key: 'err' }, error),
         h('div', { className: 'wt-list', key: 'list' },
           items.length === 0
@@ -543,13 +570,12 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
             ? h('button', {
               className: 'wt-btn',
               key: 'sse',
-              // No data-on here, unlike this toolbar's other toggles.
-              // Those (auto-refresh, session scope, Request/Response) keep a
-              // FIXED label and use the highlight to show which state is
-              // active. This button's label already IS the state indicator
-              // — it always names the mode you'd switch TO — so a highlight
-              // on top would just be redundant with the text, with no
-              // stable "on" state to anchor it to.
+              // No data-on here, unlike this toolbar's other toggles: those
+              // (Request/Response) keep a FIXED label and use the highlight to
+              // show which state is active. This button's label already IS the
+              // state indicator — it always names the mode you'd switch TO — so
+              // a highlight on top would just be redundant with the text, with
+              // no stable "on" state to anchor it to.
               title: sseMerged ? t('tabs.sseShowRawTitle') : t('tabs.sseShowMergedTitle'),
               onClick: () => setSseMerged(!sseMerged),
             }, sseMerged ? t('tabs.sseShowRaw') : t('tabs.sseShowMerged'))

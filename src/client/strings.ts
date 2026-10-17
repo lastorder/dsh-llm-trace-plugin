@@ -20,7 +20,7 @@
  * either dictionary cannot silently drift them apart.
  *
  * Every key here is named the same way the old nested `UI` table addressed
- * it (`toolbar.autoOn`, `tabs.request`, …), joined with `.` — flat because
+ * it (`toolbar.clear`, `tabs.request`, …), joined with `.` — flat because
  * that is what the locale dictionary format requires, not because the
  * grouping stopped mattering; the grouping is preserved in the section
  * comments below.
@@ -34,14 +34,19 @@ export type LocaleDict = Record<string, string>
 /** Chinese dictionary. Every key here must also exist in {@link en}, and vice versa. */
 export const zh: LocaleDict = {
   // -- toolbar --
-  'toolbar.autoOn': '自动刷新',
-  'toolbar.autoOff': '已暂停',
-  'toolbar.autoOnTitle': '每 3 秒自动刷新（只读内存中的实时记录，不扫描磁盘）。点击暂停。',
-  'toolbar.autoOffTitle': '已暂停刷新。点击恢复并立即刷新一次。',
   'toolbar.clear': '清空',
   'toolbar.clearTitle': '清空本 session 的记录（内存与磁盘上的历史记录都会删除）。要清空全部 session 的历史记录，请前往插件管理页。',
-  'toolbar.metaFilteredTitle': '本 session 命中数 / 全部记录数（含磁盘）',
-  'toolbar.metaAllTitle': '已加载 / 全部记录数（含磁盘）',
+  // -- counter (toolbar "A / B · N turn · N aux") --
+  'count.title': '命中记录数 / 全部记录数（含磁盘）。点击展开说明。',
+  'count.scopeSession': '本 session 内',
+  'count.scopeAll': '当前过滤条件下',
+  'count.helpMatch': '左边数字：{scope}命中的记录数，当前 {matched} 条。',
+  'count.helpTotal': '右边数字：store 里的全部记录数（内存环形缓冲 + 磁盘历史），当前 {total} 条。',
+  'count.helpRows': '列表这一屏只渲染了 {shown} 行（每屏最多 {limit} 行），另有 {hidden} 条命中记录没有画出来 —— 它们仍在 store 里，不是丢失了。',
+  'count.helpRowsAll': '列表这一屏渲染了全部 {shown} 行命中记录。',
+  'count.helpTurns': '· {turns} turn：列表里出现过的对话轮数；同一轮里的多次模型调用（每次调用是一个 step）只计 1 轮。',
+  'count.helpAux': '· {auxiliary} 辅助：标题生成、上下文压缩这类不属于任何对话轮的后台调用。',
+  'count.helpHint': '点击这行数字可收起说明。',
   /** Suffix on the counter line when background auxiliary calls are present. */
   'toolbar.auxiliarySuffix': ' 辅助',
   // -- tabs --
@@ -156,14 +161,19 @@ export const zh: LocaleDict = {
 /** English dictionary. Every key here must also exist in {@link zh}, and vice versa. */
 export const en: LocaleDict = {
   // -- toolbar --
-  'toolbar.autoOn': 'Auto-refresh',
-  'toolbar.autoOff': 'Paused',
-  'toolbar.autoOnTitle': 'Auto-refreshes every 3s (reads only the live in-memory ring, never scans disk). Click to pause.',
-  'toolbar.autoOffTitle': 'Refresh is paused. Click to resume and refresh once immediately.',
   'toolbar.clear': 'Clear',
   'toolbar.clearTitle': 'Clear this session\'s records (both the in-memory ring and its persisted history on disk). To clear every session\'s history, use the plugin management page.',
-  'toolbar.metaFilteredTitle': 'Matches in this session / total records (including disk)',
-  'toolbar.metaAllTitle': 'Loaded / total records (including disk)',
+  // -- counter (toolbar "A / B · N turn · N aux") --
+  'count.title': 'Matching records / all records (including disk). Click for details.',
+  'count.scopeSession': 'in this session',
+  'count.scopeAll': 'under the current filter',
+  'count.helpMatch': 'Left number: records matching {scope} — {matched} right now.',
+  'count.helpTotal': 'Right number: every record the store holds (in-memory ring + on-disk history) — {total} right now.',
+  'count.helpRows': 'This screen renders {shown} rows (at most {limit} per page); {hidden} more matching records are not drawn — they are still in the store, not lost.',
+  'count.helpRowsAll': 'This screen renders all {shown} matching rows.',
+  'count.helpTurns': '· {turns} turn: conversation turns present in the list; several model calls (each one a step) inside a turn count as one turn.',
+  'count.helpAux': '· {auxiliary} aux: background calls belonging to no turn, such as title generation or context compaction.',
+  'count.helpHint': 'Click these numbers again to collapse this.',
   'toolbar.auxiliarySuffix': ' aux',
   // -- tabs --
   'tabs.request': 'Request',

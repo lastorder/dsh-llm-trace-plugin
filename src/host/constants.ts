@@ -45,6 +45,12 @@ export const REDACTED_HEADERS = new Set([
   'x-api-key',
   'api-key',
   'x-goog-api-key',
+  // The harness's own account credential, stamped by `dsh-llm-deepseek` on
+  // every Messages call (`x-dsh-auth-token`). It is a bare token with no
+  // scheme, so it is redacted to the placeholder alone — and it is by far the
+  // most common credential on the wire for this plugin, since it rides every
+  // call the harness makes to its own provider.
+  'x-dsh-auth-token',
   'cookie',
   'set-cookie',
 ])

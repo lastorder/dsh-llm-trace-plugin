@@ -28,4 +28,16 @@ export const PACKAGE_NAME = 'dsh-llm-trace-plugin'
 export const PATH_SEP = '\u0000'
 export const ROOT_PATH = '$'
 export const LONG_STRING = 120
+/** Hard cap on rows the JSON tree renderer will draw for one body (see json-view.ts). */
 export const MAX_ROWS = 20000
+
+/**
+ * How many list rows the tab asks the host for per read.
+ *
+ * Both the fast in-memory poll and the full history read use it, and the
+ * counter in the toolbar reports it: with more matching records than this, the
+ * list shows the newest `LIST_PAGE_LIMIT` of them and the counter says how
+ * many are left over, so a bounded screen is never mistaken for a bounded
+ * store.
+ */
+export const LIST_PAGE_LIMIT = 100

@@ -69,6 +69,19 @@ test('redactedHeaders: redacts cookie and proxy-authorization', () => {
   assert.equal(result['proxy-authorization'], 'Bearer ***redacted***')
 })
 
+test('redactedHeaders: redacts the harness\'s own account token, which rides every Messages call', () => {
+  // `dsh-llm-deepseek` stamps this on every Messages request it sends, so it
+  // was the most-captured credential of all — and it rode to disk verbatim
+  // until this name joined the set.
+  const result = redactedHeaders({
+    'x-dsh-auth-token': 'not-a-real-token-just-a-fixture',
+    'x-deepseek-harness-session-id': 'session-1',
+  })
+  assert.equal(result['x-dsh-auth-token'], '***redacted***')
+  // Neighbouring harness metadata is not a credential and stays readable.
+  assert.equal(result['x-deepseek-harness-session-id'], 'session-1')
+})
+
 test('redactedHeaders: a header that merely LOOKS credential-ish is left untouched', () => {
   // Guards against over-redaction: only the exact names in the set are hidden,
   // so ordinary request metadata stays readable in the trace.

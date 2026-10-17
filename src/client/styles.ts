@@ -37,6 +37,15 @@ export const CSS = [
   '.wt-btn-step{font-family:var(--ds-font-family-code);font-weight:600;padding:3px 0;width:26px;text-align:center}',
   '.wt-div{width:1px;height:16px;flex:none;align-self:center;margin:0 8px;background:var(--dsw-alias-border-l2)}',
   '.wt-meta{color:var(--dsw-alias-label-secondary);font-size:12px;margin-left:auto}',
+  // The counter reads as text but behaves as a disclosure button: hovering a
+  // plain span for a native `title` tooltip proved unreliable inside the
+  // desktop shell, so the explanation opens on click instead. The trailing
+  // `?` is the affordance that says so.
+  '.wt-count{margin-left:auto;display:inline-flex;align-items:center;gap:4px;background:none;border:0;padding:0;font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary);cursor:pointer}',
+  '.wt-count:hover,.wt-count[data-on="1"]{color:var(--dsw-alias-label-primary)}',
+  '.wt-count::after{content:"?";display:inline-block;width:12px;height:12px;border:1px solid currentColor;border-radius:50%;font-size:9px;line-height:12px;text-align:center;opacity:.6}',
+  '.wt-count-note{padding:6px 10px;display:flex;flex-direction:column;gap:2px;border-bottom:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px}',
+  '.wt-count-hint{opacity:.7}',
   '.wt-list{flex:1;min-height:0;overflow-y:auto}',
   '.wt-item{cursor:pointer;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;gap:3px}',
   '.wt-item:hover{background:var(--dsw-alias-bg-layer-2)}',

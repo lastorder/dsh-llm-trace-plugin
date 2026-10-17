@@ -17,10 +17,10 @@ This works at the *wire* layer. A harness-level tracer observes the normalized `
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-Pin an exact version (recommended: the latest, `0.4.1`):
+Pin an exact version (recommended: the latest, `0.4.2`):
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.4.1
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.2
 ```
 
 Then update or remove it by **package name**:
@@ -45,7 +45,7 @@ Then install the checkout the same way as any local plugin:
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # or, from a git remote pinned to a branch/tag/commit:
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.1
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.2
 ```
 
 A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
@@ -144,13 +144,13 @@ This is the deliberate trade: a bounded per-page cost in exchange for never rein
 
 Nothing is preloaded into the ring on `apply`: the list already merges memory and disk, so a restart opens on the recent past regardless. (Preloading was in fact what made an earlier live/history toggle show identical content in both modes — the ring had been filled with the very history the other mode read.)
 
-The Wire Trace tab is mounted only while it is the active tab, so an unopened tab reads nothing at all. Opening it paints the live in-memory ring first and folds the on-disk history in behind that, saying so while the history is still in flight. Auto-refresh then polls the ring only, so watching a live session never re-scans the disk.
+The Wire Trace tab is mounted only while it is the active tab, so an unopened tab reads nothing at all. Opening it paints the live in-memory ring first and folds the on-disk history in behind that, saying so while the history is still in flight. From then on the tab polls the ring every 3s (never re-scanning the disk) — that polling is what makes a finished call appear and a still-streaming one refresh, so it is always on rather than a toggle, and a hidden tab skips it.
 
 Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET /llm-wire-trace/stats`, never thrown into the capture path.
 
 ### Privacy: bodies are stored verbatim
 
-Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `cookie`, and `set-cookie`. A credential riding the URL's own query string (e.g. Google Gemini's `?key=`) is redacted the same way before the URL ever reaches memory or disk — see `REDACTED_QUERY_PARAMS` in `constants.ts`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
+Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `x-dsh-auth-token` (the harness's own account credential, which rides every Messages call), `cookie`, and `set-cookie`. A credential riding the URL's own query string (e.g. Google Gemini's `?key=`) is redacted the same way before the URL ever reaches memory or disk — see `REDACTED_QUERY_PARAMS` in `constants.ts`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
 
 Clearing (either the Wire Trace tab's session-scoped `Clear`, or the management page's cross-session `Clear all history`) deletes the matching persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
 
@@ -163,7 +163,7 @@ A dynamic Cordis Host package's code runs inside an isolated `node:vm` realm. Th
 1. On `apply`, replace `globalThis.fetch` with a wrapper, keeping the original reference. `ctx.effect` ties the disposer (which restores the original reference) to the plugin's fiber, so a stop, uninstall, or failed reactivation cannot leave a dangling patched `fetch`.
 2. Every call is inspected for an outgoing `user-agent` header starting with `deepseek-harness/` — the value `attributionHeaders()` stamps on *every* provider request regardless of which adapter sends it (see `@deepseek-ai/dsh-llm`'s `APP_IDENTITY`). Anything else (the `web_fetch` tool, `web_search`, MCP transports, …) passes through completely untouched: not recorded, not cloned, same arguments, same return value.
 3. For a matched call, the real `fetch` runs first. The **original, unread** `response` goes back to the adapter exactly as it would have otherwise — its SSE parsing, timing, and error handling are completely unaffected.
-4. A `response.clone()` is mirrored in the background (never `await`-ed on the hot path) to capture the response body without disturbing the original stream the adapter is reading.
+4. A `response.clone()` is mirrored in the background (never `await`-ed on the hot path) to capture the response body without disturbing the original stream the adapter is reading. The mirror is read chunk by chunk, not with `text()`: every streamed call ends with the adapter aborting its own request (`dsh-llm-deepseek` aborts its consumer controller in a `finally`) against a socket that outlives the last event it consumed, and `text()` resolves only on a clean close — so it would reject and discard a body it had already received in full.
 
 Both shipped adapters (`dsh-llm-deepseek`, `dsh-llm-pi-ai`) call the bare `fetch` identifier with no local import, so they resolve whatever `globalThis.fetch` is at call time — which is exactly what makes this patch effective regardless of module load order.
 
@@ -173,8 +173,9 @@ The wrapper is written to hold these properties:
 
 - A non-provider call passes straight through: not recorded, not cloned, body fully intact for its own caller.
 - A provider call's caller still reads the complete, unmodified response body — the mirror never contends with it.
+- A streamed body whose call the adapter aborts is still stored: every chunk the mirror received is kept, so an SSE response is captured whole instead of being thrown away by a `text()` that will never see a clean close.
 - A transport failure (the underlying `fetch` throws) is recorded and **rethrown unchanged** — never swallowed.
-- Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.
+- Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `x-dsh-auth-token`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.
 - A credential riding the URL's own query string (`?key=`, `?access_token=`, and similar — see `REDACTED_QUERY_PARAMS` in `constants.ts`) is redacted the same way, case-insensitively, before the URL is stored, displayed, or used to build a curl command. Every other query parameter, and the path, are left untouched.
 - The destructive `clear` route is `POST`-only and rejects a cross-origin request (`Sec-Fetch-Site`), so a page open elsewhere in your browser cannot wipe your trace history.
 - Re-activating the plugin cannot double-wrap an already-patched `fetch` (it throws loudly instead); stopping restores the exact original reference.
@@ -246,7 +247,7 @@ A call that never went through `ctx.llm` is recorded with `attributed: false` an
 - Each row leads with its coordinate: `T1·S0`, or a purpose label (后台辅助调用), or 无归属.
 - Rows are grouped under sticky per-turn headers showing that turn's call and step counts.
 - The selected record shows a coordinate strip (Turn / Step / Provider / Session) above the body.
-- The toolbar summarises `… · N turn · N 辅助`.
+- The toolbar summarises the store, not the screen: `matched / all` plus `· N turn · N 辅助` — matching records under the current filter (this session by default) over every record held, memory and disk. Clicking the numbers expands the full explanation, including how many matching records are not drawn because one page holds at most 100 rows.
 
 ### Requirements
 

@@ -14,10 +14,10 @@
 dsh plugin --profile web add dsh-llm-trace-plugin
 ```
 
-指定精确版本（推荐使用最新版 `0.4.1`）：
+指定精确版本（推荐使用最新版 `0.4.2`）：
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.4.1
+dsh plugin --profile web add dsh-llm-trace-plugin@0.4.2
 ```
 
 之后按**包名**更新或卸载：
@@ -42,7 +42,7 @@ pnpm run build      # 产出 dist/host/** 与 dist/client.js
 ```sh
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 # 或者，从固定到某个分支/tag/commit 的 git 远程安装：
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.1
+dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.2
 ```
 
 git 形式的安装依然只拉源码——每次 `update` 拉到新提交后都要重新 `pnpm run build`，因为没有任何东西会替你自动构建。
@@ -141,13 +141,13 @@ body 的上限是按 1M token 上下文来定的，因此单条记录可能很�
 
 `apply` 时不会把任何记录预载进内存环形缓冲区：列表本身已经合并了内存与磁盘，因此重启后打开看到的自然就是最近的历史。（事实上，正是这个预载曾让早期的「实时 / 历史」开关在两种模式下显示出完全相同的内容 —— 内存里装的就是另一种模式要读的那批历史。）
 
-Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打开的标签页什么都不会读。打开它时，先渲染内存中的实时记录，磁盘历史随后在后台并入 —— 在历史尚未到达期间，界面会明确说明这一点。之后的自动刷新只轮询内存，所以盯着一个实时 session 看，永远不会重新扫描磁盘。
+Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打开的标签页什么都不会读。打开它时，先渲染内存中的实时记录，磁盘历史随后在后台并入 —— 在历史尚未到达期间，界面会明确说明这一点。之后标签页每 3 秒轮询一次内存（不会重新扫描磁盘）：正是这次轮询让刚结束的调用出现、让仍在流式返回的记录刷新，所以它始终开启、不提供开关；标签页不可见时会跳过。
 
 捕获会立即开始，磁盘缓慢或故障都不会拖慢 fetch 补丁，也不会让任何请求失败。持久化过程中的错误会被计数，并通过 `GET /llm-wire-trace/stats` 汇报，而绝不会抛进捕获链路。
 
 ### 隐私：请求体按原样落盘
 
-凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`cookie` 和 `set-cookie`。URL 自身查询字符串中携带的凭据（例如 Google Gemini 的 `?key=`）在其到达内存或磁盘之前也会以同样方式脱敏 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
+凭据类请求头在磁盘上同样会被脱敏，与内存中一致 —— 包括 `authorization`、`proxy-authorization`、`x-api-key`（Anthropic）、`api-key`（Azure OpenAI）、`x-goog-api-key`（Google）、`x-dsh-auth-token`（harness 自己的账号凭据，随每一次 Messages 调用发出）、`cookie` 和 `set-cookie`。URL 自身查询字符串中携带的凭据（例如 Google Gemini 的 `?key=`）在其到达内存或磁盘之前也会以同样方式脱敏 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`。但**请求体和响应体不会** —— 它们按捕获时的原样存储，也就是说你的 prompt、代码，以及上下文中的任何文件内容，都会以明文形式落在 `traceDir` 下的文件里。这是「持久化完整 body」本身固有的结果，对一个本地调试工具而言是刻意的选择。可用的调节手段是 `persist: false`、调小 `maxPersistedRecords`，或降低 `maxBodyChars`。
 
 在查看器中执行「清空」（无论是 Wire Trace 标签页里按 session 限定范围的「清空」，还是插件管理页跨 session 的「清除全部历史记录」）时，磁盘上对应的副本也会一并删除 —— 否则「清空」会在下次重启后自己变回来。
 
@@ -160,7 +160,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 1. 在 `apply` 时，用一个包装函数替换 `globalThis.fetch`，并保留原始引用。`ctx.effect` 把 disposer（负责恢复原始引用）绑定到插件的 fiber 上，因此停止、卸载或激活失败都不会留下一个悬空的、已被打补丁的 `fetch`。
 2. 每次调用都会检查其外发的 `user-agent` 头是否以 `deepseek-harness/` 开头 —— 这是 `attributionHeaders()` 给*每一个*提供方请求都会打上的值，与由哪个适配器发出无关（参见 `@deepseek-ai/dsh-llm` 的 `APP_IDENTITY`）。其他所有请求（`web_fetch` 工具、`web_search`、MCP 传输……）都会完全原样透传：不记录、不克隆，参数相同，返回值相同。
 3. 对于匹配到的调用，先执行真实的 `fetch`。那个**原始的、未被读取过的** `response` 会原封不动地交回给适配器 —— 它的 SSE 解析、计时和错误处理完全不受影响。
-4. 在后台镜像一份 `response.clone()`（绝不在热路径上 `await`），从而在不干扰适配器正在读取的原始流的前提下捕获响应体。
+4. 在后台镜像一份 `response.clone()`（绝不在热路径上 `await`），从而在不干扰适配器正在读取的原始流的前提下捕获响应体。镜像按 chunk 逐段读取，而不是用 `text()`：每一次流式调用结束时，适配器都会主动 abort 自己的请求（`dsh-llm-deepseek` 在其 `finally` 中 abort 自己的 consumer controller），而 socket 往往在适配器读完最后一个事件之后仍然开着；`text()` 只在「干净关闭」时才 resolve，因此它会把已经完整收到的响应体一并 reject 掉、全部丢弃。
 
 两个随附的适配器（`dsh-llm-deepseek`、`dsh-llm-pi-ai`）都是直接调用裸的 `fetch` 标识符、没有本地 import，因此它们在调用时解析到的就是当时的 `globalThis.fetch` —— 这正是本补丁无论模块加载顺序如何都能生效的原因。
 
@@ -170,8 +170,9 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 - 非提供方的调用直接透传：不记录、不克隆，响应体对它自己的调用方完整无损。
 - 提供方调用的调用方依然能读到完整、未经修改的响应体 —— 镜像永远不会与之争抢。
+- 适配器主动 abort 的流式响应体依然会被保存：镜像收到的每个 chunk 都保留下来，因此 SSE 响应体是完整捕获的，而不会被那个永远等不到「干净关闭」的 `text()` 整体丢弃。
 - 传输失败（底层 `fetch` 抛错）会被记录并**原样重新抛出** —— 绝不吞掉。
-- 所有凭据类请求头在存储或展示前一律脱敏：`authorization` 与 `proxy-authorization` 变为 `Bearer ***redacted***`，而裸密钥类请求头（`x-api-key`、`api-key`、`x-goog-api-key`、`cookie`、`set-cookie`）变为 `***redacted***`，不会凭空加上并不存在的 scheme。其他请求头不作任何改动。
+- 所有凭据类请求头在存储或展示前一律脱敏：`authorization` 与 `proxy-authorization` 变为 `Bearer ***redacted***`，而裸密钥类请求头（`x-api-key`、`api-key`、`x-goog-api-key`、`x-dsh-auth-token`、`cookie`、`set-cookie`）变为 `***redacted***`，不会凭空加上并不存在的 scheme。其他请求头不作任何改动。
 - URL 自身查询字符串中携带的凭据（`?key=`、`?access_token=` 及类似参数 —— 参见 `constants.ts` 中的 `REDACTED_QUERY_PARAMS`）在 URL 被存储、展示或用于构建 curl 命令之前，会以同样方式脱敏，大小写不敏感。其余查询参数与路径部分保持原样。
 - 具有破坏性的 `clear` 路由仅接受 `POST`，并会拒绝跨源请求（依据 `Sec-Fetch-Site`），因此浏览器里打开的其他页面无法清空你的追踪历史。
 - 重新激活插件不会对已经打过补丁的 `fetch` 二次包装（而是显式抛错）；停止时会恢复那个确切的原始引用。
@@ -243,7 +244,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 - 每行以坐标开头：`T1·S0`，或用途标签（后台辅助调用），或「无归属」。
 - 行按 turn 分组，组头吸顶，并显示该轮的调用数与 step 数。
 - 选中的记录在正文上方有一条坐标条（Turn / Step / Provider / Session）。
-- 工具栏汇总 `… · N turn · N 辅助`。
+- 工具栏汇总的是 store 而不是当前屏幕：`命中 / 全部` + `· N turn · N 辅助` —— 分子是当前过滤条件（默认是当前 session）下命中的记录数，分母是 store 持有的全部记录（内存 + 磁盘）。点击这行数字会展开完整说明，其中包括哪些命中记录因为「一屏最多 100 行」而没有画出来。
 
 #### 依赖
 

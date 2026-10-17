@@ -33,20 +33,19 @@ test('every entry in both dictionaries is a non-empty string', () => {
 test('covers every section the view renders, including the management panel', () => {
   // Pins the key set's shape so a whole section cannot be dropped without a
   // test failure — the view reads these by exact key.
-  const prefixes = ['toolbar', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth', 'manage']
+  const prefixes = ['toolbar', 'count', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth', 'manage']
   for (const prefix of prefixes) {
     const hit = Object.keys(en).some((key) => key === prefix || key.startsWith(prefix + '.'))
     assert.ok(hit, `missing any key under "${prefix}"`)
   }
 })
 
-test('the two SSE toggle labels are distinct, as are the two auto-refresh labels, in both locales', () => {
-  // These pairs are toggle states: identical text would make the button look
-  // dead even though it is working.
+test('the two SSE toggle labels are distinct in both locales', () => {
+  // The pair is a toggle: identical text would make the button look dead even
+  // though it is working.
   for (const dict of [zh, en]) {
     assert.notEqual(dict['tabs.sseShowRaw'], dict['tabs.sseShowMerged'])
     assert.notEqual(dict['tabs.sseShowRawTitle'], dict['tabs.sseShowMergedTitle'])
-    assert.notEqual(dict['toolbar.autoOn'], dict['toolbar.autoOff'])
   }
 })
 

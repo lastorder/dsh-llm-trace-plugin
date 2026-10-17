@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installFetchPatch, wrapFetch } from '../../src/host/fetch-patch.js'
+import { installFetchPatch, requestSignal, wrapFetch } from '../../src/host/fetch-patch.js'
 import type { WireRecord } from '../../src/shared/record-shape.js'
 
 function harness() {
@@ -13,6 +13,16 @@ function harness() {
     finalize: (r: WireRecord) => { finalized.push(r) },
   }
 }
+
+/** A body stream this test drives by hand, so it can be cut short mid-flight. */
+function controllableBody() {
+  let controller!: ReadableStreamDefaultController<Uint8Array>
+  const stream = new ReadableStream<Uint8Array>({ start(c) { controller = c } })
+  return { stream, controller }
+}
+
+/** Let every pending microtask — the mirror's reader loop among them — run. */
+const flush = () => new Promise((resolve) => setImmediate(resolve))
 
 test('wrapFetch: a non-provider call passes straight through, untouched, unrecorded', async () => {
   const h = harness()
@@ -163,6 +173,161 @@ test('wrapFetch: an SSE response body is stored verbatim as text and never parse
   // exactly as it arrived; store.get() is what decides never to parse it.
   assert.equal(h.finalized[0].response!.bodyText, 'data: {"a":1}\n\n')
 })
+
+// -- the streaming-body regression --
+//
+// `mirror.text()` is all-or-nothing: it resolves only once the mirrored stream
+// CLOSES, so a terminal error discards every chunk it had already buffered.
+// Provider adapters abort the request signal the moment they are done reading
+// (`dsh-llm-deepseek`'s `generate()` aborts its consumer controller in a
+// `finally`), and a provider SSE socket outlives the last event it consumed —
+// so the mirror branch errored on EVERY streamed call and each one was stored
+// with `bodyText: ''` plus a `recorderError`. 349 of 349 captured
+// `text/event-stream` responses were empty this way; all 19 non-streaming ones
+// were fine. The tests below lock in the per-chunk accumulation that fixed it.
+
+test('wrapFetch: an SSE body cut short by the call\'s own abort keeps every chunk that arrived', async () => {
+  const h = harness()
+  const { stream, controller } = controllableBody()
+  const ac = new AbortController()
+  const real = (async () => {
+    // The adapter is finished with the call and aborts it, exactly as
+    // dsh-llm-deepseek's generate() does in its `finally`.
+    ac.abort()
+    return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.deepseek.com/anthropic/v1/messages', {
+    method: 'POST',
+    headers: { 'user-agent': 'deepseek-harness/1.0', accept: 'text/event-stream' },
+    signal: ac.signal,
+  })
+
+  const encoder = new TextEncoder()
+  const first = 'event: content_block_delta\ndata: {"n":1}\n\n'
+  const second = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  // Let the mirror actually read each chunk before the next arrives, which is
+  // what the two-branch tee does in production (the mirror lags the caller by
+  // at most a queue depth, never by a whole body).
+  controller.enqueue(encoder.encode(first))
+  await flush()
+  controller.enqueue(encoder.encode(second))
+  await flush()
+  // The abort reaches the mirror branch as a terminal AbortError.
+  controller.error(new DOMException('This operation was aborted', 'AbortError'))
+  await flush()
+
+  assert.equal(h.finalized.length, 1)
+  const record = h.finalized[0]
+  assert.equal(record.response!.bodyText, first + second)
+  assert.equal(record.response!.bodyChars, (first + second).length)
+  // The abort is the call's own end, not a failure of this plugin.
+  assert.equal(record.recorderError, undefined)
+  assert.equal(record.status, 'ok')
+})
+
+test('wrapFetch: a body read that fails for any other reason keeps the prefix AND reports it', async () => {
+  const h = harness()
+  const { stream, controller } = controllableBody()
+  const real = (async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.deepseek.com/v1/chat', { headers: { 'user-agent': 'deepseek-harness/1.0' } })
+
+  controller.enqueue(new TextEncoder().encode('event: a\ndata: {"n":1}\n\n'))
+  await flush()
+  controller.error(new TypeError('terminated'))
+  await flush()
+
+  const record = h.finalized[0]
+  // What did arrive is still stored: a partial body beats no body.
+  assert.equal(record.response!.bodyText, 'event: a\ndata: {"n":1}\n\n')
+  // ...but a read that died mid-stream is not silently presented as complete.
+  assert.equal(record.recorderError, 'mirror read failed: terminated')
+  assert.equal(record.status, 'ok')
+})
+
+test('wrapFetch: an AbortError is only excused when the call\'s own signal was aborted', async () => {
+  const h = harness()
+  const { stream, controller } = controllableBody()
+  // No signal on the call at all, so nothing about this abort is the caller's.
+  const real = (async () => new Response(stream, { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.deepseek.com/v1/chat', { headers: { 'user-agent': 'deepseek-harness/1.0' } })
+
+  controller.error(new DOMException('This operation was aborted', 'AbortError'))
+  await flush()
+
+  assert.equal(h.finalized[0].recorderError, 'mirror read failed: This operation was aborted')
+})
+
+test('wrapFetch: the excused teardown is judged by the call\'s signal, not by the error\'s name', async () => {
+  // A destroyed socket surfaces as `TypeError: terminated` rather than an
+  // `AbortError`, which is the shape a caller-side cancel takes. The rule is
+  // "was this call aborted by its own caller", so both shapes are excused.
+  const h = harness()
+  const { stream, controller } = controllableBody()
+  const ac = new AbortController()
+  const real = (async () => {
+    ac.abort()
+    return new Response(stream, { headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.deepseek.com/v1/chat', {
+    headers: { 'user-agent': 'deepseek-harness/1.0' },
+    signal: ac.signal,
+  })
+
+  const chunk = 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  controller.enqueue(new TextEncoder().encode(chunk))
+  await flush()
+  controller.error(new TypeError('terminated'))
+  await flush()
+
+  assert.equal(h.finalized[0].response!.bodyText, chunk)
+  assert.equal(h.finalized[0].recorderError, undefined)
+})
+
+test('wrapFetch: a multi-chunk body is clipped incrementally but still reports its full character count', async () => {
+  const h = harness()
+  const real = (async () => new Response('abcdefghij', { headers: { 'content-type': 'text/plain' } })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 4, push: h.push, finalize: h.finalize })
+  await patched('https://api.deepseek.com/v1/chat', { headers: { 'user-agent': 'deepseek-harness/1.0' } })
+  await flush()
+  // Same contract `clip()` gave a fully read body: `bodyChars` is how big the
+  // body was, `bodyText` is what fits.
+  assert.equal(h.finalized[0].response!.bodyText, 'abcd')
+  assert.equal(h.finalized[0].response!.bodyChars, 10)
+  assert.equal(h.finalized[0].response!.bodyTruncated, true)
+})
+
+// -- requestSignal --
+
+test('requestSignal: reads the signal off init, off a Request, and prefers init', () => {
+  const fromInit = new AbortController()
+  assert.equal(requestSignal('https://api.deepseek.com/v1/chat', { signal: fromInit.signal }), fromInit.signal)
+
+  // `new Request(url, { signal })` wraps the signal in a follow signal, so the
+  // Request form is checked by identity of its effect, not by reference.
+  const requestAc = new AbortController()
+  const request = new Request('https://api.deepseek.com/v1/chat', { signal: requestAc.signal })
+  const followed = requestSignal(request, undefined)
+  assert.notEqual(followed, null)
+  assert.equal(followed!.aborted, false)
+  requestAc.abort()
+  assert.equal(followed!.aborted, true)
+
+  // `init` overrides the Request's own signal, as the fetch spec says.
+  assert.equal(requestSignal(request, { signal: fromInit.signal }), fromInit.signal)
+  // A Request with no explicit signal still carries one; a bare URL does not.
+  assert.notEqual(requestSignal(new Request('https://api.deepseek.com/v1/chat'), undefined), null)
+  assert.equal(requestSignal('https://api.deepseek.com/v1/chat', undefined), null)
+  assert.equal(requestSignal(undefined, undefined), null)
+})
+
 
 // -- installFetchPatch --
 

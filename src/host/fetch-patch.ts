@@ -30,6 +30,102 @@ export interface FetchPatchDeps {
 }
 
 /**
+ * The call's own request signal, whichever fetch calling form carries it.
+ *
+ * Both forms have one: `fetch(url, init)` puts it on `init`, `fetch(new
+ * Request(url, init))` on the Request itself (`init` overriding it, as the
+ * fetch spec says). A provider adapter aborts that signal the moment it stops
+ * reading the response — `dsh-llm-deepseek`'s `generate()` aborts its consumer
+ * controller in a `finally` — so "the signal is aborted" is how a streamed
+ * provider call normally ends, not an error. See `mirrorBody`.
+ */
+export function requestSignal(input: unknown, init: RequestInit | undefined): AbortSignal | null {
+  const fromInit = init === undefined || init === null ? undefined : init.signal
+  if (fromInit) return fromInit
+  const candidate = input as { signal?: AbortSignal } | null | undefined
+  if (candidate === null || candidate === undefined || typeof candidate !== 'object') return null
+  const signal = candidate.signal
+  return signal === undefined || signal === null ? null : signal
+}
+
+/**
+ * Mirror a cloned response body into a record's body fields.
+ *
+ * Read through a reader and accumulate as chunks arrive, instead of awaiting
+ * `mirror.text()`.
+ *
+ * `text()` is all-or-nothing: it buffers every chunk internally and resolves
+ * only once the mirrored stream CLOSES. A terminal stream error therefore
+ * throws away the entire body — including chunks that had already been read.
+ * That is not a corner case here, it is the normal path: the adapter aborts
+ * the request signal as soon as it is done with the stream, the abort errors
+ * the mirror branch, and a provider SSE socket routinely outlives the last
+ * event the adapter consumed. Every streamed provider call was consequently
+ * recorded with `bodyText: ''` and `recorderError: 'mirror read failed: This
+ * operation was aborted'` — 349 of 349 captured `text/event-stream` responses,
+ * while all 19 non-streaming ones were fine.
+ *
+ * Accumulating per chunk keeps every byte the mirror actually delivered, which
+ * is what this plugin exists to store. A terminal failure on a request the
+ * caller has itself aborted is then the ordinary end of a streamed call rather
+ * than a recorder failure; anything else that ends the read early is still
+ * reported on the record, alongside the prefix that did arrive.
+ *
+ * `chars` counts the WHOLE body even when `text` is clipped, matching `clip()`
+ * on a fully read body, so `bodyChars` keeps meaning "how big was the body".
+ */
+async function mirrorBody(
+  mirror: Response,
+  response: Response,
+  record: WireRecord,
+  signal: AbortSignal | null,
+  maxBodyChars: number,
+): Promise<void> {
+  let text = ''
+  let chars = 0
+  const keep = (piece: string) => {
+    if (piece.length === 0) return
+    chars += piece.length
+    const room = maxBodyChars - text.length
+    if (room > 0) text += piece.length <= room ? piece : piece.slice(0, room)
+  }
+  try {
+    if (mirror.body !== null) {
+      const reader = mirror.body.getReader()
+      const decoder = new TextDecoder()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value !== undefined) keep(decoder.decode(value, { stream: true }))
+      }
+      // Flush a trailing multi-byte sequence the same way `text()` would.
+      keep(decoder.decode())
+    }
+  } catch (error: any) {
+    // Everything read before the failure is still a verbatim prefix of the
+    // wire body; the body fields below are written from it either way.
+    //
+    // Read the signal HERE, not when the mirror was started: the adapter
+    // aborts it at the end of the call, which is exactly what surfaces as the
+    // terminal read error this catch sees. The error's own NAME is
+    // deliberately not consulted — the same teardown arrives as an
+    // `AbortError` when undici's abort path raises it and as
+    // `TypeError: terminated` when the socket is destroyed underneath it, and
+    // both mean "the caller stopped reading this response". A read that dies
+    // while the call is still live is the genuine failure this field reports.
+    if (signal === null || !signal.aborted) {
+      record.recorderError = 'mirror read failed: ' + String((error && error.message) || error)
+    }
+  }
+  if (record.response !== null) {
+    record.response.bodyText = text
+    record.response.bodyChars = chars
+    record.response.bodyTruncated = chars > text.length
+  }
+  record.status = response.ok ? 'ok' : 'http-error'
+}
+
+/**
  * Wrap the real `fetch` so only provider calls are recorded.
  * @param real - the fetch implementation to wrap.
  * @param deps - the store operations the patch feeds records into.
@@ -146,21 +242,14 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
 
     // Deliberately not awaited: capturing must never add latency or block
     // the response the adapter is about to consume.
-    ;(async () => {
+    //
+    // `bodyJson` stays null here for the same reason it does on the request:
+    // it is derived on read from `bodyText`, never retained. That also removes
+    // a full parse of every non-SSE response body from this path.
+    const signal = requestSignal(input, init)
+    void (async () => {
       try {
-        const text = await mirror.text()
-        const bodyClipResp = clip(text, maxBodyChars)
-        record.response!.bodyText = bodyClipResp.text
-        record.response!.bodyChars = bodyClipResp.chars
-        record.response!.bodyTruncated = bodyClipResp.truncated
-        // `bodyJson` stays null here for the same reason it does on the
-        // request: it is derived on read from `bodyText`, never retained.
-        // That also removes a full parse of every non-SSE response body from
-        // the mirroring path.
-        record.status = response.ok ? 'ok' : 'http-error'
-      } catch (error: any) {
-        record.recorderError = 'mirror read failed: ' + String((error && error.message) || error)
-        record.status = response.ok ? 'ok' : 'http-error'
+        await mirrorBody(mirror, response, record, signal, maxBodyChars)
       } finally {
         finalize(record)
       }
