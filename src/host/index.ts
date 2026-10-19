@@ -46,31 +46,6 @@ import { createRecordArchive } from './persistence/archive.js'
 import type { CredentialProvider } from './curl.js'
 import { Config, resolveEffectiveConfig, type PluginConfig } from './config.js'
 
-// TEMP-DIAGNOSE begin — remove before committing.
-import { appendFileSync, existsSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { isFetchPatchActive, setFetchPatchDiagnostics } from './fetch-patch.js'
-
-const diagOn = (() => {
-  try {
-    return existsSync(join(homedir(), '.dsh', 'llm-wire-trace', 'diagnose-on'))
-  } catch {
-    return false
-  }
-})()
-function diag(line: string): void {
-  if (!diagOn) return
-  try {
-    appendFileSync(join(homedir(), '.dsh', 'llm-wire-trace', 'diagnose.log'), `${new Date().toISOString()} ${line}\n`)
-  } catch {
-    // ignore
-  }
-}
-diag(`module-eval active=${isFetchPatchActive()} fetch=${String(globalThis.fetch).slice(0, 60).replace(/\s+/g, ' ')}`)
-setFetchPatchDiagnostics((line) => diag(line))
-// TEMP-DIAGNOSE end
-
 export { createStepTracker } from './step-tracker.js'
 export { createWireTraceStore } from './store.js'
 export { buildRecordName, createRecordArchive } from './persistence/index.js'
@@ -131,7 +106,6 @@ export const name = 'llm-trace-plugin'
  * reached through `ctx.inject([...])` where it is actually needed.
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
-  diag('apply') // TEMP-DIAGNOSE
   const settings = config ?? {}
 
   // Durable half. On by default — surviving a restart is the entire point —
@@ -173,7 +147,6 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   // happen before another plugin's module body can run. See the note on
   // `name` above.
   ctx.effect(() => installFetchPatch((real) => store.wrapFetch(real)), 'llm-wire-trace: fetch patch')
-  diag(`patch-installed active=${isFetchPatchActive()}`) // TEMP-DIAGNOSE
 
   // Deliberately NOT loading disk records into the in-memory ring. The list
   // already merges memory and disk, so preloading would only duplicate what
@@ -253,7 +226,6 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
       }),
     )
     console.log(`llm-wire-trace: serving ${ROUTE_PREFIX}`)
-    diag(`route-registered active=${isFetchPatchActive()}`) // TEMP-DIAGNOSE
   })
 
   console.log('llm-wire-trace: fetch patched')

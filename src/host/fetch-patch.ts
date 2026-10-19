@@ -46,28 +46,6 @@ import { callContext } from './call-context.js'
 import { buildRecordName } from './persistence/naming.js'
 import type { WireRecord } from '../shared/record-shape.js'
 
-// TEMP-DIAGNOSE begin — remove before committing.
-type DiagSink = (line: string) => void
-let diagSink: DiagSink | null = null
-let diagSeen = 0
-export function setFetchPatchDiagnostics(sink: DiagSink | null): void {
-  diagSink = sink
-}
-let lastPatched: unknown = null
-export function isFetchPatchActive(): boolean {
-  return lastPatched !== null && globalThis.fetch === lastPatched
-}
-function diag(line: string): void {
-  if (diagSink === null || diagSeen > 1000) return
-  diagSeen += 1
-  try {
-    diagSink(line)
-  } catch {
-    // never let the diagnostic disturb the request path
-  }
-}
-// TEMP-DIAGNOSE end
-
 export interface FetchPatchDeps {
   maxBodyChars: number
   push(record: WireRecord): void
@@ -187,19 +165,6 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
     // headers carry another agent's identity (see this module's doc).
     const call = callContext.getStore() ?? null
     const ua = outgoingUserAgent(input, init)
-    // TEMP-DIAGNOSE begin
-    {
-      const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as any)?.url ?? String(input)
-      let host = '?'
-      try {
-        host = new URL(raw).host
-      } catch {
-        // keep '?'
-      }
-      const admitted = call !== null || ua.startsWith(USER_AGENT_PREFIX)
-      diag(`fetch ${admitted ? 'ADMIT ' : 'reject'} host=${host} inCall=${call !== null} ua=${String(ua).slice(0, 28)}`)
-    }
-    // TEMP-DIAGNOSE end
     if (call === null && !ua.startsWith(USER_AGENT_PREFIX)) return real(input, init)
 
     const info = describeRequest(input, init)
@@ -346,7 +311,6 @@ export function installFetchPatch(buildWrapped: (real: typeof fetch) => typeof f
   const patched = buildWrapped(original)
   globalThis.fetch = patched
   marked[PATCH_MARK] = true
-  lastPatched = patched // TEMP-DIAGNOSE
   return () => {
     if (globalThis.fetch === patched) globalThis.fetch = original
     delete marked[PATCH_MARK]
