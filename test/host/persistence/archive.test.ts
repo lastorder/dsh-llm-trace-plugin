@@ -117,6 +117,28 @@ test('sweep enforces maxRecords by deleting the oldest files first', async () =>
   })
 })
 
+test('retention is amortized by writes, so a short session never trims on its own', async () => {
+  await withTempDir(async (dir) => {
+    // Pre-existing excess, as a directory that drifted past the cap while every
+    // session wrote fewer than SWEEP_INTERVAL records: `save()` only sweeps on
+    // every 50th write and `sinceSweep` starts at zero on each boot, so nothing
+    // here would ever be deleted. That is why `apply()` forces a sweep once at
+    // startup — see the archive sweep in src/host/index.ts.
+    await writeFile(join(dir, `${buildRecordName(1000).slice(0, -5)}.json`), '{}')
+    await writeFile(join(dir, `${buildRecordName(2000).slice(0, -5)}.json`), '{}')
+    await writeFile(join(dir, `${buildRecordName(3000).slice(0, -5)}.json`), '{}')
+
+    const archive = createRecordArchive({ dir, maxRecords: 1 })
+    assert.equal((await archive.stats()).retained, 3)
+
+    await archive.save(makeRecord({ id: buildRecordName(4000).slice(0, -5), startedAt: 4000 }))
+    assert.equal((await archive.stats()).retained, 4)
+
+    await archive.sweep()
+    assert.equal((await archive.stats()).retained, 1)
+  })
+})
+
 test('sweepTemp removes orphan .tmp files left by an unclean shutdown', async () => {
   await withTempDir(async (dir) => {
     const archive = createRecordArchive({ dir })

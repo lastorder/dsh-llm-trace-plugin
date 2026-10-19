@@ -133,6 +133,8 @@ Files are written indented, and each body is stored twice: the verbatim `bodyTex
 
 Bodies are sized for a 1M-token context, so a record can be large. Two things keep the directory bounded: the 300-record cap, and `prettyBodyLimit` — past 500k characters the parsed readability copy is skipped, since no editor renders a multi-megabyte body usefully anyway and writing it would double the bytes for nothing. The viewer is unaffected either way: it re-parses from `bodyText`.
 
+The cap is enforced at startup and then amortized — a directory listing per record would cost more than writing the record — so up to 50 records can pile past it before the next trim in a long session. On start, the cap is applied exactly: a directory that had drifted past it (one live case held 380 files against a cap of 300, oldest two days old, because every session wrote fewer than 50 records and the write counter resets on each boot) is trimmed back before the plugin serves anything.
+
 In practice a typical request (a few hundred thousand characters) lands around 250MB across 300 records. The worst case — 300 consecutive full 1M-token requests — is roughly 1.3GB. Lower `maxPersistedRecords`, `maxBodyChars`, or both if that matters on your machine.
 
 ### The cost, stated plainly

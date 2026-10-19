@@ -154,6 +154,15 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   // toggle show identical content in both modes.
   if (archive !== null) {
     void archive.sweepTemp().catch(() => {})
+    // Retention is amortized while running — `save()` sweeps only every
+    // SWEEP_INTERVAL writes, because a readdir per record would dominate the
+    // cost of writing one — and that counter starts at zero on every boot. So
+    // a session that writes fewer than SWEEP_INTERVAL records would never trim
+    // at all, and a trace directory that had drifted past `maxPersistedRecords`
+    // (a live one held 380 files against a cap of 300, the oldest two days old)
+    // would stay past it indefinitely. Enforce the cap once here, where the
+    // cost is one readdir against a process that is still starting up.
+    void archive.sweep().catch(() => {})
   }
 
   // ------------------------------------------------------------------
