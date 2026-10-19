@@ -49,32 +49,36 @@ Every Cordis plugin — dynamic or file-based — is, at minimum, a module expor
 ```ts
 // src/host/index.ts (abridged)
 export const name = 'llm-trace-plugin'
-export const inject = ['webServer']
 
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   // ...
 }
 ```
 
-- **`inject`** declares hard dependencies. This plugin requires `webServer` (it registers an HTTP route), so Cordis waits for that service before calling `apply`. See [Services and dependencies](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/service).
-- **Optional services** are read with `ctx.get(name)` instead, so absence degrades gracefully rather than blocking load. This plugin's turn/step attribution needs `sessions` and `llm`, but works without them:
+- **This plugin deliberately declares no top-level `inject`.** `inject` names hard dependencies, and a Cordis fiber that has any stays *inactive* until every one of them exists — so `apply()` would wait for the `webServer` service before it ever installs the `fetch` patch. That wait is fatal for a plugin whose whole job is to be in place *before* other plugins evaluate their own modules: the Loader starts every entry concurrently at mount and imports an entry's module when that entry starts, so a gated `apply()` normally runs after the module bodies of every other entry have already executed. A provider plugin that captures `globalThis.fetch` at module scope (see the README's [Known limitation](../README.md#known-limitation)) has snapshotted the unpatched `fetch` by then, and nothing this plugin does later can reach it.
+- **Services are reached per use, with `ctx.inject(deps, callback)`.** The callback runs — in a child fiber tied to this plugin — once those services exist, so a service that arrives late, or never arrives at all, delays only the wiring that needs it and never the patch:
 
   ```ts
   // src/host/index.ts
-  if (ctx.get('sessions') !== undefined) {
-    ctx.on('session/event', (session, event) => tracker.observe(String(session.id), event))
-  }
-  if (ctx.get('llm') !== undefined) {
-    ctx.on('llm/stream', (options, next) => bindLlmStream(options, next, tracker))
-  }
+  ctx.inject(['sessions'], (sessions) => {
+    sessions.on('session/event', (session, event) => tracker.observe(String(session.id), event))
+  })
+  ctx.inject(['llm'], (llm) => {
+    llm.on('llm/stream', (options, next) => bindLlmStream(options, next, tracker))
+  })
+  ctx.inject(['webServer'], (web) => {
+    web.effect(() => web.webServer.register({ kind: 'prefix', path: routePrefix, handler: ... }))
+  })
   ```
 
-- **`ctx.effect(fn, label?)`** registers a side effect with an automatic disposer, so stopping or updating the plugin cleanly undoes it. This plugin uses it for both the `fetch` patch and the HTTP route:
+  Note which context each part uses: the route handler still reads `credentials`, `configEditor` and `fiber.entry` off the OUTER `ctx`, because `ctx.fiber` must be *this plugin's own* Loader entry for a config write to target its own row — the injected child fiber has none of its own.
+
+- **`ctx.get(name)`** is the other way to reach a service, for an optional one whose absence should degrade gracefully rather than block. It is only meaningful when the read happens at use time (as this plugin's `getCredentials`/`getConfigEditor` callbacks do): a check made while `apply()` runs, such as `if (ctx.get('sessions') !== undefined)`, answers for that instant — and with no `inject` gating `apply()`, that instant is now earlier than the services it asks about.
+- **`ctx.effect(fn, label?)`** registers a side effect with an automatic disposer, so stopping or updating the plugin cleanly undoes it. This plugin uses it for the `fetch` patch, and for the HTTP route inside its `webServer` injection:
 
   ```ts
   // src/host/index.ts
   ctx.effect(() => installFetchPatch((real) => store.wrapFetch(real)), 'llm-wire-trace: fetch patch')
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: routePrefix, handler: ... }))
   ```
 
 This repository additionally defines its own `PluginContext` type (a minimal structural subset of the real `Context`) instead of importing `@deepseek-ai/cordis` — see the doc comment on that interface in `src/host/index.ts` for why: it keeps the published package free of a host-runtime type dependency. A plugin developed inside the monorepo (following the official tutorials) would instead `import type { Context } from '@deepseek-ai/cordis'` directly, which is simpler and is what you should do unless you have the same "ship standalone, no monorepo" constraint.

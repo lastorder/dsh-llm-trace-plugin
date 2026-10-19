@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { installFetchPatch, requestSignal, wrapFetch } from '../../src/host/fetch-patch.js'
+import { bindLlmStream, callContext, type CallIdentity, type SettledCall } from '../../src/host/call-context.js'
+import { createStepTracker } from '../../src/host/step-tracker.js'
 import type { WireRecord } from '../../src/shared/record-shape.js'
 
 function harness() {
@@ -71,6 +73,149 @@ test('wrapFetch: a deepseek-harness/ call is recorded with request fields, and i
   // WireRecord.bodyJson.
   assert.equal(h.finalized[0].response!.bodyText, JSON.stringify({ ok: true }))
   assert.equal(h.finalized[0].response!.bodyJson, null)
+})
+
+// -- admission: the harness user-agent OR an active model call --
+//
+// The user-agent alone is not a contract this plugin can rely on: a provider
+// plugin that builds its own agent identity rewrites that header at the fetch
+// layer — the last layer it still controls — so a request issued inside one of
+// its model calls is admitted by the context bound to that call instead.
+
+/** A hand-built bound call identity, as `bindLlmStream` would create. */
+function fakeCall(overrides: Partial<CallIdentity> = {}): CallIdentity {
+  return {
+    sessionId: 'session-1',
+    turn: 3,
+    step: 1,
+    purpose: null,
+    provider: 'opencode-zen-free-provider',
+    model: 'deepseek-v4.1-flash-free',
+    observation: { requests: 0 },
+    ...overrides,
+  }
+}
+
+test('wrapFetch: a request issued inside a model call is recorded even with no harness user-agent', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}', { headers: { 'content-type': 'application/json' } })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const call = fakeCall()
+
+  const response = await callContext.run(call, () => patched('https://opencode.ai/inference/v1/responses', {
+    method: 'POST',
+    // The provider's own identity, per its own fetch layer. Nothing here says
+    // "harness", and the harness attribution it replaced is exactly what the
+    // old user-agent-only rule keyed on.
+    headers: { 'user-agent': 'opencode/1.2.3', 'content-type': 'application/json' },
+    body: '{"model":"deepseek-v4.1-flash-free"}',
+  }))
+
+  assert.equal(response.status, 200)
+  assert.equal(h.records.length, 1)
+  const record = h.records[0]
+  assert.equal(record.attributed, true)
+  assert.equal(record.provider, 'opencode-zen-free-provider')
+  assert.equal(record.sessionId, 'session-1')
+  assert.equal(record.turn, 3)
+  assert.equal(record.step, 1)
+  // Two different `model`s, deliberately: the wire body's own id, and the
+  // harness route's. Both are kept; neither is used to guess the other.
+  assert.equal(record.model, 'deepseek-v4.1-flash-free')
+  assert.equal(record.requestedModel, 'deepseek-v4.1-flash-free')
+  assert.equal(record.request.headers['user-agent'], 'opencode/1.2.3')
+})
+
+test('wrapFetch: each recorded request credits the model call it belongs to, once per attempt', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const call = fakeCall()
+
+  await callContext.run(call, () => patched('https://opencode.ai/inference/v1/responses', { headers: { 'user-agent': 'opencode/1' } }))
+  assert.equal(call.observation.requests, 1)
+  // A retry is a second request for the same call: the receipt counts requests,
+  // so "the provider sent something" cannot be mistaken for "nothing was sent".
+  await callContext.run(call, () => patched('https://opencode.ai/inference/v1/responses', { headers: { 'user-agent': 'opencode/1' } }))
+  assert.equal(call.observation.requests, 2)
+  assert.equal(h.records.length, 2)
+})
+
+test('wrapFetch: a request outside any model call still needs the harness user-agent', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  // No bound context, foreign agent: untouched, exactly as before.
+  await patched('https://opencode.ai/inference/v1/responses', { headers: { 'user-agent': 'opencode/1' } })
+  assert.deepEqual(h.records, [])
+})
+
+test('the receipt and the patch agree end to end: a fetches-inside-the-call provider reports requests > 0', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}', { headers: { 'content-type': 'text/event-stream' } })) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const reported: SettledCall[] = []
+  // The adapter fetches on the first pull, inside the bound context — the real
+  // shape of every provider call this plugin captures.
+  const inner: AsyncIterable<string> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<string>> {
+          await patched('https://api.deepseek.com/anthropic/v1/messages', {
+            method: 'POST',
+            headers: { 'user-agent': 'deepseek-harness/1.0' },
+            body: '{"model":"deepseek-chat"}',
+          })
+          return { done: true, value: undefined as any }
+        },
+      }
+    },
+  }
+
+  for await (const _chunk of bindLlmStream({ sessionId: 's1', provider: 'deepseek' }, () => inner, createStepTracker(), (call) => {
+    reported.push(call)
+  })) { /* drain */ }
+
+  assert.equal(reported.length, 1)
+  assert.equal(reported[0].requests, 1)
+  assert.equal(h.records.length, 1)
+})
+
+test('the receipt and the patch agree end to end: a provider that never reaches the patch reports requests 0', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const reported: SettledCall[] = []
+  // The provider's SDK was handed a `globalThis.fetch` snapshot taken before
+  // this patch existed, so the request never enters `patched` at all. Nothing
+  // on the fetch side can see that; the call's own receipt is what can.
+  //
+  // Sanity-check the patch first, so the empty record list below proves the
+  // request went AROUND it rather than that the patch is broken.
+  await patched('https://api.deepseek.com/probe', { headers: { 'user-agent': 'deepseek-harness/1.0' } })
+  assert.equal(h.records.length, 1, 'the patch is live in this process')
+  h.records.length = 0
+  h.finalized.length = 0
+  const inner: AsyncIterable<string> = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<string>> {
+          await real('https://opencode.ai/inference/v1/responses', { headers: { 'user-agent': 'opencode/1' } })
+          return { done: true, value: undefined as any }
+        },
+      }
+    },
+  }
+
+  for await (const _chunk of bindLlmStream({ sessionId: 's1', provider: 'opencode-zen-free-provider', model: 'zen-free' }, () => inner, createStepTracker(), (call) => {
+    reported.push(call)
+  })) { /* drain */ }
+
+  assert.equal(reported.length, 1)
+  assert.equal(reported[0].requests, 0)
+  assert.equal(reported[0].provider, 'opencode-zen-free-provider')
+  assert.deepEqual(h.records, [])
 })
 
 test('wrapFetch: bodies are never parsed into the ring — only `model` is read, once', async () => {

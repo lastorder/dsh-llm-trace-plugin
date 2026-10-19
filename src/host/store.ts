@@ -10,7 +10,7 @@ import { ARCHIVE_CACHE_TTL_MS, DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_RECORDS, LIST
 import { wrapFetch } from './fetch-patch.js'
 import { capacity, summarizePage, summarizeRecord } from './page-grouping.js'
 import { tryParseJson } from './http-utils.js'
-import { createCoverageTracker, providerKeyForRecord, type CoverageSnapshot } from './coverage.js'
+import { createCoverageTracker, providerKeyForModelCall, providerKeyForRecord, type CoverageSnapshot, type UntracedModelCallNotice } from './coverage.js'
 import type { ArchiveListResult, RecordArchive } from './persistence/archive.js'
 
 export interface WireTraceStoreOptions {
@@ -18,6 +18,12 @@ export interface WireTraceStoreOptions {
   maxBodyChars?: number
   /** Optional durable half. When absent the store behaves as a pure in-memory ring. */
   archive?: RecordArchive | null
+  /**
+   * Called once per provider the first time one of its model calls reaches no
+   * captured request; see `coverage.ts`. The store only reports it — deciding
+   * what to say and where is the host glue's job.
+   */
+  onUntracedModelCall?: (notice: UntracedModelCallNotice) => void
 }
 
 export interface ListOptions {
@@ -51,6 +57,12 @@ export interface StoreStats {
 export interface WireTraceStore {
   records: WireRecord[]
   wrapFetch(real: typeof fetch): typeof fetch
+  /**
+   * Report one settled model call (see `call-context.ts`'s `SettledCall`):
+   * `traced` says whether any request belonging to it was captured. Fed from
+   * the host glue's `llm/stream` observer; it never creates a record.
+   */
+  recordModelCall(provider: string | null, traced: boolean, model?: string | null): void
   list(options?: ListOptions | number): ListPage
   listAll(options?: ListAllOptions): Promise<ListAllPage>
   stats(): Promise<StoreStats>
@@ -68,7 +80,7 @@ export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): Wire
   const maxBodyChars = storeOptions?.maxBodyChars || DEFAULT_MAX_BODY_CHARS
   const archive = storeOptions?.archive ?? null
   const records: WireRecord[] = []
-  const coverage = createCoverageTracker()
+  const coverage = createCoverageTracker({ onFirstUntracedCall: storeOptions?.onUntracedModelCall })
 
   function push(record: WireRecord) {
     coverage.record(providerKeyForRecord(record.provider, record.request.url), record.attributed)
@@ -185,6 +197,10 @@ export function createWireTraceStore(storeOptions?: WireTraceStoreOptions): Wire
 
     wrapFetch(real) {
       return wrapFetch(real, { maxBodyChars, push, finalize })
+    },
+
+    recordModelCall(provider, traced, model = null) {
+      coverage.recordModelCall(providerKeyForModelCall(provider), traced, model)
     },
 
     /**

@@ -49,32 +49,36 @@
 ```ts
 // src/host/index.ts（节选）
 export const name = 'llm-trace-plugin'
-export const inject = ['webServer']
 
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   // ...
 }
 ```
 
-- **`inject`** 声明硬依赖。本插件需要 `webServer`（它要注册一个 HTTP 路由），所以 Cordis 会等这个服务就绪之后才调用 `apply`。详见 [Services and dependencies](https://deepseek-harness.github.io/deepseek-harness/en/develop/framework/service)。
-- **可选服务**改用 `ctx.get(name)` 读取，缺失时优雅降级而不是阻塞加载。本插件的 turn/step 归属功能需要 `sessions` 和 `llm`，但没有它们也能正常工作：
+- **本插件刻意不在顶层声明 `inject`。** `inject` 用来声明硬依赖，而任何带 `inject` 的 Cordis fiber 都会一直处于 *inactive* 状态，直到这些服务全部就绪——也就是说 `apply()` 会先等 `webServer`，然后才去装 `fetch` 补丁。对于一个"职责就是在别的插件求值自身模块之前先就位"的插件来说，这个等待是致命的：Loader 在挂载时并发启动所有 entry，并在某个 entry 启动时 import 它的模块，因此被闸住的 `apply()` 通常会在其他所有 entry 的模块体都执行完之后才运行。此时，某个在模块作用域里捕获 `globalThis.fetch` 的提供方插件（见 README 的[已知限制](../README.zh.md#已知限制)）早就把未经补丁的 `fetch` 拷走了，本插件之后再做什么都够不到它。
+- **服务改为按需获取：`ctx.inject(deps, callback)`。** 回调会在这些服务就绪后运行（运行在一个绑定到本插件生命周期的子 fiber 里），因此某个服务姗姗来迟、甚至永不出现，都只会推迟需要它的那部分接线，而永远不会推迟补丁本身：
 
   ```ts
   // src/host/index.ts
-  if (ctx.get('sessions') !== undefined) {
-    ctx.on('session/event', (session, event) => tracker.observe(String(session.id), event))
-  }
-  if (ctx.get('llm') !== undefined) {
-    ctx.on('llm/stream', (options, next) => bindLlmStream(options, next, tracker))
-  }
+  ctx.inject(['sessions'], (sessions) => {
+    sessions.on('session/event', (session, event) => tracker.observe(String(session.id), event))
+  })
+  ctx.inject(['llm'], (llm) => {
+    llm.on('llm/stream', (options, next) => bindLlmStream(options, next, tracker))
+  })
+  ctx.inject(['webServer'], (web) => {
+    web.effect(() => web.webServer.register({ kind: 'prefix', path: routePrefix, handler: ... }))
+  })
   ```
 
-- **`ctx.effect(fn, label?)`** 注册一个带自动销毁器的副作用，插件停止或更新时会被干净地撤销。本插件用它同时管理 `fetch` 补丁和 HTTP 路由：
+  注意每一部分用的是哪个 context：路由处理器依然从**外层** `ctx` 读取 `credentials`、`configEditor` 和 `fiber.entry`，因为写配置时必须让 `ctx.fiber` 指向*本插件自己*的 Loader entry——被注入出来的那个子 fiber 没有自己的 entry。
+
+- **`ctx.get(name)`** 是获取服务的另一种方式，适合那些"缺失时应当优雅降级、而不是阻塞加载"的可选服务。它只在使用时读取才有意义（本插件的 `getCredentials`/`getConfigEditor` 回调就是这么做的）：在 `apply()` 执行期间做一次 `if (ctx.get('sessions') !== undefined)` 这样的判断，回答的只是那一瞬间的状态——而在不再用 `inject` 闸住 `apply()` 之后，这一瞬间比它所询问的那些服务更早。
+- **`ctx.effect(fn, label?)`** 注册一个带自动销毁器的副作用，插件停止或更新时会被干净地撤销。本插件用它管理 `fetch` 补丁，以及在 `webServer` 注入里注册的 HTTP 路由：
 
   ```ts
   // src/host/index.ts
   ctx.effect(() => installFetchPatch((real) => store.wrapFetch(real)), 'llm-wire-trace: fetch patch')
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: routePrefix, handler: ... }))
   ```
 
 本仓库还额外定义了自己的 `PluginContext` 类型（真实 `Context` 的一个最小结构子集），而不是直接 import `@deepseek-ai/cordis`——原因见 `src/host/index.ts` 里那个接口上方的注释：这样能让发布出去的包不带 host 运行时的类型依赖。如果你的插件是在 monorepo 内按官方教程开发的，直接 `import type { Context } from '@deepseek-ai/cordis'` 会更简单，也是推荐做法——除非你也有和本项目一样"独立发布、不依赖 monorepo"的约束。

@@ -10,6 +10,7 @@ function fakeStore(overrides: Partial<WireTraceStore> = {}): WireTraceStore {
   return {
     records: [],
     wrapFetch: (real) => real,
+    recordModelCall: () => {},
     list: () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0 }),
     listAll: async () => ({ items: [], unattributed: 0, turns: [], auxiliary: 0, total: 0, matched: 0, persistence: false, truncated: false, historyPending: false }),
     stats: async () => ({ persistence: false, memory: 0, coverage: { since: 0, providers: [] } }),

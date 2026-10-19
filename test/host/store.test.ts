@@ -333,3 +333,40 @@ test('stats: coverage is not reset by clear()', async () => {
   const stats = await store.stats()
   assert.equal(stats.coverage.providers.length, 1)
 })
+
+test('stats: recordModelCall counts model calls and how many of them went untraced', async () => {
+  const store = createWireTraceStore()
+  store.recordModelCall('opencode-zen-free-provider', false, 'zen-free')
+  store.recordModelCall('opencode-zen-free-provider', false, 'zen-free')
+  store.recordModelCall('deepseek', true, 'deepseek-chat')
+  const byProvider = new Map((await store.stats()).coverage.providers.map((p) => [p.provider, p]))
+  assert.equal(byProvider.get('opencode-zen-free-provider')!.modelCalls, 2)
+  assert.equal(byProvider.get('opencode-zen-free-provider')!.untracedCalls, 2)
+  assert.equal(byProvider.get('deepseek')!.modelCalls, 1)
+  assert.equal(byProvider.get('deepseek')!.untracedCalls, 0)
+})
+
+test('stats: a model call with no provider name at all buckets under "unknown" rather than being dropped', async () => {
+  const store = createWireTraceStore()
+  store.recordModelCall(null, false)
+  const providers = (await store.stats()).coverage.providers
+  assert.equal(providers.length, 1)
+  assert.equal(providers[0].provider, 'unknown')
+  assert.equal(providers[0].untracedCalls, 1)
+})
+
+test('stats: recordModelCall never creates a record — a model call is not a captured request', async () => {
+  const store = createWireTraceStore()
+  store.recordModelCall('zen', false, 'zen-free')
+  assert.deepEqual(store.records, [])
+  assert.equal((await store.stats()).memory, 0)
+})
+
+test('stats: onUntracedModelCall fires once per provider for the glue to warn about', async () => {
+  const notices: any[] = []
+  const store = createWireTraceStore({ onUntracedModelCall: (notice) => { notices.push(notice) } })
+  store.recordModelCall('zen', false, 'zen-free')
+  store.recordModelCall('zen', false, 'zen-free')
+  store.recordModelCall('zen', true, 'zen-free')
+  assert.deepEqual(notices, [{ provider: 'zen', model: 'zen-free', untracedCalls: 1 }])
+})

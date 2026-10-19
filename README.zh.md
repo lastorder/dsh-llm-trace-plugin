@@ -82,6 +82,7 @@ host 侧的插件行位于 [`cordis.patch.yml`](cordis.patch.yml)，支持以下
 以上每一项也都可以在 DSH 自带的插件页（设置 → 插件 → `dsh-llm-trace-plugin`）中编辑，这是本插件通过 `plugins.bundle.config` Slot 提供的内容。该面板展示：
 
 - **本地缓存**：当前内存中保留的记录数，以及（`persist` 开启时）磁盘上已持久化的记录数，与 `maxPersistedRecords` 上限对比。
+- **抓包缺口提示**：当 host 汇报某个提供方的模型调用一条请求都没被抓到时显示——即[「如何察觉」](#如何察觉)里描述的结论。
 - **清除全部历史记录**：一键清空所有 session 的记录（内存与磁盘）——这与 Wire Trace 标签页自身的 `Clear` 按钮不同，后者只清空打开该标签页所在的那个 session（见[按 session 过滤](#按-session-过滤)）。
 - **上表中的每一项参数**，预填为当前生效的值。
 
@@ -157,12 +158,13 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 ## 工作原理
 
-1. 在 `apply` 时，用一个包装函数替换 `globalThis.fetch`，并保留原始引用。`ctx.effect` 把 disposer（负责恢复原始引用）绑定到插件的 fiber 上，因此停止、卸载或激活失败都不会留下一个悬空的、已被打补丁的 `fetch`。
-2. 每次调用都会检查其外发的 `user-agent` 头是否以 `deepseek-harness/` 开头 —— 这是 `attributionHeaders()` 给*每一个*提供方请求都会打上的值，与由哪个适配器发出无关（参见 `@deepseek-ai/dsh-llm` 的 `APP_IDENTITY`）。其他所有请求（`web_fetch` 工具、`web_search`、MCP 传输……）都会完全原样透传：不记录、不克隆，参数相同，返回值相同。
-3. 对于匹配到的调用，先执行真实的 `fetch`。那个**原始的、未被读取过的** `response` 会原封不动地交回给适配器 —— 它的 SSE 解析、计时和错误处理完全不受影响。
+1. 在 `apply` 时，用一个包装函数替换 `globalThis.fetch`，并保留原始引用。`ctx.effect` 把 disposer（负责恢复原始引用）绑定到插件的 fiber 上，因此停止、卸载或激活失败都不会留下一个悬空的、已被打补丁的 `fetch`。这次替换不等任何东西：本插件刻意不声明 `inject`，因为带 `inject` 的 Cordis fiber 会一直处于 inactive 状态直到所有依赖就绪，而某个在模块求值时读取 fetch 槽位的提供方插件，只有在它的模块体运行之前包装函数已经就位时才够得到（参见[「已知限制」](#已知限制)）。本插件用到的每个服务都改为按需获取，因此 web 服务迟迟不来，只会推迟本插件自己的路由，永远不会推迟抓包。
+2. 每次调用由两个相互独立的信号之一放行：外发的 `user-agent` 头以 `deepseek-harness/` 开头 —— 这是 `attributionHeaders()` 给*每一个*由 harness 发出的提供方请求都会打上的值（参见 `@deepseek-ai/dsh-llm` 的 `APP_IDENTITY`）——**或者**该请求是在一次活跃的 `llm/stream` 调用内部发出的，也就是本插件为归属而绑定的那份 async context（参见 `call-context.ts`）。其他所有请求（`web_fetch` 工具、`web_search`、MCP 传输……）都会完全原样透传：不记录、不克隆，参数相同，返回值相同。第二个信号之所以存在，是因为 user-agent 不是本插件能强加给别人的契约：某个自行构造 agent 身份的提供方插件会在 fetch 层改写这个头（在 harness 已经合并进自己的归属标识之后，那是它仍然控制的最后一层），而在一次模型调用内部发出的请求，无论它自称什么，都是提供方流量。
+3. 对于放行的调用，先执行真实的 `fetch`。那个**原始的、未被读取过的** `response` 会原封不动地交回给适配器 —— 它的 SSE 解析、计时和错误处理完全不受影响。
 4. 在后台镜像一份 `response.clone()`（绝不在热路径上 `await`），从而在不干扰适配器正在读取的原始流的前提下捕获响应体。镜像按 chunk 逐段读取，而不是用 `text()`：每一次流式调用结束时，适配器都会主动 abort 自己的请求（`dsh-llm-deepseek` 在其 `finally` 中 abort 自己的 consumer controller），而 socket 往往在适配器读完最后一个事件之后仍然开着；`text()` 只在「干净关闭」时才 resolve，因此它会把已经完整收到的响应体一并 reject 掉、全部丢弃。
+5. 每一条被放行的请求都会记在它所属的那次模型调用账上，而每一次 `llm/stream` 调用在结束时都会上报 —— 于是一次「没有任何请求被抓到」的模型调用会变成 `GET /llm-wire-trace/stats` 里 `coverage` 的一个数字、host 端的一行告警、以及插件管理页上的一处提示，而不是一份无声无息、空空如也的 trace。参见[「如何察觉」](#如何察觉)。
 
-两个随附的适配器（`dsh-llm-deepseek`、`dsh-llm-pi-ai`）都是直接调用裸的 `fetch` 标识符、没有本地 import，因此它们在调用时解析到的就是当时的 `globalThis.fetch` —— 这正是本补丁无论模块加载顺序如何都能生效的原因。
+两个随附的适配器（`dsh-llm-deepseek`、`dsh-llm-pi-ai`）都是直接调用裸的 `fetch` 标识符、没有本地 import，因此它们在调用时解析到的就是当时的 `globalThis.fetch` —— 这正是本补丁**对它们而言**无论模块加载顺序如何都能生效的原因。这并不是本插件能强加给第三方提供方插件的性质：如果某个提供方在模块求值时就把 `globalThis.fetch` 拷进一个模块级常量、再把这份拷贝注入自家 SDK，它对本插件就是不可见的，因为它的请求根本不会进入包装函数。bundle 顺序是剩下的那个杠杆 —— Loader 按 `dsh.profile.bundles` 的顺序逐层应用每个 bundle 的 patch 来组装 entry 列表，并在某个 entry 启动时 import 它的模块，因此把本插件排在这样一个提供方**之前**，才能让包装函数在那个提供方的模块体读取槽位之前就位。要注意这类插件默认会落在什么位置：DSH 自己的插件管理器每装一个新 bundle 都追加到列表**末尾**，而那恰好是错误的一端。参见[「已知限制」](#已知限制)。
 
 ## 安全性
 
@@ -406,19 +408,38 @@ content 和 reasoning-content 的增量按线路顺序拼接；工具调用被�
 
 ## 已知限制
 
-本插件依赖于这样一个实现细节：当前所有的提供方适配器都调用裸的、未经 import 的 `fetch`。如果未来某个适配器改用自带的 HTTP 客户端（例如某个 SDK 内置了自己的 `undici` 实例），它对本补丁就是不可见的 —— 而且是静默不可见，不会报错。这是 fetch 补丁这一方案的固有局限，而非本插件的缺陷。
+本插件依赖于这样一个实现细节：当前所有的提供方适配器都调用裸的、未经 import 的 `fetch`。下面每一种失效形态的表现都一样：某次模型调用的请求从未进入那个包装函数，于是既没有记录、也没有报错、磁盘上也没有任何东西可查。共有三种成因：
 
-**`globalThis.fetch` 这个槽位是整个进程共享的，本补丁只有在它始终保持「当前生效」时才有效。** Node 内置的 `fetch` 与 npm 的 `undici` 包共用同一个全局 dispatcher 槽位（`Symbol.for('undici.globalDispatcher.*')`），因此进程中**任何其他地方**——另一个插件、未来的某个适配器、某个传递依赖——只要 `import('undici')`，就可能在本插件已经装好包装函数**之后**，悄悄替换掉 `globalThis.fetch` 或它的 dispatcher。一旦发生，抓包会无声无息地停止：适配器照常工作，只是不再出现在 trace 里而已。顺序反过来也是同样的效果：如果本插件先装上补丁，随后另一方才替换掉该槽位，那么被悄悄绕过的就是本插件自己的包装函数。
+1. **提供方自带 HTTP 客户端。** 某个适配器如果改用它自带的 SDK 传输层（自己的 `undici` 实例、预先配置好的 client），而不是全局 `fetch`，就永远进不了包装函数。
+2. **提供方把 fetch 槽位拷走了。** 提供方插件可能在模块求值时读取一次 `globalThis.fetch`，存进模块级常量，再把这份拷贝注入自家 SDK。`@jiesou/dsh-opencode-zen-free-provider` 正是这么做的 —— `const zenNativeFetch = globalThis.fetch`，随后作为 `fetch:` 传进每一次模型流 —— 因此如果这次快照发生在本插件 `apply()` 装好包装函数**之前**，它之后发出的每一次模型调用都会直接打到原始的 `fetch`，永远如此。决定这一点的是 bundle 顺序：Loader 按 `dsh.profile.bundles` 的顺序逐层应用每个 bundle 的 patch 来组装 entry 列表，并在某个 entry 启动时 import 它的模块，所以本插件必须排在这样一个提供方**之前**。在列表里把它往前挪然后重启 host —— 而且在装了别的东西之后要回头检查一下位置，因为 DSH 的插件管理器会把新 bundle 追加到末尾。
+3. **槽位被替换掉了。** Node 内置的 `fetch` 与 npm 的 `undici` 包共用同一个全局 dispatcher 槽位（`Symbol.for('undici.globalDispatcher.*')`），因此进程中**任何其他地方**——另一个插件、未来的某个适配器、某个传递依赖——只要 `import('undici')`，就可能在本插件已经装好包装函数**之后**，悄悄替换掉 `globalThis.fetch` 或它的 dispatcher。顺序反过来也是同样的效果：谁后包装，谁就拥有那个槽位；另一方的抓包无声无息地失效。
 
-具体而言：
+还有两点值得说明白：
 
-- **不要把本插件与另一个同样会给 `globalThis.fetch` 打补丁的插件一起安装。** 双方都没有可靠的办法察觉对方也这么做了——现有的「已打补丁」防护（`installFetchPatch` 的 `PATCH_MARK` symbol）只能拦住*本插件自身*的重复安装，拦不住另一个实现包装同一个全局对象。谁后包装，谁就悄悄赢得那个槽位；另一方的抓包无声无息地失效，没有任何诊断信息。
-- **某个通过自带 SDK 传输层路由的提供方**（为你新增的任何提供方都应验证这一点——`dsh-llm-pi-ai` 通过 `pi-ai` SDK 路由，应确认其传输层确实解析的是全局 `fetch`，而不是内置的另一份）同样是不可见的，原因相同。
-- **察觉上述任一失效情形的实际办法**：`GET /llm-wire-trace/stats` 会汇报一个 `coverage` 对象——自进程启动以来按提供方统计的调用计数（`{ provider, calls, attributedCalls, lastSeenAt }`），按调用量从多到少排序。如果某个你确知正在发起调用的提供方在这里显示为零（或明显偏低），这就是本补丁失去全局槽位、或者该提供方流量根本没有经过 `globalThis.fetch` 的可观测症状。这个计数器刻意只在进程生命周期内有效——它是一个实时健康信号，不是历史记录，也不会因为清空 trace 而被重置。
+- **不要把本插件与另一个同样会给 `globalThis.fetch` 打补丁的插件一起安装。** 双方都没有可靠的办法察觉对方也这么做了——现有的「已打补丁」防护（`installFetchPatch` 的 `PATCH_MARK` symbol）只能拦住*本插件自身*的重复安装，拦不住另一个实现包装同一个全局对象。
+- **user-agent 不是放行契约。** 一条请求被放行，要么靠 harness 的 `deepseek-harness/` user-agent，要么靠它是在一次 `llm/stream` 调用内部发出的 —— 正因为提供方可能改写那个头。所以「放行」这一侧从不会丢请求；会丢请求的只有「包装函数根本没被走到」这一种情形。
 
-因此，请把本插件当作调试 profile 的一部分，而非永久安装项；并且要谨慎考虑同一 profile 里还有什么其他东西也在动 `fetch`。
+### 如何察觉
+
+`GET /llm-wire-trace/stats` 会汇报一个 `coverage` 对象，按提供方一行，把问题的两侧都数出来：
+
+```json
+{"since": 1792374023811, "providers": [
+  {"provider": "opencode-zen-free-provider", "calls": 0, "attributedCalls": 0,
+   "modelCalls": 12, "untracedCalls": 12, "lastSeenAt": 1792375125343}
+]}
+```
+
+- `calls` / `attributedCalls` 统计**确实被抓到**的 wire 记录。
+- `modelCalls` / `untracedCalls` 统计 harness 自己发起的模型调用（每次 `llm/stream` 记一次），以及其中有多少次结束时一条请求都没抓到。
+
+`untracedCalls > 0` 是上述任何一种失效形态都藏不住的诊断：一个发出了模型调用却什么都拿不出来的提供方，要么绕过了包装函数，要么根本没走网络。这些行按 `untracedCalls` 从多到少排序，所以最该看的就是第一行。host 端也会在某个提供方首次出现这种情况时打一行 `console.warn`，插件管理页会就地显示同样的结论。而 `modelCalls: 0` 且 `calls: 0` 的提供方，只是本插件从它身上什么都没看到 —— 既没有流量、也没有模型调用 —— 这与「`calls: 0` 但 `modelCalls` 不为零」是两回事。
+
+这些计数器刻意只在进程生命周期内有效——它是一个实时健康信号，不是历史记录，也不会因为清空 trace 而被重置。
 
 harness 坐标（turn / step）另有一层不同的依赖：它们来自 `llm/stream` 与 `session/event` 两个通道，而不是 fetch。因此**不经过 `ctx.llm` 的调用可以被抓包、却无法被归属**（记为 `attributed: false`）；反过来，某个绕开裸 `fetch` 的适配器会同时丢失抓包与坐标。两者都属于如实报告的缺口，不会被猜测填补。
+
+因此，请把本插件当作调试 profile 的一部分，而非永久安装项；并且要谨慎考虑同一 profile 里还有什么其他东西也在动 `fetch`。
 
 ## 仓库结构
 
@@ -430,10 +451,10 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
   config.ts                    PluginConfig 及其运行时 Config schema，以及 resolveEffectiveConfig（不依赖 Cordis，有单元测试）
   constants.ts                共享常量（user-agent 前缀、header 名、默认值）
   http-utils.ts               header 脱敏、请求解析、JSON/body 裁剪
-  call-context.ts             围绕 llm/stream 的 AsyncLocalStorage 绑定（turn/step/purpose/provider）
+  call-context.ts             围绕 llm/stream 的 AsyncLocalStorage 绑定（turn/step/purpose/provider），外加每次调用「抓到了多少请求」的收据
   step-tracker.ts              基于 session/event 的 turn/step 跟踪
-  coverage.ts                   按提供方统计的抓包健康计数器，经 stats() 暴露
-  fetch-patch.ts                globalThis.fetch 补丁本身
+  coverage.ts                   按提供方统计的抓包健康计数器 —— 既数抓到的记录，也数「什么都没抓到」的模型调用 —— 经 stats() 暴露
+  fetch-patch.ts                globalThis.fetch 补丁本身（放行条件：harness user-agent，或处于活跃的 llm/stream 调用中）
   curl.ts                       curl 命令渲染与密钥解析
   store.ts                      内存环与持久化归档的合并视图
   page-grouping.ts              列表分页分组（turn、辅助调用、无归属统计）
@@ -446,7 +467,7 @@ src/host/                    host 半边（Node ESM，由 tsc 逐文件编译）
 src/client/                   浏览器半边（由 esbuild 打包为单个经典脚本）
   entry.ts                     window.__ModuleLoader__.load({ id, factory }) 包裹；唯一把 strings.ts 绑定到 DSH ctx.locale 服务的文件
   wire-trace-view.ts            WireTraceView 组件（状态与渲染）
-  plugin-manage-view.ts         插件管理页面板（本地缓存统计、清除全部历史记录、每一项 Config 参数）
+  plugin-manage-view.ts         插件管理页面板（本地缓存统计、抓包缺口提示、清除全部历史记录、每一项 Config 参数）
   view-model.ts                 视图背后的纯列表/详情逻辑（不依赖 DOM，有单元测试）
   strings.ts                    双语（zh/en）locale 词典，覆盖每一条面向用户的文案，注册进 ctx.locale
   json-view.ts                   可折叠 JSON 树组件

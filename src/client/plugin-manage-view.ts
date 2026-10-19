@@ -203,6 +203,29 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
         ? t('manage.statsLine', { memory: stats.memory, retained: stats.retained ?? 0, maxRecords: stats.maxRecords ?? '—' })
         : t('manage.statsLineNoPersist', { memory: stats.memory }))
 
+    /**
+     * The one coverage row worth showing: a provider whose model calls produced
+     * NO captured request. The host's `coverage` is ordered with untraced calls
+     * first, but this scans rather than indexing, so an older host build (whose
+     * rows carry no `untracedCalls` at all) simply shows nothing instead of
+     * rendering `undefined`.
+     *
+     * This is the difference between a trace that is empty because nothing was
+     * captured and one that is empty because the provider's transport never
+     * reached the fetch patch — the distinction this page could not previously
+     * make at all; see the README's "Known limitation".
+     */
+    const untracedProvider = stats === null || stats.coverage === undefined || !Array.isArray(stats.coverage.providers)
+      ? null
+      : stats.coverage.providers.find((entry: any) => Number(entry && entry.untracedCalls) > 0) ?? null
+    const captureWarning = untracedProvider === null
+      ? null
+      : h('div', { className: 'wt-err', key: 'capture-warning' }, t('manage.captureWarning', {
+        provider: untracedProvider.provider,
+        untraced: untracedProvider.untracedCalls,
+        modelCalls: untracedProvider.modelCalls,
+      }))
+
     const fieldRows = CONFIG_FIELDS.map((field) => {
       const draft = drafts[field.key] ?? ''
       const disabled = configUsingDefaults || configState === null || configState.editable === false || savingField === field.key
@@ -255,6 +278,7 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
         }, t('manage.clearAllButton')),
       ]),
       statsError === null ? null : h('div', { className: 'wt-err', key: 'stats-err' }, t('manage.statsError', { message: statsError })),
+      captureWarning,
       clearNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'clear-notice' }, clearNotice),
       h('div', { className: 'wt-manage-fields', key: 'fields' }, [
         h('div', { className: 'wt-manage-fields-label', key: 'label' }, t('manage.fieldsLabel')),

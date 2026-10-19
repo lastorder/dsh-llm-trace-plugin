@@ -85,6 +85,7 @@ The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these opt
 Every key above is also editable from DSH's own Plugins page (Settings → Plugins → `dsh-llm-trace-plugin`), which this plugin populates through the `plugins.bundle.config` Slot. That panel shows:
 
 - **Local cache**: how many records are currently held in memory, and (when `persist` is on) how many are persisted on disk, against `maxPersistedRecords`.
+- **A capture-gap warning**, when the host reports a provider whose model calls produced no captured request at all — the finding described under ["Noticing it"](#noticing-it).
 - **Clear all history**: a page-wide wipe of every session's records, memory and disk — distinct from the Wire Trace tab's own `Clear` button, which is scoped to the session it was opened from (see [Filtering by session](#filtering-by-session)).
 - **Every parameter in the table above**, pre-filled with the value currently in effect.
 
@@ -160,12 +161,13 @@ A dynamic Cordis Host package's code runs inside an isolated `node:vm` realm. Th
 
 ## How it works
 
-1. On `apply`, replace `globalThis.fetch` with a wrapper, keeping the original reference. `ctx.effect` ties the disposer (which restores the original reference) to the plugin's fiber, so a stop, uninstall, or failed reactivation cannot leave a dangling patched `fetch`.
-2. Every call is inspected for an outgoing `user-agent` header starting with `deepseek-harness/` — the value `attributionHeaders()` stamps on *every* provider request regardless of which adapter sends it (see `@deepseek-ai/dsh-llm`'s `APP_IDENTITY`). Anything else (the `web_fetch` tool, `web_search`, MCP transports, …) passes through completely untouched: not recorded, not cloned, same arguments, same return value.
+1. On `apply`, replace `globalThis.fetch` with a wrapper, keeping the original reference. `ctx.effect` ties the disposer (which restores the original reference) to the plugin's fiber, so a stop, uninstall, or failed reactivation cannot leave a dangling patched `fetch`. That swap waits for nothing: this plugin deliberately declares no `inject`, because a Cordis fiber with injected services stays inactive until every one of them exists — and a provider plugin that reads the fetch slot at module-evaluation time is only reachable if the wrapper is already installed when that module body runs (see ["Known limitation"](#known-limitation)). Each service this plugin uses is instead reached per use, so a late web server delays only the plugin's own routes, never the capture.
+2. Every call is admitted by one of two independent signals: an outgoing `user-agent` header starting with `deepseek-harness/` — the value `attributionHeaders()` stamps on *every* harness-issued provider request (see `@deepseek-ai/dsh-llm`'s `APP_IDENTITY`) — **or** the request being issued inside an active `llm/stream` call, the async context this plugin already binds for attribution (see `call-context.ts`). Anything else (the `web_fetch` tool, `web_search`, MCP transports, …) passes through completely untouched: not recorded, not cloned, same arguments, same return value. The second signal exists because the user-agent is not a contract this plugin can impose: a provider plugin that builds its own agent identity rewrites that header at the fetch layer — the last layer it still controls once the harness has merged its attribution in — and a request sent from inside a model call is provider traffic whatever it calls itself.
 3. For a matched call, the real `fetch` runs first. The **original, unread** `response` goes back to the adapter exactly as it would have otherwise — its SSE parsing, timing, and error handling are completely unaffected.
 4. A `response.clone()` is mirrored in the background (never `await`-ed on the hot path) to capture the response body without disturbing the original stream the adapter is reading. The mirror is read chunk by chunk, not with `text()`: every streamed call ends with the adapter aborting its own request (`dsh-llm-deepseek` aborts its consumer controller in a `finally`) against a socket that outlives the last event it consumed, and `text()` resolves only on a clean close — so it would reject and discard a body it had already received in full.
+5. Each admitted request is credited to the model call it belongs to, and each `llm/stream` call reports when it settles — so a model call that produced no captured request at all becomes a number under `GET /llm-wire-trace/stats`'s `coverage`, a one-line host warning, and a notice on the plugin management page, instead of a silently empty trace. See ["Noticing it"](#noticing-it).
 
-Both shipped adapters (`dsh-llm-deepseek`, `dsh-llm-pi-ai`) call the bare `fetch` identifier with no local import, so they resolve whatever `globalThis.fetch` is at call time — which is exactly what makes this patch effective regardless of module load order.
+Both shipped adapters (`dsh-llm-deepseek`, `dsh-llm-pi-ai`) call the bare `fetch` identifier with no local import, so they resolve whatever `globalThis.fetch` is at call time — which is what makes this patch effective regardless of module load order **for them**. It is not a property this plugin can impose on a third-party provider plugin: one that snapshots `globalThis.fetch` at module-evaluation time and injects the copy into its SDK is invisible here, because its requests never enter the wrapper at all. Bundle order is the remaining lever — the Loader composes the entry list by applying each bundle's patch layer in `dsh.profile.bundles` order and imports an entry's module when that entry starts, so listing this plugin **before** such a provider is what puts the wrapper in place before that provider's module body reads the slot. Note where such a plugin lands by default: DSH's own plugin manager appends each newly installed bundle to the end of the list, which is exactly the wrong end. See ["Known limitation"](#known-limitation).
 
 ## Safety properties
 
@@ -409,15 +411,36 @@ The left record list and the right detail pane are meant to scroll independently
 
 ## Known limitation
 
-This plugin depends on the implementation detail that every current provider adapter calls the bare, unimported `fetch`. A future adapter that instead uses its own HTTP client (e.g. an SDK bundling its own `undici` instance) would be invisible to this patch — silently, not as an error. That is an inherent limit of the fetch-patch approach, not a bug in this plugin.
+This plugin depends on the implementation detail that every current provider adapter calls the bare, unimported `fetch`. Every failure mode below has the same shape: a model call's request never enters that wrapper, so there is no record, no error, and nothing on disk to inspect. Three ways it happens:
 
-**The `globalThis.fetch` slot is shared process-wide, and this patch is only effective while it stays the active one.** Node's built-in `fetch` and npm's `undici` package share the same global dispatcher slot (`Symbol.for('undici.globalDispatcher.*')`), so merely `import('undici')` **anywhere else in the process** — another plugin, a future adapter, a transitive dependency — can silently replace `globalThis.fetch` or its dispatcher *after* this plugin has already installed its wrapper. When that happens, capture stops with no error and no warning: the adapter keeps working exactly as before, it just stops appearing in the trace. The reverse ordering has the same effect: if this plugin installs its patch before another party swaps the slot, this plugin's wrapper is the one silently bypassed.
+1. **A provider with its own HTTP client.** An adapter that uses an SDK-bundled transport (its own `undici` instance, a preconfigured client) instead of the global `fetch` never reaches the wrapper.
+2. **A provider that snapshots the fetch slot.** A provider plugin can read `globalThis.fetch` once, at module-evaluation time, keep it in a module-level constant, and inject that copy into its SDK. `@jiesou/dsh-opencode-zen-free-provider` does exactly this — `const zenNativeFetch = globalThis.fetch`, later passed as `fetch:` into every model stream — so if that snapshot is taken before this plugin's `apply()` installs its wrapper, every model call it makes goes straight to the original `fetch`, forever. Bundle order is what decides that: the Loader composes the entry list by applying each bundle's patch layer in `dsh.profile.bundles` order, and an entry's module is imported when that entry starts, so this plugin must be listed **before** such a provider. Move it up in that list and restart the host — and check the position after installing anything else, because DSH's plugin manager appends new bundles to the end.
+3. **The slot being replaced.** Node's built-in `fetch` and npm's `undici` package share the same global dispatcher slot (`Symbol.for('undici.globalDispatcher.*')`), so merely `import('undici')` **anywhere else in the process** — another plugin, a future adapter, a transitive dependency — can silently replace `globalThis.fetch` or its dispatcher *after* this plugin has installed its wrapper. The reverse ordering has the same effect: whichever wrapper is installed last owns the slot, and the other's capture goes dark.
 
-Concretely, this means:
+Two consequences worth stating plainly:
 
-- **Do not install this plugin alongside another plugin that also patches `globalThis.fetch`.** There is no reliable way for either plugin to detect that the other has done so — the existing "already patched" guard (`installFetchPatch`'s `PATCH_MARK` symbol) only catches this *same* plugin trying to reinstall itself, not a different implementation wrapping the same global. Whichever one wraps last silently wins the slot; the other's capture goes dark with no diagnostic.
-- **A provider routed through its own SDK-bundled transport** (verify this for any provider you add — `dsh-llm-pi-ai` routes through the `pi-ai` SDK, whose transport should be checked to confirm it actually resolves the global `fetch` rather than a bundled one) is invisible the same way.
-- **The practical way to notice either failure mode**: `GET /llm-wire-trace/stats` reports a `coverage` object — per-provider call counts since process start (`{ provider, calls, attributedCalls, lastSeenAt }`), sorted busiest-first. A provider you know is actively making calls but that shows zero (or an unexpectedly low) count here is the observable symptom of this patch having lost the global slot, or of that provider's traffic never reaching `globalThis.fetch` at all. This counter is intentionally process-lifetime only — it is a live health signal, not history, and is not reset by clearing the trace.
+- **Do not install this plugin alongside another plugin that also patches `globalThis.fetch`.** There is no reliable way for either plugin to detect the other — the existing "already patched" guard (`installFetchPatch`'s `PATCH_MARK` symbol) only catches this *same* plugin trying to reinstall itself, not a different implementation wrapping the same global.
+- **The user-agent is not the admission contract.** A request is admitted by the harness `deepseek-harness/` user-agent *or* by being issued inside an `llm/stream` call, precisely because a provider may rewrite that header. Admission is therefore never what loses a request — only the wrapper never being reached is.
+
+### Noticing it
+
+`GET /llm-wire-trace/stats` reports a `coverage` object with one row per provider, counting both sides of the question:
+
+```json
+{"since": 1792374023811, "providers": [
+  {"provider": "opencode-zen-free-provider", "calls": 0, "attributedCalls": 0,
+   "modelCalls": 12, "untracedCalls": 12, "lastSeenAt": 1792375125343}
+]}
+```
+
+- `calls` / `attributedCalls` count the wire records that WERE captured.
+- `modelCalls` / `untracedCalls` count the model calls the harness itself started (one per `llm/stream`), and how many of those settled with no captured request at all.
+
+`untracedCalls > 0` is the diagnosis none of the failure modes above can hide behind: a provider that made model calls with nothing to show for them either bypasses the wrapper or never went to the wire. Rows are sorted with untraced calls first, so the row worth reading is the top one. The host also logs one `console.warn` per provider the first time it happens, and the plugin management page shows the same finding inline. A provider with `modelCalls: 0` and `calls: 0` is simply one this plugin has seen nothing from — neither traffic nor a model call — which is a different statement from `calls: 0` next to a non-zero `modelCalls`.
+
+These counters are intentionally process-lifetime only — a live health signal, not history, and not reset by clearing the trace.
+
+Harness coordinates (turn / step) have a separate dependency: they come from the `llm/stream` and `session/event` channels, not from fetch. So a call that never goes through `ctx.llm` can be captured yet not attributed (recorded as `attributed: false`), while an adapter that bypasses the bare `fetch` loses both the capture and the coordinates. Both are reported as the gaps they are, never filled in by guessing.
 
 Because of this, treat this plugin as belonging to a debugging profile rather than a permanent installation, and be deliberate about what else in that same profile also touches `fetch`.
 
@@ -431,10 +454,10 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
   config.ts                   PluginConfig + its runtime Config schema, and resolveEffectiveConfig (no Cordis dependency, unit-tested)
   constants.ts                shared constants (user-agent prefix, header name, defaults)
   http-utils.ts               header redaction, request description, JSON/body clipping
-  call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider)
+  call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider), plus each call's captured-request receipt
   step-tracker.ts              turn/step tracking from session/event
-  coverage.ts                  per-provider capture-health counters, exposed via stats()
-  fetch-patch.ts               the globalThis.fetch patch itself
+  coverage.ts                  per-provider capture-health counters — records captured AND model calls that captured nothing — exposed via stats()
+  fetch-patch.ts               the globalThis.fetch patch itself (admission: harness user-agent or an active llm/stream call)
   curl.ts                      curl-command rendering + credential resolution
   store.ts                     in-memory ring merged with the durable archive
   page-grouping.ts             list-page grouping (turns, auxiliary, unattributed)
@@ -447,7 +470,7 @@ src/host/                    host half (Node ESM, compiled 1:1 by tsc)
 src/client/                  browser half (bundled by esbuild into one classic script)
   entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper; the one file binding strings.ts to DSH's ctx.locale service
   wire-trace-view.ts           the WireTraceView component (state + rendering)
-  plugin-manage-view.ts        the plugin management page panel (cache stats, clear-all, every Config parameter)
+  plugin-manage-view.ts        the plugin management page panel (cache stats, capture-gap warning, clear-all, every Config parameter)
   view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
   strings.ts                   bilingual (zh/en) locale dictionaries for every user-visible string, registered with ctx.locale
   json-view.ts                 the collapsible JSON tree component

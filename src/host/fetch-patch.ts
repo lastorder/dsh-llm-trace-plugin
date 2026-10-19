@@ -1,8 +1,24 @@
 /**
- * The `globalThis.fetch` patch: only provider calls (identified by the
- * `deepseek-harness/` user-agent every adapter sends) are recorded; every
- * other call passes through completely untouched — same arguments, same
- * return value, same thrown errors.
+ * The `globalThis.fetch` patch: provider calls are recorded; every other call
+ * passes through completely untouched — same arguments, same return value,
+ * same thrown errors.
+ *
+ * "Provider call" is decided by TWO independent signals, and either one is
+ * sufficient:
+ *
+ *   - the outgoing `user-agent` starts with `deepseek-harness/`, the value
+ *     `attributionHeaders()` stamps on every harness-issued provider request;
+ *   - the request is issued inside an active `llm/stream` call, i.e.
+ *     `callContext.getStore()` is bound (see call-context.ts).
+ *
+ * The second signal exists because the user-agent is not something this plugin
+ * can rely on a third-party provider plugin leaving alone. A provider that
+ * builds its own agent identity rewrites the header at the fetch layer — the
+ * only layer it still controls once the harness has merged its own attribution
+ * in — and a provider that reaches the wire from inside a model call is by
+ * construction provider traffic whatever it calls itself. A request issued
+ * inside such a call is therefore recorded even when nothing about its headers
+ * says "harness".
  *
  * This ONLY works as an installed package. A dynamic Cordis Host package runs
  * its code inside an isolated `node:vm` realm whose `globalThis` is not the
@@ -11,8 +27,15 @@
  * fetch that `@deepseek-ai/dsh-llm-deepseek` and `@deepseek-ai/dsh-llm-pi-ai`
  * resolve at call time. Both of those adapters call the bare `fetch`
  * identifier with no local import, so they read whatever `globalThis.fetch`
- * resolves to at the moment of the call — which is exactly what makes patching
- * it here, in the real process realm, effective regardless of load order.
+ * resolves to at the moment of the call.
+ *
+ * That "at the moment of the call" is exactly what a provider plugin can opt
+ * out of, by snapshotting `globalThis.fetch` at module-evaluation time and
+ * injecting the copy into its SDK. Such a provider is invisible here no matter
+ * how this patch is written — the requests never enter this function at all —
+ * which is why `coverage.ts` counts model calls that produced no captured
+ * request, and `index.ts` warns about them instead of leaving a silently empty
+ * trace. See the README's "Known limitation" section.
  *
  * @module dsh-llm-trace-plugin/host/fetch-patch
  */
@@ -22,6 +45,28 @@ import { clip, describeRequest, outgoingUserAgent, redactedHeaders, tryParseJson
 import { callContext } from './call-context.js'
 import { buildRecordName } from './persistence/naming.js'
 import type { WireRecord } from '../shared/record-shape.js'
+
+// TEMP-DIAGNOSE begin — remove before committing.
+type DiagSink = (line: string) => void
+let diagSink: DiagSink | null = null
+let diagSeen = 0
+export function setFetchPatchDiagnostics(sink: DiagSink | null): void {
+  diagSink = sink
+}
+let lastPatched: unknown = null
+export function isFetchPatchActive(): boolean {
+  return lastPatched !== null && globalThis.fetch === lastPatched
+}
+function diag(line: string): void {
+  if (diagSink === null || diagSeen > 1000) return
+  diagSeen += 1
+  try {
+    diagSink(line)
+  } catch {
+    // never let the diagnostic disturb the request path
+  }
+}
+// TEMP-DIAGNOSE end
 
 export interface FetchPatchDeps {
   maxBodyChars: number
@@ -133,8 +178,29 @@ async function mirrorBody(
 export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetch {
   const { maxBodyChars, push, finalize } = deps
   return async function patchedFetch(input: any, init?: any): Promise<Response> {
+    // Harness identity of the call this fetch belongs to. Present for every
+    // call made through `ctx.llm`; absent for anything else, which is then
+    // honestly recorded as unattributed rather than guessed at.
+    //
+    // Read BEFORE the admission test, because it IS half of that test: a
+    // request issued inside a model call is provider traffic even when its
+    // headers carry another agent's identity (see this module's doc).
+    const call = callContext.getStore() ?? null
     const ua = outgoingUserAgent(input, init)
-    if (!ua.startsWith(USER_AGENT_PREFIX)) return real(input, init)
+    // TEMP-DIAGNOSE begin
+    {
+      const raw = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as any)?.url ?? String(input)
+      let host = '?'
+      try {
+        host = new URL(raw).host
+      } catch {
+        // keep '?'
+      }
+      const admitted = call !== null || ua.startsWith(USER_AGENT_PREFIX)
+      diag(`fetch ${admitted ? 'ADMIT ' : 'reject'} host=${host} inCall=${call !== null} ua=${String(ua).slice(0, 28)}`)
+    }
+    // TEMP-DIAGNOSE end
+    if (call === null && !ua.startsWith(USER_AGENT_PREFIX)) return real(input, init)
 
     const info = describeRequest(input, init)
     const bodyClip = clip(info.bodyText || '', maxBodyChars)
@@ -148,10 +214,6 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
     //
     // The parsed value is deliberately NOT kept: see `bodyJson` below.
     const requestJson = tryParseJson(info.bodyText)
-    // Harness identity of the call this fetch belongs to. Present for every
-    // call made through `ctx.llm`; absent for anything else, which is then
-    // honestly recorded as unattributed rather than guessed at.
-    const call = callContext.getStore() ?? null
     const headerSessionId = info.headers[SESSION_HEADER] ?? null
     const startedAt = Date.now()
     const record: WireRecord = {
@@ -206,6 +268,12 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       error: null,
     }
     push(record)
+    // Credit this request to the model call it belongs to, so a call that ends
+    // with a zero receipt is provably one whose traffic never got here — the
+    // signal `coverage.ts` reports and `index.ts` warns about. Counted on
+    // ADMISSION, not on a successful response: a provider error still proves
+    // the request reached the wire, which is what the receipt answers.
+    if (call !== null) call.observation.requests += 1
 
     let response: Response
     try {
@@ -278,6 +346,7 @@ export function installFetchPatch(buildWrapped: (real: typeof fetch) => typeof f
   const patched = buildWrapped(original)
   globalThis.fetch = patched
   marked[PATCH_MARK] = true
+  lastPatched = patched // TEMP-DIAGNOSE
   return () => {
     if (globalThis.fetch === patched) globalThis.fetch = original
     delete marked[PATCH_MARK]
