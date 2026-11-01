@@ -367,7 +367,7 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       ? null
       : (notice.kind === 'truncated'
         ? t('notice.truncatedBody', { totalChars: fmtCount(notice.totalChars), keptChars: fmtCount(notice.keptChars) })
-        : t('notice.notJson'))
+        : (notice.kind === 'empty' ? t('notice.emptyBody') : t('notice.notJson')))
     // The raw view shows the literal bytes only when the reader explicitly
     // asked to see them (`!sseMerged`); the merged view — including the
     // frame-list fallback if merging ever needed one — stays on the JSON

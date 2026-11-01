@@ -177,6 +177,7 @@ The wrapper is written to hold these properties:
 
 - A non-provider call passes straight through: not recorded, not cloned, body fully intact for its own caller.
 - A provider call's caller still reads the complete, unmodified response body — the mirror never contends with it.
+- The **request** body is captured whatever shape it reaches `fetch` in: a string, a byte buffer (`Uint8Array`/`Buffer`/`ArrayBuffer`), `URLSearchParams`, a `Blob`, a `ReadableStream` (teed — one half is sent, the other mirrored), or the body of a `Request` passed as `fetch`'s first argument (read from a `clone()`). The copy handed to the real `fetch` is never consumed. A shape that cannot be mirrored without consuming it (`FormData`, an async iterable) is sent untouched and flagged in the record's `recorderError`; the viewer then says nothing was recorded instead of calling the empty body "not JSON".
 - A streamed body whose call the adapter aborts is still stored: every chunk the mirror received is kept, so an SSE response is captured whole instead of being thrown away by a `text()` that will never see a clean close.
 - A transport failure (the underlying `fetch` throws) is recorded and **rethrown unchanged** — never swallowed.
 - Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `x-dsh-auth-token`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.

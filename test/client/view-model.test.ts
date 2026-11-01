@@ -404,6 +404,14 @@ test('describeBodyNotice: an untruncated unparseable body is reported as not-jso
   assert.equal(notice.kind, 'not-json')
 })
 
+test('describeBodyNotice: a stored-nothing body is reported as empty, not as not-json', () => {
+  const notice = describeBodyNotice({
+    treeValue: rawWrapper(''),
+    shown: { bodyChars: 0, bodyText: '', bodyTruncated: false },
+  })
+  assert.equal(notice.kind, 'empty')
+})
+
 test('describeBodyNotice: a raw fallback with no shown half still explains itself', () => {
   assert.equal(describeBodyNotice({ treeValue: rawWrapper('x'), shown: null }).kind, 'not-json')
 })

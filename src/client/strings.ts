@@ -75,6 +75,7 @@ export const zh: LocaleDict = {
   'notice.autoFellBack': '本 session 没有可归属的记录（这些调用没有经过 ctx.llm，例如插件重载前就已经发出的请求），已自动显示全部记录。',
   'notice.truncatedHistory': '磁盘上还有更早的记录未被扫描（单次查询有读取上限）。',
   'notice.notJson': '这段内容不是 JSON，按原文显示。',
+  'notice.emptyBody': '这一侧没有记录到任何内容：请求本身没有 body，或其 body 的形态未能被镜像（详见记录里的 recorderError）。',
   // -- group --
   'group.auxiliary': '后台辅助调用',
   'group.auxiliaryMeta': '不属于任何 turn',
@@ -202,6 +203,7 @@ export const en: LocaleDict = {
   'notice.autoFellBack': 'No attributable records exist for this session (these calls never went through ctx.llm — e.g. requests made before the plugin reloaded), so every record is now shown automatically.',
   'notice.truncatedHistory': 'Older records still exist on disk that were not scanned (one query has a read cap).',
   'notice.notJson': 'This content is not JSON, shown as raw text.',
+  'notice.emptyBody': 'Nothing was recorded for this side: the request had no body, or its body shape could not be mirrored (see recorderError on the record).',
   // -- group --
   'group.auxiliary': 'Background auxiliary calls',
   'group.auxiliaryMeta': 'Not part of any turn',

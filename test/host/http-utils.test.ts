@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { clip, describeRequest, outgoingUserAgent, redactedHeaders, redactHeaderValue, redactUrl, tryParseJson } from '../../src/host/http-utils.js'
+import { clip, deferBodyCapture, describeRequest, describeUnmirroredBody, outgoingUserAgent, redactedHeaders, redactHeaderValue, redactUrl, tryParseJson } from '../../src/host/http-utils.js'
 
 // -- clip --
 
@@ -196,9 +196,93 @@ test('describeRequest: defaults to GET when no method is given anywhere', () => 
   assert.equal(result.method, 'GET')
 })
 
-test('describeRequest: a non-string body (e.g. a stream) is left unread, bodyText stays null', () => {
-  const result = describeRequest('https://api.example.com', { method: 'POST', body: new Uint8Array([1, 2, 3]) as any })
+test('describeRequest: byte-buffer bodies (Uint8Array, Buffer, ArrayBuffer, DataView) are decoded as UTF-8', () => {
+  const text = '{"model":"x","msg":"héllo 你好"}'
+  const bytes = new TextEncoder().encode(text)
+  const url = 'https://api.example.com'
+  assert.equal(describeRequest(url, { method: 'POST', body: bytes }).bodyText, text)
+  assert.equal(describeRequest(url, { method: 'POST', body: Buffer.from(text) }).bodyText, text)
+  assert.equal(describeRequest(url, { method: 'POST', body: bytes.buffer.slice(0) as ArrayBuffer }).bodyText, text)
+  assert.equal(describeRequest(url, { method: 'POST', body: new DataView(bytes.buffer) }).bodyText, text)
+})
+
+test('describeRequest: a view onto part of a larger buffer decodes only its own window', () => {
+  const backing = new TextEncoder().encode('xxxx{"a":1}yyyy')
+  const view = new Uint8Array(backing.buffer, 4, 7)
+  assert.equal(describeRequest('https://api.example.com', { method: 'POST', body: view }).bodyText, '{"a":1}')
+})
+
+test('describeRequest: URLSearchParams body is serialized', () => {
+  const result = describeRequest('https://api.example.com', { method: 'POST', body: new URLSearchParams({ a: '1', b: '2' }) })
+  assert.equal(result.bodyText, 'a=1&b=2')
+})
+
+test('describeRequest: a stream body is left unread, bodyText stays null', () => {
+  const result = describeRequest('https://api.example.com', { method: 'POST', body: new ReadableStream() as any })
   assert.equal(result.bodyText, null)
+})
+
+// -- deferBodyCapture --
+
+test('deferBodyCapture: a ReadableStream body is teed — capture sees it all and the wire copy is intact', async () => {
+  const text = '{"model":"streamed"}'
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(text.slice(0, 5)))
+      controller.enqueue(new TextEncoder().encode(text.slice(5)))
+      controller.close()
+    },
+  })
+  const deferred = deferBodyCapture('https://api.example.com', { method: 'POST', body })
+  assert.ok(deferred)
+  assert.equal(await deferred.text, text)
+  // The init handed back to the real fetch still carries the whole body.
+  const wire = await new Response(deferred.init!.body as ReadableStream).text()
+  assert.equal(wire, text)
+})
+
+test('deferBodyCapture: a Blob body is read without being consumed', async () => {
+  const blob = new Blob(['{"model":"blob"}'])
+  const deferred = deferBodyCapture('https://api.example.com', { method: 'POST', body: blob })
+  assert.ok(deferred)
+  assert.equal(await deferred.text, '{"model":"blob"}')
+  assert.equal(await blob.text(), '{"model":"blob"}')
+})
+
+test('deferBodyCapture: a Request input body is read from a clone, leaving the original unread', async () => {
+  const request = new Request('https://api.example.com/v1', { method: 'POST', body: '{"model":"req"}' })
+  const deferred = deferBodyCapture(request, undefined)
+  assert.ok(deferred)
+  assert.equal(await deferred.text, '{"model":"req"}')
+  assert.equal(request.bodyUsed, false)
+  assert.equal(await request.text(), '{"model":"req"}')
+})
+
+test('deferBodyCapture: nothing to capture for a bodyless call, a string body, or a bodyless Request', () => {
+  assert.equal(deferBodyCapture('https://api.example.com', undefined), null)
+  assert.equal(deferBodyCapture('https://api.example.com', { method: 'POST', body: 'x' }), null)
+  assert.equal(deferBodyCapture(new Request('https://api.example.com'), undefined), null)
+})
+
+test('deferBodyCapture: an init body wins over the Request input body', async () => {
+  const request = new Request('https://api.example.com/v1', { method: 'POST', body: 'from-request' })
+  const deferred = deferBodyCapture(request, { body: new Blob(['from-init']) })
+  assert.ok(deferred)
+  assert.equal(await deferred.text, 'from-init')
+})
+
+// -- describeUnmirroredBody --
+
+test('describeUnmirroredBody: names shapes that cannot be mirrored, ignores ones that can', () => {
+  const form = new FormData()
+  form.append('a', '1')
+  assert.equal(describeUnmirroredBody({ body: form }), 'FormData')
+  assert.equal(describeUnmirroredBody({ body: (async function* () { yield 'x' })() as any }), 'AsyncGenerator')
+  assert.equal(describeUnmirroredBody({ body: 'text' }), null)
+  assert.equal(describeUnmirroredBody({ body: new Uint8Array(1) }), null)
+  assert.equal(describeUnmirroredBody({ body: new ReadableStream() as any }), null)
+  assert.equal(describeUnmirroredBody({ body: new Blob(['x']) }), null)
+  assert.equal(describeUnmirroredBody(undefined), null)
 })
 
 // -- tryParseJson --

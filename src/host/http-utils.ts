@@ -118,26 +118,129 @@ export interface DescribedRequest {
   method: string
   url: string
   headers: HeaderMap
+  /**
+   * The request body as text when it is available SYNCHRONOUSLY (a string, a
+   * byte buffer, or a `URLSearchParams`); `null` otherwise. A body that can
+   * only be read asynchronously is handled by {@link deferBodyCapture}.
+   */
   bodyText: string | null
+}
+
+/** Decode a byte view / buffer as UTF-8 without throwing on malformed input. */
+function decodeBytes(body: ArrayBuffer | ArrayBufferView): string {
+  const view = ArrayBuffer.isView(body)
+    ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
+    : new Uint8Array(body)
+  return new TextDecoder().decode(view)
+}
+
+/**
+ * Read a request body that is available without consuming anything: a string,
+ * `ArrayBuffer`, any typed array / `Buffer` / `DataView`, or `URLSearchParams`.
+ * Returns `null` for everything else (streams, `Blob`, `FormData`, …).
+ */
+function readSyncBody(body: unknown): string | null {
+  if (typeof body === 'string') return body
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return decodeBytes(body)
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return body.toString()
+  return null
 }
 
 /**
  * Extract method, URL, and body text from a fetch call, supporting both the
  * `fetch(url, init)` and `fetch(new Request(url, init))` calling forms.
+ *
+ * Only reads what needs no I/O. A string, byte-buffer or `URLSearchParams`
+ * body is returned in `bodyText`; every other shape (a `Request` object's own
+ * body, a `Blob`, a `ReadableStream`) is left for {@link deferBodyCapture},
+ * because reading it here would be asynchronous and — for a stream — would
+ * consume the only copy.
  */
 export function describeRequest(input: unknown, init: RequestInit | undefined): DescribedRequest {
   const isRequestLike = input !== null && typeof input === 'object' && typeof (input as Request).url === 'string'
   const url = redactUrl(isRequestLike ? (input as Request).url : String(input))
   const method = (init && init.method) || (isRequestLike ? (input as Request).method : undefined) || 'GET'
   const headers = redactedHeaders((init && init.headers) || (isRequestLike ? (input as Request).headers : undefined))
-  let bodyText: string | null = null
-  const body = init ? init.body : undefined
-  if (typeof body === 'string') bodyText = body
-  // Request-object bodies and streamed/binary bodies are deliberately left
-  // unread here: reading them would consume the only copy. Both shipped
-  // adapters pass a JSON string body directly, which is the case this
-  // plugin exists to capture.
+  const bodyText = init ? readSyncBody(init.body) : null
   return { method: String(method), url, headers, bodyText }
+}
+
+/** A request body that has to be read asynchronously, plus the fetch args to send. */
+export interface DeferredBody {
+  /**
+   * Resolves with the body text, or `null` when it could not be read. Never
+   * rejects: a failure to mirror the body must not surface as a failed call.
+   */
+  text: Promise<string | null>
+  /** The `init` to pass to the real `fetch` in place of the caller's. */
+  init: RequestInit | undefined
+}
+
+/** Drain a stream into text, resolving with whatever was read if it fails midway. */
+async function drainToText(stream: ReadableStream<Uint8Array>): Promise<string | null> {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value !== undefined) text += typeof value === 'string' ? value : decoder.decode(value, { stream: true })
+    }
+    text += decoder.decode()
+    return text
+  } catch {
+    return text.length > 0 ? text : null
+  }
+}
+
+/**
+ * Start capturing a request body that {@link describeRequest} could not read
+ * synchronously, WITHOUT consuming the copy the real `fetch` will send.
+ *
+ * - `init.body` is a `ReadableStream`: tee it. One branch replaces the body in
+ *   the returned `init`; the other is drained here.
+ * - `init.body` is a `Blob`: `Blob.text()` is non-consuming.
+ * - no `init.body`, and `input` is a `Request` carrying a body: read from
+ *   `input.clone()`, which leaves `input` itself unread.
+ *
+ * Returns `null` when there is nothing to capture or the shape cannot be
+ * mirrored without consuming it (an async-iterable or `FormData` body).
+ * Every path is best-effort and never throws.
+ */
+export function deferBodyCapture(input: unknown, init: RequestInit | undefined): DeferredBody | null {
+  try {
+    const body = init ? init.body : undefined
+    if (body !== undefined && body !== null) {
+      if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) {
+        const [forWire, forCapture] = body.tee()
+        return { text: drainToText(forCapture), init: { ...init, body: forWire } }
+      }
+      if (typeof Blob !== 'undefined' && body instanceof Blob) {
+        return { text: body.text().catch(() => null), init }
+      }
+      return null
+    }
+    const isRequest = typeof Request !== 'undefined' && input instanceof Request
+    if (isRequest && (input as Request).body !== null && !(input as Request).bodyUsed) {
+      const copy = (input as Request).clone()
+      return { text: copy.text().catch(() => null), init }
+    }
+  } catch {
+    // A body that cannot be mirrored is recorded as empty rather than failing the call.
+  }
+  return null
+}
+
+/** Name the shape of a request body this plugin cannot mirror, for the record's note. */
+export function describeUnmirroredBody(init: RequestInit | undefined): string | null {
+  const body = init ? init.body : undefined
+  if (body === undefined || body === null) return null
+  if (readSyncBody(body) !== null) return null
+  if (typeof ReadableStream !== 'undefined' && body instanceof ReadableStream) return null
+  if (typeof Blob !== 'undefined' && body instanceof Blob) return null
+  if (typeof FormData !== 'undefined' && body instanceof FormData) return 'FormData'
+  return Object.prototype.toString.call(body).slice(8, -1)
 }
 
 /** Best-effort JSON parse for display; never throws. */

@@ -281,7 +281,7 @@ export interface BodyNoticeInput {
 }
 
 /** Why the JSON view fell back to raw text, if it did. */
-export type BodyNoticeKind = 'none' | 'truncated' | 'not-json'
+export type BodyNoticeKind = 'none' | 'truncated' | 'not-json' | 'empty'
 
 export interface BodyNotice {
   kind: BodyNoticeKind
@@ -304,6 +304,10 @@ export function describeBodyNotice(input: BodyNoticeInput): BodyNotice {
   if (!isRawFallback(input.treeValue)) return empty
   const shown = input.shown
   if (shown === null || shown === undefined) return { kind: 'not-json', totalChars: 0, keptChars: 0 }
+  // Nothing was stored at all. Calling that "not JSON" sends the reader
+  // hunting for a malformed body when the real answer is that no body was
+  // captured (or the call had none).
+  if (shown.bodyChars === 0 && (shown.bodyText || '') === '') return { kind: 'empty', totalChars: 0, keptChars: 0 }
   if (shown.bodyTruncated !== true) return { kind: 'not-json', totalChars: 0, keptChars: 0 }
   return {
     kind: 'truncated',

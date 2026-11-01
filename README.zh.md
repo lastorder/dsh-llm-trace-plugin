@@ -174,6 +174,7 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 - 非提供方的调用直接透传：不记录、不克隆，响应体对它自己的调用方完整无损。
 - 提供方调用的调用方依然能读到完整、未经修改的响应体 —— 镜像永远不会与之争抢。
+- **请求**体无论以什么形态到达 `fetch` 都会被捕获：字符串、字节缓冲（`Uint8Array`/`Buffer`/`ArrayBuffer`）、`URLSearchParams`、`Blob`、`ReadableStream`（用 tee 分成两路——一路发送，一路镜像），以及作为 `fetch` 第一个参数传入的 `Request` 自带的 body（从 `clone()` 读取）。交给真实 `fetch` 的那一份绝不会被消费。无法在不消费的前提下镜像的形态（`FormData`、async iterable）会原样发送，并在记录的 `recorderError` 中标注；查看器随后会提示「没有记录到内容」，而不是把空 body 说成「不是 JSON」。
 - 适配器主动 abort 的流式响应体依然会被保存：镜像收到的每个 chunk 都保留下来，因此 SSE 响应体是完整捕获的，而不会被那个永远等不到「干净关闭」的 `text()` 整体丢弃。
 - 传输失败（底层 `fetch` 抛错）会被记录并**原样重新抛出** —— 绝不吞掉。
 - 所有凭据类请求头在存储或展示前一律脱敏：`authorization` 与 `proxy-authorization` 变为 `Bearer ***redacted***`，而裸密钥类请求头（`x-api-key`、`api-key`、`x-goog-api-key`、`x-dsh-auth-token`、`cookie`、`set-cookie`）变为 `***redacted***`，不会凭空加上并不存在的 scheme。其他请求头不作任何改动。

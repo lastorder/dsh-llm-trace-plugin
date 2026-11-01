@@ -41,7 +41,7 @@
  */
 
 import { USER_AGENT_PREFIX, SESSION_HEADER } from './constants.js'
-import { clip, describeRequest, outgoingUserAgent, redactedHeaders, tryParseJson } from './http-utils.js'
+import { clip, deferBodyCapture, describeRequest, describeUnmirroredBody, outgoingUserAgent, redactedHeaders, tryParseJson } from './http-utils.js'
 import { callContext } from './call-context.js'
 import { buildRecordName } from './persistence/naming.js'
 import type { WireRecord } from '../shared/record-shape.js'
@@ -69,6 +69,20 @@ export function requestSignal(input: unknown, init: RequestInit | undefined): Ab
   if (candidate === null || candidate === undefined || typeof candidate !== 'object') return null
   const signal = candidate.signal
   return signal === undefined || signal === null ? null : signal
+}
+
+/** How long `finalize` waits for a still-running request-body mirror before persisting without it. */
+const REQUEST_BODY_SETTLE_MS = 5000
+
+/** Wait for `work`, but never longer than `ms`; the timer is always cleared. */
+async function settleWithin(work: Promise<void>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const limit = new Promise<void>((resolve) => { timer = setTimeout(resolve, ms) })
+  try {
+    await Promise.race([work, limit])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
 
 /**
@@ -168,6 +182,12 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
     if (call === null && !ua.startsWith(USER_AGENT_PREFIX)) return real(input, init)
 
     const info = describeRequest(input, init)
+    // A body that cannot be read synchronously (a stream, a Blob, a Request's
+    // own body) is mirrored in the background, from a copy: the real fetch
+    // gets `deferred.init`, whose body is the untouched other half.
+    const deferred = info.bodyText === null ? deferBodyCapture(input, init) : null
+    if (deferred !== null) init = deferred.init
+    const unmirrored = deferred === null && info.bodyText === null ? describeUnmirroredBody(init) : null
     const bodyClip = clip(info.bodyText || '', maxBodyChars)
     // ONE parse of the request body, and only to read `model` off it — which
     // is the one field a list row needs and the wire URL cannot supply.
@@ -232,6 +252,22 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       response: null,
       error: null,
     }
+    if (unmirrored !== null) record.recorderError = `request body of type ${unmirrored} cannot be mirrored without consuming it; not captured`
+    // Filled in when the background read settles. It resolves before the
+    // response ends in every ordinary call, because the request body has to be
+    // fully sent first; `finalize` waits for it so the persisted record has it.
+    const requestBodyDone: Promise<void> = deferred === null ? Promise.resolve() : deferred.text.then((text) => {
+      if (text === null) {
+        record.recorderError = record.recorderError ?? 'request body could not be mirrored'
+        return
+      }
+      const clipped = clip(text, maxBodyChars)
+      record.request.bodyText = clipped.text
+      record.request.bodyChars = clipped.chars
+      record.request.bodyTruncated = clipped.truncated
+      if (record.model === null) record.model = (tryParseJson(text) as any)?.model ?? null
+    })
+    const settleBody = () => deferred === null ? Promise.resolve() : settleWithin(requestBodyDone, REQUEST_BODY_SETTLE_MS)
     push(record)
     // Credit this request to the model call it belongs to, so a call that ends
     // with a zero receipt is provably one whose traffic never got here — the
@@ -246,6 +282,7 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
     } catch (error: any) {
       record.status = 'transport-error'
       record.error = { name: String(error && error.name), message: String((error && error.message) || error) }
+      await settleBody()
       finalize(record)
       throw error
     }
@@ -269,6 +306,7 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       mirror = response.clone()
     } catch (error: any) {
       record.recorderError = 'clone failed: ' + String((error && error.message) || error)
+      await settleBody()
       finalize(record)
       return response
     }
@@ -284,6 +322,7 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       try {
         await mirrorBody(mirror, response, record, signal, maxBodyChars)
       } finally {
+        await settleBody()
         finalize(record)
       }
     })()

@@ -75,6 +75,99 @@ test('wrapFetch: a deepseek-harness/ call is recorded with request fields, and i
   assert.equal(h.finalized[0].response!.bodyJson, null)
 })
 
+// -- request bodies that are not strings --
+//
+// A model call whose body reached `fetch` as bytes, a stream or a Request used
+// to be recorded with `bodyText: ''`, which the viewer then reported as "not
+// JSON". These pin that every such shape is captured AND still sent intact.
+
+const HARNESS_HEADERS = { 'user-agent': 'deepseek-harness/1.0', 'content-type': 'application/json' }
+const BODY = '{"model":"claude-x","messages":[]}'
+
+test('wrapFetch: a byte-buffer request body is captured and the model read off it', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.example.com/v1/messages', { method: 'POST', headers: HARNESS_HEADERS, body: new TextEncoder().encode(BODY) })
+
+  assert.equal(h.records[0].request.bodyText, BODY)
+  assert.equal(h.records[0].request.bodyChars, BODY.length)
+  assert.equal(h.records[0].model, 'claude-x')
+})
+
+test('wrapFetch: a ReadableStream request body is captured from a tee and still reaches the real fetch whole', async () => {
+  const h = harness()
+  let sent = ''
+  const real = (async (_input: any, init: any) => {
+    sent = await new Response(init.body).text()
+    return new Response('{}')
+  }) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const body = new ReadableStream<Uint8Array>({
+    start(c) { c.enqueue(new TextEncoder().encode(BODY)); c.close() },
+  })
+
+  await patched('https://api.example.com/v1/messages', { method: 'POST', headers: HARNESS_HEADERS, body, duplex: 'half' } as any)
+  await flush()
+  await flush()
+
+  assert.equal(sent, BODY)
+  assert.equal(h.finalized.length, 1)
+  assert.equal(h.finalized[0].request.bodyText, BODY)
+  assert.equal(h.finalized[0].model, 'claude-x')
+})
+
+test('wrapFetch: a Request-object body is captured from a clone and is unconsumed when the real fetch sees it', async () => {
+  const h = harness()
+  let sent = ''
+  const real = (async (input: any) => {
+    sent = await input.text()
+    return new Response('{}')
+  }) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const request = new Request('https://api.example.com/v1/messages', { method: 'POST', headers: HARNESS_HEADERS, body: BODY })
+
+  await patched(request)
+  await flush()
+  await flush()
+
+  assert.equal(sent, BODY)
+  assert.equal(h.finalized[0].request.bodyText, BODY)
+  assert.equal(h.finalized[0].model, 'claude-x')
+})
+
+test('wrapFetch: a deferred request body is clipped to maxBodyChars like a string one', async () => {
+  const h = harness()
+  const real = (async () => new Response('{}')) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 10, push: h.push, finalize: h.finalize })
+
+  await patched('https://api.example.com/v1/messages', { method: 'POST', headers: HARNESS_HEADERS, body: new Blob([BODY]) })
+  await flush()
+  await flush()
+
+  const request = h.finalized[0].request
+  assert.equal(request.bodyText, BODY.slice(0, 10))
+  assert.equal(request.bodyChars, BODY.length)
+  assert.equal(request.bodyTruncated, true)
+})
+
+test('wrapFetch: a body shape that cannot be mirrored is sent untouched and flagged on the record', async () => {
+  const h = harness()
+  let sawBody: unknown
+  const real = (async (_input: any, init: any) => { sawBody = init.body; return new Response('{}') }) as typeof fetch
+  const patched = wrapFetch(real, { maxBodyChars: 1000, push: h.push, finalize: h.finalize })
+  const form = new FormData()
+  form.append('a', '1')
+
+  await patched('https://api.example.com/upload', { method: 'POST', headers: HARNESS_HEADERS, body: form })
+  await flush()
+
+  assert.equal(sawBody, form)
+  assert.equal(h.records[0].request.bodyText, '')
+  assert.match(h.records[0].recorderError ?? '', /FormData/)
+})
+
 // -- admission: the harness user-agent OR an active model call --
 //
 // The user-agent alone is not a contract this plugin can rely on: a provider
