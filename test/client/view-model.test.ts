@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  classifyCompare,
   compareRowsNewestFirst,
+  defaultBaselineId,
   describeBodyNotice,
   groupKeyOf,
   groupRows,
@@ -11,6 +13,7 @@ import {
   normalizePage,
   RAW_KEY,
   rawWrapper,
+  resolveBaselineId,
   selectRequestBody,
   selectResponseBody,
   shouldFallBackToAllSessions,
@@ -427,4 +430,84 @@ test('stepDepth: clamps to [0, contentDepth]', () => {
 
 test('stepDepth: content with no nesting pins the stepper at zero', () => {
   assert.equal(stepDepth(0, 1, 0), 0)
+})
+
+// -- compare: baseline selection --
+
+// Newest-first, as the list renders: s1c is the newest.
+const ordered = [
+  row({ id: 's1c', turn: 2, step: 1 }),
+  row({ id: 'title', turn: null, step: null, purpose: 'session-title' }),
+  row({ id: 's1b', turn: 2, step: 0 }),
+  row({ id: 'other-session', sessionId: 'session-b', turn: 1, step: 1 }),
+  row({ id: 's1a', turn: 1, step: 0 }),
+]
+
+test('defaultBaselineId picks the nearest older call of the same kind in the same session', () => {
+  // Skips the title call in between (different purpose) and the other session.
+  assert.equal(defaultBaselineId(ordered, 's1c'), 's1b')
+  assert.equal(defaultBaselineId(ordered, 's1b'), 's1a')
+})
+
+test('defaultBaselineId compares an auxiliary call only with an earlier call of the same purpose', () => {
+  assert.equal(defaultBaselineId(ordered, 'title'), null)
+  const withEarlierTitle = [...ordered, row({ id: 'title0', turn: null, step: null, purpose: 'session-title' })]
+  assert.equal(defaultBaselineId(withEarlierTitle, 'title'), 'title0')
+})
+
+test('defaultBaselineId is null for the first of its kind, an unknown id, or no selection', () => {
+  assert.equal(defaultBaselineId(ordered, 's1a'), null)
+  assert.equal(defaultBaselineId(ordered, 'missing'), null)
+  assert.equal(defaultBaselineId(ordered, null), null)
+})
+
+test('defaultBaselineId treats a missing and a null session id alike, and an empty purpose as none', () => {
+  const rows = [
+    row({ id: 'n2', sessionId: null, purpose: '' }),
+    row({ id: 'n1', sessionId: null, purpose: null }),
+  ]
+  assert.equal(defaultBaselineId(rows, 'n2'), 'n1')
+})
+
+test('resolveBaselineId honours a still-valid pick and otherwise falls back to the default', () => {
+  assert.equal(resolveBaselineId(ordered, 's1c', 's1a'), 's1a')
+  assert.equal(resolveBaselineId(ordered, 's1c', null), 's1b')
+  // A pick that vanished from the list, or that is the selection itself, is ignored.
+  assert.equal(resolveBaselineId(ordered, 's1c', 'gone'), 's1b')
+  assert.equal(resolveBaselineId(ordered, 's1c', 's1c'), 's1b')
+  assert.equal(resolveBaselineId(ordered, null, 's1a'), null)
+})
+
+// -- compare: status --
+
+const withBody = (id: string, bodyJson: unknown, bodyText = '{}') => record({
+  id,
+  request: { ...record().request, bodyJson, bodyText },
+})
+
+test('classifyCompare reports why there is nothing to compare, in the order a reader can act on it', () => {
+  const head = withBody('h', { a: 1 })
+  const base = withBody('b', { a: 2 })
+  assert.deepEqual(classifyCompare({ candidateCount: 0, baselineId: null, base: null, loadError: null, head }), { kind: 'no-others' })
+  assert.deepEqual(classifyCompare({ candidateCount: 3, baselineId: null, base: null, loadError: null, head }), { kind: 'no-baseline' })
+  assert.deepEqual(classifyCompare({ candidateCount: 3, baselineId: 'b', base: null, loadError: 'boom', head }), { kind: 'error', message: 'boom' })
+  assert.deepEqual(classifyCompare({ candidateCount: 3, baselineId: 'b', base: null, loadError: null, head }), { kind: 'loading' })
+  assert.deepEqual(classifyCompare({ candidateCount: 3, baselineId: 'b', base, loadError: null, head: null }), { kind: 'loading' })
+  assert.deepEqual(classifyCompare({ candidateCount: 3, baselineId: 'b', base, loadError: null, head }), { kind: 'ready' })
+})
+
+test('classifyCompare never diffs against a stale baseline record', () => {
+  // `base` is still the record of the PREVIOUS pick while the new one loads.
+  const stale = withBody('old-pick', { a: 1 })
+  assert.deepEqual(
+    classifyCompare({ candidateCount: 3, baselineId: 'new-pick', base: stale, loadError: null, head: withBody('h', {}) }),
+    { kind: 'loading' },
+  )
+})
+
+test('classifyCompare names the side whose body is not parseable JSON', () => {
+  const good = withBody('g', { a: 1 })
+  const raw = (id: string) => withBody(id, null, '{"truncated')
+  assert.deepEqual(classifyCompare({ candidateCount: 1, baselineId: 'b', base: raw('b'), loadError: null, head: good }), { kind: 'not-json', side: 'base' })
+  assert.deepEqual(classifyCompare({ candidateCount: 1, baselineId: 'b', base: withBody('b', { a: 1 }), loadError: null, head: raw('h') }), { kind: 'not-json', side: 'head' })
 })

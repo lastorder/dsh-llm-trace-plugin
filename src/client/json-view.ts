@@ -14,7 +14,6 @@
 
 import { LONG_STRING, MAX_ROWS } from './constants.js'
 import { flattenJq, isLongString, oneLine, collapsedSummary, fmtCount, type JsonLine } from './json-model.js'
-import { copy } from './api-client.js'
 import { stringify, type Translate } from './format.js'
 
 /** The subset of the React runtime this module needs. */
@@ -30,6 +29,10 @@ export interface JsonViewProps {
   longOpen: Set<string>
   onToggle: (path: string, depth: number) => void
   onToggleLong: (path: string) => void
+  /** Copy one node's value; `path` identifies the row so it can show the confirmation. */
+  onCopy: (path: string, text: string) => void
+  /** The row whose copy was just confirmed (null when none). */
+  copiedPath: string | null
   t: Translate
 }
 
@@ -38,7 +41,7 @@ export function createJsonView(React: ReactLike) {
   const h = React.createElement
 
   return function JsonView(props: JsonViewProps) {
-    const { value, isOpen, longOpen, onToggle, onToggleLong, t } = props
+    const { value, isOpen, longOpen, onToggle, onToggleLong, onCopy, copiedPath, t } = props
     const flat = React.useMemo(() => flattenJq(value, isOpen), [value, isOpen])
 
     /** `"key": ` / `` (array elements carry no label in jq output). */
@@ -110,15 +113,27 @@ export function createJsonView(React: ReactLike) {
           key: 'g',
         }, togglePath === null ? '' : (line.type === 'open' ? '-' : '+')),
         h('span', { className: 'wt-jbody', key: 'b' }, body),
-        line.type === 'close' ? null : h('button', {
-          className: 'wt-jcopy',
-          key: 'cp',
-          title: t('json.copyNode'),
-          onClick: (event: any) => {
-            event.stopPropagation()
-            copy(typeof line.value === 'string' ? line.value : stringify(line.value))
-          },
-        }, '⧉'),
+        // Sits right after the value rather than at the far edge of the pane,
+        // so the pointer that is already on the value barely has to move; it
+        // shows a confirmation in place, because a copy otherwise looks like
+        // nothing happened.
+        line.type === 'close' ? null : (() => {
+          const done = copiedPath === line.path
+          return h('button', {
+            className: 'wt-jcopy',
+            key: 'cp',
+            type: 'button',
+            'data-done': done ? '1' : '0',
+            title: t('json.copyNode'),
+            onClick: (event: any) => {
+              event.stopPropagation()
+              onCopy(line.path, typeof line.value === 'string' ? line.value : stringify(line.value))
+            },
+          }, [
+            h('span', { className: 'wt-jcopy-icon', key: 'i', 'aria-hidden': 'true' }, done ? '✓' : '⧉'),
+            h('span', { key: 't' }, done ? t('json.copied') : t('json.copy')),
+          ])
+        })(),
       ].filter(Boolean)))
 
       if (line.type === 'leaf' && line.kind === 'string' && isLongString(line.value) && longOpen.has(line.path)) {

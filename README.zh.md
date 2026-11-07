@@ -220,9 +220,21 @@ Wire Trace 标签页只有在处于激活状态时才会挂载，因此没被打
 
 折叠后的容器会收成一行占位符，并保留其尾随逗号，例如 `"messages": [ … 12 items ],`。完全展开时，该视图就是合法的 JSON：经 `JSON.parse` 可原样还原为捕获到的值。
 
-包含 Request 和 Response 两个标签页。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体默认会被*重新组装*——把散落的 delta 增量合并回一份完整、可读的结构，再用同一套 JSON 视图显示（见下）。
+包含 Request、Response 和 Compare（对比）三个标签页。标签页上方是所选调用的身份信息（模型、状态、开始时间、耗时、HTTP 状态、方法与 URL）以及坐标条；标签栏右侧是针对整条记录的操作（复制 curl、复制、下载），折叠深度步进器和 SSE 切换则放在下面一行，且只在两个 body 标签页里出现。Request 始终显示解析后的请求体。Response 则依据内容类型自适应：JSON 响应体原样显示，而 `event-stream` 响应体默认会被*重新组装*——把散落的 delta 增量合并回一份完整、可读的结构，再用同一套 JSON 视图显示（见下）。
 
 > 本标签页的语言跟随 DSH 自身的 Settings → General → Language 开关（`@deepseek-ai/dsh-client-locale` 服务），因此每个按钮、提示和通知都会相应地以中文或英文渲染。本插件的词典注册在 `llm-wire-trace` 命名空间下；未来若有语言包想为本插件扩展语言，可以通过 locale 服务自身的 `addLanguage` 扩展点。
+
+### 对比：请求体发生了什么变化
+
+同一轮里连续的几次调用发出的请求几乎一样，读者通常想问的是「这一次 harness 到底改了什么？」——而两棵 200 KB 的 JSON 树很难回答这个问题。**Compare（对比）** 标签页直接回答它。
+
+- **默认基准是「上一次同类请求」**：同一 session 里最近的、用途（purpose）相同的更早一条记录。中间夹着的后台 `session-title` / `compaction` 调用会被跳过（它们的 body 毫不相干），而它们自己则与上一次同用途的调用对比。同类请求的第一次没有默认基准，标签页会明说。
+- **可以手动选任意其他调用作基准。**「对比基准」下拉框按 turn 分组列出所有其他记录——可以拿某一步和本轮第一步比，也可以拿第 N 轮和第 N−1 轮比。基准行在列表里带「基准」标记。手动选择会一直保留到你选中另一条记录（之后回到默认）；点「恢复默认」立即回到默认。对比标签页打开时再点列表里的其他行，仍停留在对比页，方便逐步翻看一轮里每一步的变化。
+- **结构化 diff，按顶层 key 分组。** `messages`、`tools`、`temperature` 等各占一节，带变化计数（`+2 ~1`），数组还显示长度变化（`4 → 6 项`）。追加的消息显示为新增；被修改的消息只显示变了的那个字段（`[0].content`）；被修改的字符串会原地高亮，多行文本（如 system prompt）则显示为行级 diff，未变化的部分折叠起来。较长的值点击即可展开。对象的 key 顺序不算变化。被删除项的序号指它在基准里的位置（标签页里有说明）。
+- **未变化的顶层字段会折叠列出**，这样也能看到哪些东西没变。
+- **「复制」会把变化清单复制为纯文本**，每处变化一行。
+
+两边的 body 都必须能解析为 JSON。被 `maxBodyChars` 截断的 body 无法解析，此时标签页会指明是哪一边，而不是瞎猜。这里没有任何东西会改动已存储的 body：diff 是浏览器端基于同样原样保存的记录算出来的。
 
 ### harness 坐标（turn / step）
 
@@ -403,6 +415,8 @@ content 和 reasoning-content 的增量按线路顺序拼接；工具调用被�
 
 `复制` 会把当前这一半完整记录 —— 整个 `request` 或 `response` 对象，含请求头 —— 以格式化 JSON 放入剪贴板，与视图所显示的内容一致。`下载` 则把完整记录（两半都在）导出为 `llm-wire-trace-<id>.json`。
 
+如果只想复制某一个字段，把鼠标移到 JSON 树里对应的那一行：值的后面（而不是整个面板的最右边）会出现一个「复制」小按钮，键盘聚焦时同样会显示。它复制的是该节点的值——字符串按原文、不带引号；数字、布尔和 `null` 按原样；对象或数组（即使已经折叠）则是格式化后的 JSON——点击后按钮会变成绿色的「✓ 已复制」并保持约一秒半，让一次复制不会看起来像什么都没发生。
+
 ### 独立滚动：本插件需要修正的一个外壳 CSS 怪癖
 
 左侧记录列表与右侧详情面板本应各自独立滚动，但外壳自身的 `ConversationRoot` CSS 会造成阻碍：对于任何已打开的非空白会话（`data-phase="active"` —— 对我们来说就是永远如此），它会把那个被称为 `viewArea` 的祖先元素设为 `flex:1 0 auto; min-height:auto`。这对 Chat 是有意为之 —— 它让消息列表可以超出可视区域生长，从而使*整个页面*滚动、并把输入框粘性固定在底部 —— 但同一条规则不可避免地会作用到每一个 `conversation.view` 条目，包括本插件，进而破坏双栏布局：由于没有一个有界高度可供溢出，根元素会撑到与内容等高，整个页面变成一起滚动。
@@ -474,6 +488,8 @@ src/client/                   浏览器半边（由 esbuild 打包为单个经�
   view-model.ts                 视图背后的纯列表/详情逻辑（不依赖 DOM，有单元测试）
   strings.ts                    双语（zh/en）locale 词典，覆盖每一条面向用户的文案，注册进 ctx.locale
   json-view.ts                   可折叠 JSON 树组件
+  compare-view.ts                对比标签页：基准选择器与分组 diff（React；手工验证）
+  body-diff.ts                   两份请求体的纯结构化 diff（不含 DOM，有单元测试）
   json-model.ts                   纯 JSON 展平数据模型（不含 DOM）
   format.ts                       标签/格式化函数（turn 徽标、session 标签、时间戳）；以参数形式接收当前 locale 的 t
   sse.ts                           原始 SSE 帧解析/美化打印
@@ -518,9 +534,9 @@ pnpm run verify       # build + typecheck + test + lint —— 认为一次改�
 
 ### 测试
 
-`test/` 与 `src/host/**`、`src/shared/**`，以及不含 DOM 的 client 模块（`constants.ts`、`format.ts`、`json-model.ts`、`sse.ts`、`strings.ts`、`view-model.ts`、`sse-merge/**`）逐文件对应，用 Node 内置的测试运行器（`node:test`）——不引入任何测试框架依赖。覆盖范围包括：内存 store 与伪造 archive 的合并逻辑、持久化层用真实临时目录做的文件 I/O、turn/step 归属用到的 `AsyncLocalStorage` 上下文绑定，每个 SSE 合并适配器针对合成数据和一个本项目真实修过的 bug 的精确复现（一个 `message` item 自己的 id 被误判成 tool-call id），以及查看器自身的列表/详情逻辑 —— 内存读取与历史读取这两条竞争路径的合并、一次性的 session 过滤回退、turn 分组，以及请求体/响应体的选取。
+`test/` 与 `src/host/**`、`src/shared/**`，以及不含 DOM 的 client 模块（`body-diff.ts`、`constants.ts`、`format.ts`、`json-model.ts`、`sse.ts`、`strings.ts`、`view-model.ts`、`sse-merge/**`）逐文件对应，用 Node 内置的测试运行器（`node:test`）——不引入任何测试框架依赖。覆盖范围包括：内存 store 与伪造 archive 的合并逻辑、持久化层用真实临时目录做的文件 I/O、turn/step 归属用到的 `AsyncLocalStorage` 上下文绑定，每个 SSE 合并适配器针对合成数据和一个本项目真实修过的 bug 的精确复现（一个 `message` item 自己的 id 被误判成 tool-call id），以及查看器自身的列表/详情逻辑 —— 内存读取与历史读取这两条竞争路径的合并、一次性的 session 过滤回退、turn 分组，以及请求体/响应体的选取。
 
-刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
+刻意不做单元测试的部分：`src/host/index.ts` / `src/client/entry.ts`（纯 Cordis/`ModuleLoader` 胶水，靠 `build`+`typecheck` 成功来覆盖）和依赖真实 DOM/React 的 client 模块（`api-client.ts`、`styles.ts`、`json-view.ts`、`compare-view.ts`、`wire-trace-view.ts`），改用本项目开发过程中一直使用的"伪 React + 伪 `ModuleLoader` + 真实 `dist/client.js`"模式手工验证。
 
 一次改动完成前必须走完的确切自验证流程、测试目录布局依赖的模块边界，以及保护本项目既有设计取舍的硬性约束（不加 `prepare` 脚本、`dist/` 保持是 gitignore 掉的构建产物、body 逐字存储），见 [`AGENTS.md`](AGENTS.md)（英文）。
 

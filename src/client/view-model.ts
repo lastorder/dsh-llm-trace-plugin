@@ -323,3 +323,96 @@ export function describeBodyNotice(input: BodyNoticeInput): BodyNotice {
 export function stepDepth(current: number, delta: number, contentDepth: number): number {
   return Math.max(0, Math.min(contentDepth, current + delta))
 }
+
+// ---------------------------------------------------------------------------
+// Compare: choosing the baseline request
+// ---------------------------------------------------------------------------
+
+const purposeOf = (item: Pick<WireRecordSummary, 'purpose'>): string | null =>
+  typeof item.purpose === 'string' && item.purpose.length > 0 ? item.purpose : null
+
+/**
+ * The request a record is compared against when the reader has not picked one:
+ * the previous call of the same kind.
+ *
+ * "Previous" means the nearest OLDER row that belongs to the same session and
+ * has the same purpose. Matching on purpose matters because a background
+ * `session-title` or `compaction` call sits in time between two conversation
+ * steps but has an entirely different body — diffing step 2 against it would
+ * report the whole request as rewritten. A title call is likewise compared
+ * with the previous title call, not with whatever ran just before it.
+ *
+ * `items` is newest-first (the order the list renders), so older rows follow
+ * the selected one.
+ *
+ * @returns the baseline's id, or null when the record is the first of its kind.
+ */
+export function defaultBaselineId(items: readonly WireRecordSummary[], selectedId: string | null): string | null {
+  if (selectedId === null) return null
+  const index = items.findIndex((item) => item.id === selectedId)
+  if (index === -1) return null
+  const selected = items[index]
+  for (let i = index + 1; i < items.length; i += 1) {
+    const candidate = items[i]
+    if ((candidate.sessionId ?? null) === (selected.sessionId ?? null) && purposeOf(candidate) === purposeOf(selected)) {
+      return candidate.id
+    }
+  }
+  return null
+}
+
+/**
+ * The baseline actually in force: the reader's pick while it is still valid
+ * (still listed, and not the selected record itself), else the default.
+ */
+export function resolveBaselineId(
+  items: readonly WireRecordSummary[],
+  selectedId: string | null,
+  override: string | null,
+): string | null {
+  if (selectedId === null) return null
+  if (override !== null && override !== selectedId && items.some((item) => item.id === override)) return override
+  return defaultBaselineId(items, selectedId)
+}
+
+/** What the Compare tab has to say right now. */
+export type CompareStatus =
+  | { kind: 'no-others' }
+  | { kind: 'no-baseline' }
+  | { kind: 'loading' }
+  | { kind: 'error', message: string }
+  | { kind: 'not-json', side: 'base' | 'head' }
+  | { kind: 'ready' }
+
+export interface CompareStatusInput {
+  /** How many other rows exist to pick from. */
+  candidateCount: number
+  /** The baseline in force (see {@link resolveBaselineId}), if any. */
+  baselineId: string | null
+  /** The full record fetched for the baseline; only valid when its id matches `baselineId`. */
+  base: WireRecord | null
+  /** Why the baseline could not be fetched, if it could not. */
+  loadError: string | null
+  /** The selected record, once its full detail has arrived. */
+  head: WireRecord | null
+}
+
+/**
+ * Decide what the Compare tab shows: a reason there is nothing to compare, a
+ * loading/error state, or the diff itself.
+ *
+ * The order is the order a reader would need to act on: with no other row at
+ * all there is nothing to pick; with rows but no default baseline the reader
+ * is told to pick one; a stale `base` (still the previous baseline's record,
+ * from before the pick changed) counts as loading rather than being diffed
+ * against the wrong request.
+ */
+export function classifyCompare(input: CompareStatusInput): CompareStatus {
+  if (input.candidateCount === 0) return { kind: 'no-others' }
+  if (input.baselineId === null) return { kind: 'no-baseline' }
+  if (input.loadError !== null) return { kind: 'error', message: input.loadError }
+  if (input.head === null || input.base === null || input.base.id !== input.baselineId) return { kind: 'loading' }
+  if (isRawFallback(selectRequestBody(input.base))) return { kind: 'not-json', side: 'base' }
+  if (isRawFallback(selectRequestBody(input.head))) return { kind: 'not-json', side: 'head' }
+  return { kind: 'ready' }
+}

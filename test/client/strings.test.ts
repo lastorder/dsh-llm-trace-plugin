@@ -33,7 +33,7 @@ test('every entry in both dictionaries is a non-empty string', () => {
 test('covers every section the view renders, including the management panel', () => {
   // Pins the key set's shape so a whole section cannot be dropped without a
   // test failure — the view reads these by exact key.
-  const prefixes = ['toolbar', 'count', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth', 'manage']
+  const prefixes = ['toolbar', 'count', 'tabs', 'empty', 'notice', 'group', 'coord', 'badge', 'session', 'purpose', 'json', 'curl', 'turn', 'depth', 'compare', 'manage']
   for (const prefix of prefixes) {
     const hit = Object.keys(en).some((key) => key === prefix || key.startsWith(prefix + '.'))
     assert.ok(hit, `missing any key under "${prefix}"`)

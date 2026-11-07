@@ -9,6 +9,7 @@
   "include": [
     "src/host/**/*.ts",
     "src/shared/**/*.ts",
+    "src/client/body-diff.ts",
     "src/client/constants.ts",
     "src/client/format.ts",
     "src/client/json-model.ts",

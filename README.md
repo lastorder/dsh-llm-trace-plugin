@@ -223,9 +223,21 @@ Using the global stepper resets the baseline and clears any per-row folds, so th
 
 A folded container collapses to a one-line placeholder that keeps its trailing comma, e.g. `"messages": [ … 12 items ],`. Fully expanded, the view is valid JSON: it round-trips through `JSON.parse` to exactly the captured value.
 
-Two tabs, Request and Response. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is, by default, *reassembled* — its scattered delta fragments merged back into one complete, readable structure — and shown through the same JSON view (see below).
+Three tabs: Request, Response and Compare. Above them the detail pane shows the selected call's identity (model, status, start time, duration, HTTP status, method and URL) and its coordinate strip; the tab bar carries the per-record actions (copy as curl, copy, download), and the fold-depth stepper and the SSE toggle sit one row below, only on the two body tabs. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is, by default, *reassembled* — its scattered delta fragments merged back into one complete, readable structure — and shown through the same JSON view (see below).
 
 > The tab's language follows DSH's own Settings → General → Language switch (the `@deepseek-ai/dsh-client-locale` service), so every button, tooltip, and notice renders in Chinese or English to match. This plugin registers its dictionaries under the `llm-wire-trace` namespace; a future language pack targeting this plugin can extend that namespace through the locale service's own `addLanguage` extension point.
+
+### Compare: what changed in the request body
+
+Consecutive calls in a turn send almost the same request, so the usual question is *what did the harness change this time?* — which two 200 KB JSON trees answer badly. The **Compare** tab answers it directly.
+
+- **The default baseline is the previous call of the same kind**: the nearest older row in the same session with the same purpose. A background `session-title` / `compaction` call that ran in between is skipped (its body is unrelated), and is itself compared with the previous call of its own purpose. The first call of its kind has no default baseline, and the tab says so.
+- **Pick any other call as the baseline.** The `Compare against` dropdown lists every other row, grouped by turn — compare a step with the start of its turn, or turn N with turn N−1. The baseline row is tagged `Base` in the list. A pick lasts until you select another record (then the default applies again); `Reset to previous` returns to it at once. Selecting another row while Compare is open keeps Compare open, so you can walk a turn step by step.
+- **A structural diff, grouped by top-level key.** `messages`, `tools`, `temperature`, … each get a section with change counts (`+2 ~1`) and, for arrays, the length change (`4 → 6 items`). An appended message is an addition; an edited message shows only the field that changed (`[0].content`); a changed string is highlighted in place, and a multi-line one (a system prompt) is shown as a line diff with unchanged stretches folded. Long values expand on click. Object key order is not a change. The index of a removed item is its position in the baseline (the tab says so).
+- **Unchanged top-level fields are listed, collapsed**, so you can also see what stayed the same.
+- **`Copy` copies the change list as plain text**, one change per line.
+
+Both bodies must parse as JSON. A body cut by `maxBodyChars` cannot, and the tab names which side it is rather than guessing. Nothing here alters the stored bodies: the diff is computed in the browser from the same verbatim records.
 
 ### Harness coordinates (turn / step)
 
@@ -406,6 +418,8 @@ The client tells you which of the two happened after each copy. Inlining a real 
 
 Copy (`复制`) puts the complete record half — the whole `request` or `response` object, headers included — on the clipboard as formatted JSON, matching what the view shows. Download (`下载`) exports the complete record, both halves, as `llm-wire-trace-<id>.json`.
 
+To copy a single field instead, hover its row in the JSON tree: a `Copy` pill appears right after the value (not at the far edge of the pane), and focusing it with the keyboard shows it too. It copies that node's value — a string raw, without quotes; a number, boolean or `null` as written; an object or array (even one folded away) as formatted JSON — and turns into a green `✓ Copied` for about a second and a half, so a copy never looks like nothing happened.
+
 ### Independent scrolling: a shell CSS quirk this plugin corrects
 
 The left record list and the right detail pane are meant to scroll independently, but the shell's own `ConversationRoot` CSS gets in the way: for any open, non-blank session (`data-phase="active"` — i.e. always, for us) it sets the ancestor it calls `viewArea` to `flex:1 0 auto; min-height:auto`. That's intentional for Chat — it lets the message list grow past the visible area so the *whole page* scrolls with a sticky composer pinned at the bottom — but the same rule reaches every `conversation.view` entry, including this one, and breaks a two-pane layout: with no bounded height to overflow against, the root grows to fit its content and the whole page scrolls as one.
@@ -477,6 +491,8 @@ src/client/                  browser half (bundled by esbuild into one classic s
   view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
   strings.ts                   bilingual (zh/en) locale dictionaries for every user-visible string, registered with ctx.locale
   json-view.ts                 the collapsible JSON tree component
+  compare-view.ts              the Compare tab: baseline picker and the grouped diff (React; hand-verified)
+  body-diff.ts                 pure structural diff of two request bodies (no DOM, unit-tested)
   json-model.ts                 pure JSON-flattening data model (no DOM)
   format.ts                     labels/formatters (turn badge, session label, timestamps); takes the active-locale t as a parameter
   sse.ts                        raw SSE frame parsing/pretty-printing
@@ -521,9 +537,9 @@ For local development, run `pnpm run build` after every source change (needed fo
 
 ### Tests
 
-`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `strings.ts`, `view-model.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id), and the viewer's own list/detail logic — the merge of the racing memory and history reads, the one-shot session-filter fallback, turn grouping, and body selection.
+`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`body-diff.ts`, `constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `strings.ts`, `view-model.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id), and the viewer's own list/detail logic — the merge of the racing memory and history reads, the one-shot session-filter fallback, turn grouping, and body selection.
 
-Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
+Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `compare-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
 
 See [`AGENTS.md`](AGENTS.md) for the exact self-verification flow a change must complete before it's done, the module boundaries the test layout depends on, and the hard constraints (no `prepare` script, `dist/` stays a gitignored build artifact, bodies stay verbatim) that protect this project's deliberate design choices.
 

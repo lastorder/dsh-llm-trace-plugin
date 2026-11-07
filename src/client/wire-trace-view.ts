@@ -16,14 +16,19 @@ import { fmtCount, maxDepthOf } from './json-model.js'
 import { parseSseFrames, prettySseText } from './sse.js'
 import { mergeSseChunks } from './sse-merge/index.js'
 import { createJsonView, type ReactLike as MinimalReactLike } from './json-view.js'
+import { createCompareView } from './compare-view.js'
+import { diffBodies, formatDiffText } from './body-diff.js'
 import { LIST_PAGE_LIMIT } from './constants.js'
 import {
+  classifyCompare,
+  defaultBaselineId,
   describeBodyNotice,
   groupRows,
   isRawFallback,
   isSseResponse,
   mergeSummaryPages,
   normalizePage,
+  resolveBaselineId,
   RAW_KEY,
   selectRequestBody,
   selectResponseBody,
@@ -65,6 +70,7 @@ export interface WireTraceViewProps {
 export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
   const h = React.createElement
   const JsonView = createJsonView(React)
+  const CompareView = createCompareView(React)
 
   /**
    * `conversation.view` is a session-scoped slot, so the framework passes the
@@ -94,7 +100,14 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     const [auxiliary, setAuxiliary] = React.useState(0)
     const [selected, setSelected] = React.useState<string | null>(null)
     const [detail, setDetail] = React.useState<WireRecord | null>(null)
-    const [tab, setTab] = React.useState<'request' | 'response'>('request')
+    const [tab, setTab] = React.useState<'request' | 'response' | 'compare'>('request')
+    // Compare tab: the reader's own baseline pick (null = use the default,
+    // the previous call of the same kind), and the baseline's full record.
+    // `baseError` remembers WHICH baseline failed, so a stale failure can
+    // never be shown against a different pick.
+    const [baselineOverride, setBaselineOverride] = React.useState<string | null>(null)
+    const [baseDetail, setBaseDetail] = React.useState<WireRecord | null>(null)
+    const [baseError, setBaseError] = React.useState<{ id: string, message: string } | null>(null)
     const [error, setError] = React.useState<string | null>(null)
     const [tick, setTick] = React.useState(0)
     // Container open/closed state is a global baseline depth plus per-path
@@ -112,6 +125,9 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     // Whether the toolbar counter's explanation is expanded; see counterText.
     const [countOpen, setCountOpen] = React.useState(false)
     const [curlNotice, setCurlNotice] = React.useState<string | null>(null)
+    // The tree row whose copy was just done, so it can say so for a moment.
+    const [copiedPath, setCopiedPath] = React.useState<string | null>(null)
+    const copiedTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
     // One-shot escape hatch for a provider that never stamps the session
     // header at all (pi-ai puts the id only in an SDK-local option, never on
     // the wire). Under such a provider the default filter would match
@@ -285,11 +301,49 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       setDepth(1)
       setOverrides(new Map())
       setLongOpen(new Set())
+      setCopiedPath(null)
     }, [selected, tab])
+
+    React.useEffect(() => () => {
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current)
+    }, [])
+
+    const copyNode = React.useCallback((path: string, text: string) => {
+      copy(text)
+      setCopiedPath(path)
+      if (copiedTimer.current !== null) clearTimeout(copiedTimer.current)
+      copiedTimer.current = setTimeout(() => setCopiedPath(null), 1500)
+    }, [])
 
     React.useEffect(() => {
       setCurlNotice(null)
     }, [selected])
+
+    // A baseline pick is relative to the record it was made for. Moving to
+    // another record goes back to the default (the previous call) instead of
+    // silently carrying a stale choice along.
+    React.useEffect(() => {
+      setBaselineOverride(null)
+    }, [selected])
+
+    const baselineId = React.useMemo(
+      () => resolveBaselineId(items, selected, baselineOverride),
+      [items, selected, baselineOverride],
+    )
+    const defaultId = React.useMemo(() => defaultBaselineId(items, selected), [items, selected])
+
+    // The baseline's body is fetched only when the Compare tab is actually in
+    // use, and only when the baseline itself changes — polling replaces
+    // `items` every few seconds but leaves the baseline's id alone.
+    React.useEffect(() => {
+      if (tab !== 'compare' || baselineId === null) return undefined
+      let alive = true
+      apiGet('get', { id: baselineId }).then(
+        (result: any) => { if (alive) setBaseDetail(result) },
+        (reason: any) => { if (alive) setBaseError({ id: baselineId, message: String((reason && reason.message) || reason) }) },
+      )
+      return () => { alive = false }
+    }, [tab, baselineId])
 
     const copyCurl = () => {
       if (detail === null || curlBusy) return
@@ -354,13 +408,16 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
       }),
       [detail, sseMerged],
     )
-    const treeValue = tab === 'request' ? requestBody : responseBody
+    // The Compare tab has no body of its own; Copy/Download still address the
+    // request side while it is open.
+    const side = tab === 'response' ? 'response' : 'request'
+    const treeValue = side === 'request' ? requestBody : responseBody
 
     // Why the JSON view fell back to a single `__raw__` blob — overwhelmingly
     // because a body cut at the character cap stops mid-JSON and cannot parse.
     const shownBody = detail === null
       ? null
-      : (tab === 'request' ? detail.request : detail.response)
+      : (side === 'request' ? detail.request : detail.response)
     const rawFallback = isRawFallback(treeValue)
     const notice = describeBodyNotice({ treeValue, shown: shownBody })
     const bodyNotice = notice.kind === 'none'
@@ -377,7 +434,27 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
     // re-indented, so what you read still matches the bytes on the wire
     // frame-for-frame.
     const rawText = showRaw ? prettySseText(detail!.response!.bodyText) : ''
-    const text = detail === null ? '' : stringify(tab === 'request' ? detail.request : detail.response)
+    const text = detail === null ? '' : stringify(side === 'request' ? detail.request : detail.response)
+
+    // ---- Compare ---------------------------------------------------------
+    // Only trust a detail that belongs to the CURRENT selection: right after a
+    // click the previous record's detail is still in state until the fetch lands.
+    const headDetail = detail !== null && detail.id === selected ? detail : null
+    const candidateRows = React.useMemo(() => items.filter((item) => item.id !== selected), [items, selected])
+    const candidateGroups = React.useMemo(() => groupRows(candidateRows), [candidateRows])
+    const compareStatus = classifyCompare({
+      candidateCount: candidateRows.length,
+      baselineId,
+      base: baseDetail,
+      loadError: baseError !== null && baseError.id === baselineId ? baseError.message : null,
+      head: headDetail,
+    })
+    const compareReady = tab === 'compare' && compareStatus.kind === 'ready'
+    const diff = React.useMemo(
+      () => (compareReady ? diffBodies(selectRequestBody(baseDetail), selectRequestBody(headDetail)) : null),
+      [compareReady, baseDetail, headDetail],
+    )
+    const diffText = diff === null ? '' : formatDiffText(diff)
 
     // Deepest nesting actually present, so `+` can stop at the point where it
     // would no longer change anything (and the button can disable).
@@ -432,7 +509,10 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
         key: item.id,
         className: 'wt-item',
         'data-sel': item.id === selected ? '1' : '0',
-        onClick: () => { setSelected(item.id); setTab('request') },
+        // While comparing, stepping through the list keeps the Compare tab
+        // open: that is how you walk a turn step by step and read each diff.
+        'data-base': tab === 'compare' && item.id === baselineId ? '1' : '0',
+        onClick: () => { setSelected(item.id); setTab(tab === 'compare' ? 'compare' : 'request') },
       },
       [
         h('div', { className: 'wt-row', key: 'r1' }, [
@@ -443,6 +523,9 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
             return h('span', { className: 'wt-step', 'data-k': badge.kind, key: 'st', title: badge.title }, badge.text)
           })(),
           h('span', { className: 'wt-model', key: 'm' }, item.model || item.url),
+          tab === 'compare' && item.id === baselineId
+            ? h('span', { className: 'wt-basetag', key: 'b', title: t('compare.baseTagTitle') }, t('compare.baseTag'))
+            : null,
           h('span', { className: 'wt-tag', 'data-k': statusKind(item.status), key: 's' }, item.status),
         ]),
         h('div', { className: 'wt-sub', key: 'r2' }, [
@@ -562,50 +645,20 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
             ].filter(Boolean)),
       ].filter(Boolean)),
       h('div', { className: 'wt-right', key: 'right' }, [
-        h('div', { className: 'wt-tabs', key: 'tabs' }, [
-          h('button', { className: 'wt-btn', key: 'req', 'data-on': tab === 'request' ? '1' : '0', onClick: () => setTab('request') }, t('tabs.request')),
-          h('button', { className: 'wt-btn', key: 'res', 'data-on': tab === 'response' ? '1' : '0', onClick: () => setTab('response') }, t('tabs.response')),
-          h('span', { className: 'wt-div', key: 'div' }),
-          isSse && tab === 'response'
-            ? h('button', {
-              className: 'wt-btn',
-              key: 'sse',
-              // No data-on here, unlike this toolbar's other toggles: those
-              // (Request/Response) keep a FIXED label and use the highlight to
-              // show which state is active. This button's label already IS the
-              // state indicator — it always names the mode you'd switch TO — so
-              // a highlight on top would just be redundant with the text, with
-              // no stable "on" state to anchor it to.
-              title: sseMerged ? t('tabs.sseShowRawTitle') : t('tabs.sseShowMergedTitle'),
-              onClick: () => setSseMerged(!sseMerged),
-            }, sseMerged ? t('tabs.sseShowRaw') : t('tabs.sseShowMerged'))
-            : null,
-          h('button', {
-            className: 'wt-btn wt-btn-step',
-            key: 'less',
-            title: t('tabs.collapseTitle'),
-            onClick: () => step(-1),
-            disabled: detail === null || showRaw || depth <= 0,
-          }, t('tabs.collapse')),
-          h('button', {
-            className: 'wt-btn wt-btn-step',
-            key: 'more',
-            title: t('tabs.expandTitle'),
-            onClick: () => step(1),
-            disabled: detail === null || showRaw || depth >= contentDepth,
-          }, t('tabs.expand')),
-          h('span', { className: 'wt-meta', key: 'depth' }, showRaw || detail === null ? '' : t('depth.label', { depth, contentDepth })),
-          h('span', { className: 'wt-meta', key: 'sp' }, detail === null ? '' : detail.id + ' · ' + detail.request.method + ' ' + detail.request.url),
-          h('button', {
-            className: 'wt-btn',
-            key: 'curl',
-            disabled: detail === null || curlBusy,
-            title: t('tabs.curlTitle'),
-            onClick: copyCurl,
-          }, curlBusy ? t('tabs.curlBusy') : t('tabs.curl')),
-          h('button', { className: 'wt-btn', key: 'copy', onClick: () => copy(showRaw ? rawText : text) }, t('tabs.copy')),
-          h('button', { className: 'wt-btn', key: 'dl', onClick: () => { if (detail !== null) download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) } }, t('tabs.download')),
-        ].filter(Boolean)),
+        // Identity of the selected call: which model, did it work, how long
+        // did it take. The wire bytes below never say any of this up front.
+        detail === null ? null : h('div', { className: 'wt-head', key: 'head' }, [
+          h('div', { className: 'wt-head-main', key: 'main' }, [
+            h('span', { className: 'wt-head-model', key: 'm', title: detail.model || detail.request.url }, detail.model || detail.request.url),
+            h('span', { className: 'wt-tag', 'data-k': statusKind(detail.status), key: 's' }, detail.status),
+            h('span', { className: 'wt-head-stats', key: 'st' }, [
+              fmtTime(detail.startedAt),
+              fmtDuration(detail.durationMs),
+              detail.response === null ? 'HTTP -' : 'HTTP ' + detail.response.status,
+            ].join(' · ')),
+          ]),
+          h('div', { className: 'wt-head-url', key: 'url', title: detail.id }, detail.request.method + ' ' + detail.request.url),
+        ]),
         // Always-visible coordinate strip for the selected record: the
         // harness facts that the wire bytes below can never tell you.
         detail === null ? null : (() => {
@@ -635,35 +688,115 @@ export function createWireTraceView(React: WireTraceReact, ctx: ViewContext) {
           }
           return h('div', { className: 'wt-coords', key: 'coords' }, parts)
         })(),
+        // What to look at (tabs) on the left, what to do with it (actions) on
+        // the right. View-specific controls live one row down, so this row
+        // never wraps into a pile of unrelated buttons.
+        detail === null ? null : h('div', { className: 'wt-tabs', key: 'tabs' }, [
+          h('div', { className: 'wt-tablist', role: 'tablist', key: 'list' }, (['request', 'response', 'compare'] as const).map((name) => h('button', {
+            className: 'wt-tab',
+            key: name,
+            role: 'tab',
+            'aria-selected': tab === name ? 'true' : 'false',
+            'data-on': tab === name ? '1' : '0',
+            onClick: () => setTab(name),
+          }, t('tabs.' + name)))),
+          h('div', { className: 'wt-actions', key: 'actions' }, [
+            h('button', {
+              className: 'wt-btn',
+              key: 'curl',
+              disabled: curlBusy,
+              title: t('tabs.curlTitle'),
+              onClick: copyCurl,
+            }, curlBusy ? t('tabs.curlBusy') : t('tabs.curl')),
+            h('button', {
+              className: 'wt-btn',
+              key: 'copy',
+              disabled: tab === 'compare' && diffText === '',
+              title: tab === 'compare' ? t('tabs.copyDiffTitle') : t('tabs.copyTitle'),
+              onClick: () => copy(tab === 'compare' ? diffText : (showRaw ? rawText : text)),
+            }, t('tabs.copy')),
+            h('button', {
+              className: 'wt-btn',
+              key: 'dl',
+              title: t('tabs.downloadTitle'),
+              onClick: () => { download('llm-wire-trace-' + detail.id + '.json', stringify(detail)) },
+            }, t('tabs.download')),
+          ]),
+        ]),
+        // Controls for reading one body: SSE merged/raw, and fold depth.
+        detail === null || tab === 'compare' ? null : h('div', { className: 'wt-subbar', key: 'subbar' }, [
+          isSse && tab === 'response'
+            ? h('button', {
+              className: 'wt-btn',
+              key: 'sse',
+              // No data-on here, unlike the tabs: this button's label already
+              // IS the state indicator — it always names the mode you'd switch
+              // TO — so a highlight on top would just be redundant with the
+              // text, with no stable "on" state to anchor it to.
+              title: sseMerged ? t('tabs.sseShowRawTitle') : t('tabs.sseShowMergedTitle'),
+              onClick: () => setSseMerged(!sseMerged),
+            }, sseMerged ? t('tabs.sseShowRaw') : t('tabs.sseShowMerged'))
+            : null,
+          h('span', { className: 'wt-subbar-fill', key: 'fill' }),
+          h('span', { className: 'wt-meta', key: 'depth' }, showRaw ? '' : t('depth.label', { depth, contentDepth })),
+          h('button', {
+            className: 'wt-btn wt-btn-step',
+            key: 'less',
+            title: t('tabs.collapseTitle'),
+            onClick: () => step(-1),
+            disabled: showRaw || depth <= 0,
+          }, t('tabs.collapse')),
+          h('button', {
+            className: 'wt-btn wt-btn-step',
+            key: 'more',
+            title: t('tabs.expandTitle'),
+            onClick: () => step(1),
+            disabled: showRaw || depth >= contentDepth,
+          }, t('tabs.expand')),
+        ].filter(Boolean)),
         curlNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'curl-notice', style: { padding: '4px 12px' } }, curlNotice),
         detail === null
           ? h('div', { className: 'wt-empty', key: 'empty' }, t('empty.noSelection'))
-          : (tab === 'response' && detail.response === null)
-            ? h('div', { className: 'wt-empty', key: 'pending' }, t('empty.responsePending'))
-            : showRaw
-              ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
-              : h(React.Fragment, { key: 'json' }, [
-                // Say why the structure is missing, rather than leaving a bare
-                // `__raw__` key for the reader to decipher.
-                bodyNotice === null
-                  ? null
-                  : h('div', { className: 'wt-jnotice', key: 'notice', style: { padding: '4px 12px' } }, bodyNotice),
-                // Non-JSON content is shown as text. Wrapping it in a
-                // synthetic `__raw__` object only dressed it up as JSON it is
-                // not, and buried it one expand deep.
-                rawFallback
-                  ? h('pre', { className: 'wt-sse', key: 'text' }, (treeValue as Record<string, string>)[RAW_KEY] || '')
-                  : h(JsonView, {
-                    key: 'tree',
-                    value: treeValue,
-                    isOpen,
-                    longOpen,
-                    onToggle: toggle,
-                    onToggleLong: toggleLong,
-                    t,
-                  }),
-              ].filter(Boolean)),
-      ]),
+          : tab === 'compare'
+            ? h(CompareView, {
+              key: 'compare',
+              status: compareStatus,
+              diff,
+              candidates: candidateGroups,
+              baselineId,
+              defaultId,
+              overridden: baselineOverride !== null && baselineId === baselineOverride,
+              onPick: (id: string | null) => setBaselineOverride(id === defaultId ? null : id),
+              t,
+            })
+            : (tab === 'response' && detail.response === null)
+              ? h('div', { className: 'wt-empty', key: 'pending' }, t('empty.responsePending'))
+              : showRaw
+                ? h('pre', { className: 'wt-sse', key: 'raw' }, rawText)
+                : h(React.Fragment, { key: 'json' }, [
+                  // Say why the structure is missing, rather than leaving a bare
+                  // `__raw__` key for the reader to decipher.
+                  bodyNotice === null
+                    ? null
+                    : h('div', { className: 'wt-jnotice', key: 'notice', style: { padding: '4px 12px' } }, bodyNotice),
+                  // Non-JSON content is shown as text. Wrapping it in a
+                  // synthetic `__raw__` object only dressed it up as JSON it is
+                  // not, and buried it one expand deep.
+                  rawFallback
+                    ? h('pre', { className: 'wt-sse', key: 'text' }, (treeValue as Record<string, string>)[RAW_KEY] || '')
+                    : h(JsonView, {
+                      key: 'tree',
+                      value: treeValue,
+                      isOpen,
+                      longOpen,
+                      onToggle: toggle,
+                      onToggleLong: toggleLong,
+                      onCopy: copyNode,
+                      copiedPath,
+                      t,
+                    }),
+                ].filter(Boolean)),
+      ].filter(Boolean)),
     ])
   }
 }
