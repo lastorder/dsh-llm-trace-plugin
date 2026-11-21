@@ -8,7 +8,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { buildCurl, resolveRealApiKey, type CredentialProvider } from './curl.js'
-import { CONFIG_FIELDS } from './config.js'
+import { CONFIG_FIELDS, LEGACY_CONFIG_FIELDS } from './config.js'
 import type { WireTraceStore } from './store.js'
 
 async function readJsonBody(req: IncomingMessage, limit = 262144): Promise<any> {
@@ -212,6 +212,9 @@ export function createRouteHandler(deps: RouteDeps) {
         try {
           await editor.edit(entry, (current) => {
             const next: Record<string, unknown> = { ...current }
+            // Options earlier versions accepted no longer do anything; drop
+            // them so the profile stops carrying them.
+            for (const key of LEGACY_CONFIG_FIELDS) delete next[key]
             for (const key of CONFIG_FIELDS) {
               if (!Object.hasOwn(patch, key)) continue
               const value = (patch as Record<string, unknown>)[key]

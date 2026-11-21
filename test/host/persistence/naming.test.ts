@@ -1,52 +1,53 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildRecordName, idFromName, resolveTraceDir } from '../../../src/host/persistence/naming.js'
+import { join } from 'node:path'
+import {
+  buildRecordId,
+  buildSegmentStem,
+  LEGACY_RECORD_FILE,
+  LEGACY_TEMP_FILE,
+  parseSegmentFile,
+  resolveTraceDir,
+} from '../../../src/host/persistence/naming.js'
 
-test('buildRecordName: matches the file-record regex shape (13-digit ms, 4-hex ordinal, 8-hex random)', () => {
-  const name = buildRecordName(1700000000000)
-  assert.match(name, /^\d{13}-[0-9a-f]{4}-[0-9a-f]{8}\.json$/)
+test('buildRecordId: 13-digit ms, 4-hex ordinal, 8-hex random', () => {
+  assert.match(buildRecordId(1700000000000), /^1700000000000-[0-9a-f]{4}-[0-9a-f]{8}$/)
 })
 
-test('buildRecordName: two calls at the same millisecond get an increasing intra-ms ordinal', () => {
-  const first = buildRecordName(1700000000123)
-  const second = buildRecordName(1700000000123)
-  const firstOrdinal = first.split('-')[1]
-  const secondOrdinal = second.split('-')[1]
-  assert.ok(parseInt(secondOrdinal, 16) > parseInt(firstOrdinal, 16))
+test('buildRecordId: two calls in the same millisecond get an increasing ordinal; a later one resets it', () => {
+  const first = buildRecordId(1700000000123)
+  const second = buildRecordId(1700000000123)
+  assert.ok(first < second)
+  assert.equal(buildRecordId(1700000000124).split('-')[1], '0000')
 })
 
-test('buildRecordName: a later millisecond resets the intra-ms ordinal to zero', () => {
-  buildRecordName(1700000000200)
-  buildRecordName(1700000000200)
-  const nextMs = buildRecordName(1700000000201)
-  assert.equal(nextMs.split('-')[1], '0000')
+test('buildRecordId: ids sort lexicographically in timestamp order, and a negative time clamps to zero', () => {
+  assert.ok(buildRecordId(1700000000300) < buildRecordId(1700000000400))
+  assert.match(buildRecordId(-5), /^0000000000000-/)
 })
 
-test('buildRecordName: names sort lexicographically in the same order as their timestamps', () => {
-  const a = buildRecordName(1700000000300)
-  const b = buildRecordName(1700000000400)
-  assert.ok(a < b)
+test('buildSegmentStem/parseSegmentFile: round-trip both file kinds and recover the start time', () => {
+  const stem = buildSegmentStem(1700000000000)
+  assert.match(stem, /^1700000000000-[0-9a-f]{8}$/)
+  assert.deepEqual(parseSegmentFile(`${stem}.dat`), { stem, kind: 'dat', startMs: 1700000000000 })
+  assert.deepEqual(parseSegmentFile(`${stem}.idx`), { stem, kind: 'idx', startMs: 1700000000000 })
 })
 
-test('buildRecordName: a negative/fractional startedAt is floored and clamped to zero, never negative', () => {
-  const name = buildRecordName(-5)
-  assert.match(name, /^0000000000000-/)
+test('parseSegmentFile: ignores everything else in the directory', () => {
+  for (const name of ['1700000000000-0000-aaaaaaaa.json', '1700000000000-abc.dat', 'notes.txt', '1700000000000-aaaaaaaa.dat.tmp']) {
+    assert.equal(parseSegmentFile(name), null, name)
+  }
 })
 
-test('idFromName: strips exactly the .json extension', () => {
-  assert.equal(idFromName('1700000000000-0000-aaaaaaaa.json'), '1700000000000-0000-aaaaaaaa')
+test('LEGACY_RECORD_FILE/LEGACY_TEMP_FILE: recognize files earlier versions wrote, and not segments', () => {
+  assert.ok(LEGACY_RECORD_FILE.test('1700000000000-0000-aaaaaaaa.json'))
+  assert.ok(LEGACY_RECORD_FILE.test('1700000000000-aaaaaaaa.json'))
+  assert.ok(!LEGACY_RECORD_FILE.test('1700000000000-aaaaaaaa.dat'))
+  assert.ok(LEGACY_TEMP_FILE.test('1700000000000-0000-aaaaaaaa.json.1a2b3c4d.tmp'))
 })
 
-test('resolveTraceDir: an explicit directory always wins', () => {
-  assert.equal(resolveTraceDir('/explicit/dir', { DSH_HOME: '/home' }), '/explicit/dir')
-})
-
-test('resolveTraceDir: falls back to $DSH_HOME/llm-wire-trace/records', () => {
-  const dir = resolveTraceDir(undefined, { DSH_HOME: '/custom/home' })
-  assert.equal(dir, '/custom/home/llm-wire-trace/records')
-})
-
-test('resolveTraceDir: falls back to homedir()/.dsh when DSH_HOME is unset', () => {
-  const dir = resolveTraceDir(undefined, {})
-  assert.ok(dir.endsWith('/.dsh/llm-wire-trace/records'))
+test('resolveTraceDir: an explicit directory wins; otherwise $DSH_HOME, then ~/.dsh', () => {
+  assert.equal(resolveTraceDir('/custom', { DSH_HOME: '/dsh' }), '/custom')
+  assert.equal(resolveTraceDir(undefined, { DSH_HOME: '/dsh' }), join('/dsh', 'llm-wire-trace', 'records'))
+  assert.ok(resolveTraceDir(undefined, {}).endsWith(join('.dsh', 'llm-wire-trace', 'records')))
 })

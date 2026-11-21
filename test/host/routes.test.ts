@@ -26,7 +26,7 @@ function routeDeps(store: WireTraceStore, overrides: Partial<RouteDeps> = {}): R
     store,
     routePrefix: ROUTE_PREFIX,
     getCredentials: () => undefined,
-    currentConfig: () => ({ maxRecords: 200 }),
+    currentConfig: () => ({ maxDiskMB: 1024 }),
     schema: () => ({}),
     getConfigEditor: () => undefined,
     getSelfEntry: () => undefined,
@@ -257,14 +257,14 @@ test('a thrown store error becomes a 500 with its message, never an unhandled re
 
 test('config GET: reports editable=false with no configEditor/entry, plus the current values and field list', async () => {
   const store = fakeStore()
-  const handler = createRouteHandler(routeDeps(store, { currentConfig: () => ({ maxRecords: 200, persist: true }) }))
+  const handler = createRouteHandler(routeDeps(store, { currentConfig: () => ({ maxDiskMB: 1024, persist: true }) }))
   const { res, captured } = fakeResponse()
   await handler(fakeRequest(`${ROUTE_PREFIX}/config`), res)
   assert.equal(captured.status, 200)
   const body = captured.json() as any
   assert.equal(body.editable, false)
-  assert.deepEqual(body.values, { maxRecords: 200, persist: true })
-  assert.ok(Array.isArray(body.fields) && body.fields.includes('maxRecords'))
+  assert.deepEqual(body.values, { maxDiskMB: 1024, persist: true })
+  assert.deepEqual(body.fields, ['persist', 'maxDiskMB', 'traceDir'])
 })
 
 test('config GET: reports editable=true once both a configEditor and this plugin\'s own entry exist', async () => {
@@ -283,30 +283,43 @@ test('config GET: reports editable=true once both a configEditor and this plugin
 
 test('config POST: merges the patch over the current config and persists through configEditor.edit', async () => {
   const store = fakeStore()
-  const editor = fakeConfigEditor({ maxRecords: 200, persist: true })
+  const editor = fakeConfigEditor({ maxDiskMB: 1024, persist: true })
   const handler = createRouteHandler(routeDeps(store, {
     getConfigEditor: () => editor,
     getSelfEntry: () => editor.entry,
     schema: (data) => data,
   }))
   const { res, captured } = fakeResponse()
-  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxRecords":500}'], { 'sec-fetch-site': 'same-origin' }), res)
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":500}'], { 'sec-fetch-site': 'same-origin' }), res)
   assert.equal(captured.status, 200)
   assert.deepEqual(captured.json(), { ok: true })
-  assert.deepEqual(editor.current, { maxRecords: 500, persist: true })
+  assert.deepEqual(editor.current, { maxDiskMB: 500, persist: true })
 })
 
 test('config POST: a null value unsets that field rather than storing null', async () => {
   const store = fakeStore()
-  const editor = fakeConfigEditor({ maxRecords: 500, persist: true })
+  const editor = fakeConfigEditor({ maxDiskMB: 500, persist: true })
   const handler = createRouteHandler(routeDeps(store, {
     getConfigEditor: () => editor,
     getSelfEntry: () => editor.entry,
     schema: (data) => data,
   }))
   const { res } = fakeResponse()
-  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxRecords":null}'], { 'sec-fetch-site': 'same-origin' }), res)
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":null}'], { 'sec-fetch-site': 'same-origin' }), res)
   assert.deepEqual(editor.current, { persist: true })
+})
+
+test('config POST: options from earlier versions are dropped from the saved config', async () => {
+  const store = fakeStore()
+  const editor = fakeConfigEditor({ maxPersistedRecords: 300, prettyBodyLimit: 1, maxRecords: 200, persist: true })
+  const handler = createRouteHandler(routeDeps(store, {
+    getConfigEditor: () => editor,
+    getSelfEntry: () => editor.entry,
+    schema: (data) => data,
+  }))
+  const { res } = fakeResponse()
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":2048}'], { 'sec-fetch-site': 'same-origin' }), res)
+  assert.deepEqual(editor.current, { persist: true, maxDiskMB: 2048 })
 })
 
 test('config POST: an unknown field is refused with 400 and never reaches configEditor', async () => {
@@ -325,24 +338,24 @@ test('config POST: an unknown field is refused with 400 and never reaches config
 
 test('config POST: a schema rejection becomes a 400 and the config is left untouched', async () => {
   const store = fakeStore()
-  const editor = fakeConfigEditor({ maxRecords: 200 })
+  const editor = fakeConfigEditor({ maxDiskMB: 1024 })
   const handler = createRouteHandler(routeDeps(store, {
     getConfigEditor: () => editor,
     getSelfEntry: () => editor.entry,
-    schema: () => { throw new Error('maxRecords must be at least 1') },
+    schema: () => { throw new Error('maxDiskMB must be at least 16') },
   }))
   const { res, captured } = fakeResponse()
-  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxRecords":-1}'], { 'sec-fetch-site': 'same-origin' }), res)
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":1}'], { 'sec-fetch-site': 'same-origin' }), res)
   assert.equal(captured.status, 400)
-  assert.match((captured.json() as any).error, /maxRecords/)
-  assert.deepEqual(editor.current, { maxRecords: 200 })
+  assert.match((captured.json() as any).error, /maxDiskMB/)
+  assert.deepEqual(editor.current, { maxDiskMB: 1024 })
 })
 
 test('config POST: 409s when live editing is unavailable (no configEditor/entry), never reaching the schema', async () => {
   const store = fakeStore()
   const handler = createRouteHandler(routeDeps(store))
   const { res, captured } = fakeResponse()
-  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxRecords":500}'], { 'sec-fetch-site': 'same-origin' }), res)
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":500}'], { 'sec-fetch-site': 'same-origin' }), res)
   assert.equal(captured.status, 409)
 })
 
@@ -363,7 +376,7 @@ test('config POST: a cross-site request is refused with 403 and never reaches co
     getSelfEntry: () => editor.entry,
   }))
   const { res, captured } = fakeResponse()
-  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxRecords":500}'], { 'sec-fetch-site': 'cross-site' }), res)
+  await handler(fakePostRequest(`${ROUTE_PREFIX}/config`, ['{"maxDiskMB":500}'], { 'sec-fetch-site': 'cross-site' }), res)
   assert.equal(captured.status, 403)
   assert.deepEqual(editor.current, {})
 })

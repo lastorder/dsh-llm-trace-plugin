@@ -14,15 +14,14 @@ test('list: no archive behaves as a pure in-memory ring, newest first', () => {
   assert.equal(page.matched, 2)
 })
 
-test('list: maxRecords caps the in-memory ring, dropping the oldest', () => {
-  const store = createWireTraceStore({ maxRecords: 2 })
-  const wrapped = store.wrapFetch((async () => new Response('{}')) as typeof fetch)
-  // Not exercising wrapFetch here directly (covered in fetch-patch.test.ts);
-  // push records the way the store itself does, through its own array.
-  for (let i = 0; i < 5; i += 1) (store as any).records.push(makeRecord({ id: `r${i}`, startedAt: i }))
-  while ((store as any).records.length > 2) (store as any).records.shift()
+test('the in-memory ring is bounded, dropping the oldest', async () => {
+  const store = createWireTraceStore({ memoryRing: 2 })
+  const wrapped = store.wrapFetch((async () => new Response('{}', { headers: { 'content-type': 'application/json' } })) as typeof fetch)
+  for (let i = 0; i < 5; i += 1) {
+    await wrapped('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'user-agent': 'deepseek-harness/1.0' }, body: `{"n":${i}}` })
+  }
   assert.equal((store as any).records.length, 2)
-  void wrapped
+  assert.deepEqual((store as any).records.map((r: any) => r.request.bodyText), ['{"n":3}', '{"n":4}'])
 })
 
 test('list: filters by sessionId BEFORE windowing, so a busy other session cannot push this one out', () => {
@@ -45,14 +44,23 @@ test('listAll: with no archive, memoryOnly is implied and historyPending mirrors
   assert.deepEqual(page.items.map((i) => i.id), ['r1'])
 })
 
-test('listAll: memoryOnly true skips the archive even when one is configured', async () => {
-  const archive = createFakeArchive()
+test('listAll: memoryOnly answers from memory while the archive index is still loading', async () => {
+  const archive = createFakeArchive({ ready: false })
   await archive.save(makeRecord({ id: 'disk-only', startedAt: 1 }))
   const store = createWireTraceStore({ archive })
   const page = await store.listAll({ memoryOnly: true })
   assert.deepEqual(page.items, [])
   assert.equal(page.persistence, true)
   assert.equal(page.historyPending, true)
+})
+
+test('listAll: once the index is loaded, memoryOnly merges it too (it costs no disk read)', async () => {
+  const archive = createFakeArchive()
+  await archive.save(makeRecord({ id: 'disk-only', startedAt: 1 }))
+  const store = createWireTraceStore({ archive })
+  const page = await store.listAll({ memoryOnly: true })
+  assert.deepEqual(page.items.map((i) => i.id), ['disk-only'])
+  assert.equal(page.historyPending, false)
 })
 
 test('listAll: merges memory and archive, the in-memory copy winning for a shared id', async () => {
@@ -69,29 +77,36 @@ test('listAll: merges memory and archive, the in-memory copy winning for a share
   assert.equal(page.historyPending, false)
 })
 
-test('listAll: caches repeat archive reads within the TTL window (same key -> same promise identity effect)', async () => {
+test('listAll: counts add records only memory holds (in flight) to the archive\'s exact counts', async () => {
   const archive = createFakeArchive()
-  await archive.save(makeRecord({ id: 'r1' }))
-  let listCalls = 0
-  const originalList = archive.list.bind(archive)
-  archive.list = async (query) => { listCalls += 1; return originalList(query) }
+  await archive.save(makeRecord({ id: 'a1', sessionId: 'a', startedAt: 1 }))
+  await archive.save(makeRecord({ id: 'b1', sessionId: 'b', startedAt: 2 }))
   const store = createWireTraceStore({ archive })
-  await store.listAll({ sessionId: 'x' })
-  await store.listAll({ sessionId: 'x' })
-  assert.equal(listCalls, 1)
+  ;(store as any).records.push(makeRecord({ id: 'a2', sessionId: 'a', startedAt: 3, status: 'streaming' }))
+  // Also held by the archive: must not be counted twice.
+  ;(store as any).records.push(makeRecord({ id: 'b1', sessionId: 'b', startedAt: 2 }))
+  const all = await store.listAll()
+  assert.equal(all.total, 3)
+  assert.equal(all.matched, 3)
+  const mine = await store.listAll({ sessionId: 'a' })
+  assert.equal(mine.matched, 2)
+  assert.equal(mine.total, 3)
+  assert.deepEqual(mine.items.map((i) => i.id), ['a2', 'a1'])
 })
 
-test('listAll: clear() invalidates the archive cache so a subsequent read is not stale', async () => {
+test('a finished record leaves memory once the archive has it; housekeeping requests stay', async () => {
   const archive = createFakeArchive()
-  await archive.save(makeRecord({ id: 'r1' }))
-  let listCalls = 0
-  const originalList = archive.list.bind(archive)
-  archive.list = async (query) => { listCalls += 1; return originalList(query) }
   const store = createWireTraceStore({ archive })
-  await store.listAll({ sessionId: 'x' })
-  await store.clear()
-  await store.listAll({ sessionId: 'x' })
-  assert.equal(listCalls, 2)
+  const wrapped = store.wrapFetch((async () => new Response('{}', { headers: { 'content-type': 'application/json' } })) as typeof fetch)
+  await wrapped('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'user-agent': 'deepseek-harness/1.0' }, body: '{"model":"m"}' })
+  await wrapped('https://api.deepseek.com/models', { method: 'GET', headers: { 'user-agent': 'deepseek-harness/1.0' } })
+  // Let the response mirror and the save settle.
+  for (let i = 0; i < 20 && archive.saved.length === 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 5))
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.equal(archive.saved.length, 1)
+  assert.deepEqual((store as any).records.map((r: any) => r.request.method), ['GET'])
+  const page = await store.listAll()
+  assert.deepEqual(page.items.map((i) => i.method).sort(), ['GET', 'POST'])
 })
 
 test('get: memory is checked before the archive', async () => {
@@ -122,7 +137,7 @@ test('get: returns null when a record exists nowhere', async () => {
 //
 // Capture stores `bodyJson: null` so the ring never holds a parsed copy of
 // every body (see fetch-patch.ts). This is where a reader gets it back, and
-// it must land identically to the archive's own `fromPersisted` path so a
+// it must land identically to the archive's own `withParsedBodies` path so a
 // live record and a restored one are indistinguishable.
 
 test('get: hydrates request/response bodyJson from bodyText for a memory hit', () => {

@@ -600,3 +600,28 @@ test('installFetchPatch: disposer is a no-op if fetch was reassigned by someone 
   assert.equal(globalThis.fetch, somethingElse)
   globalThis.fetch = original
 })
+
+test('installFetchPatch: a disposed wrapper that is still referenced stops recording and just forwards', async () => {
+  const original = globalThis.fetch
+  const seen: string[] = []
+  const real = (async () => new Response('ok')) as typeof fetch
+  globalThis.fetch = real
+  try {
+    const dispose = installFetchPatch((inner) => (async (input: any, init?: any) => { seen.push(String(input)); return inner(input, init) }) as typeof fetch)
+    // Something else wraps fetch on top of ours, and a provider keeps a snapshot of ours.
+    const snapshot = globalThis.fetch
+    const outer = (async (input: any, init?: any) => snapshot(input, init)) as typeof fetch
+    globalThis.fetch = outer
+    await globalThis.fetch('https://a.example/1')
+    assert.deepEqual(seen, ['https://a.example/1'])
+
+    dispose()
+    assert.equal(globalThis.fetch, outer)
+    const response = await globalThis.fetch('https://a.example/2')
+    await snapshot('https://a.example/3')
+    assert.equal(await response.text(), 'ok')
+    assert.deepEqual(seen, ['https://a.example/1'])
+  } finally {
+    globalThis.fetch = original
+  }
+})

@@ -5,545 +5,183 @@
 
 English | [中文](README.zh.md)
 
-A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that captures the **literal HTTP request and response** of every LLM provider call — the exact bytes on the wire, provider-native field names, raw SSE frames — and lets you browse them in a **Wire Trace** session tab.
+A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that records the **literal HTTP request and response** of every LLM provider call — the exact bytes on the wire, provider-native field names, raw SSE frames — and lets you browse them in a **Wire Trace** session tab.
 
-This works at the *wire* layer. A harness-level tracer observes the normalized `GenerateOptions` / `StreamChunk` objects the harness builds: provider-neutral, aware of `sessionId` / `turn` / `step`. This plugin has no harness concepts at all — it only sees what actually left the process and what actually came back.
+It works at the wire layer: it sees only what actually left the process and what came back, and labels each call with the session, turn and step it belongs to.
 
 ## Install
 
-**npm is the supported install path.** The published package ships a prebuilt `dist/` (compiled by `pnpm run build` at publish time), so this works with no local toolchain:
+Install from npm. The published package ships a prebuilt `dist/`, so no local toolchain is needed:
 
 ```sh
-dsh plugin --profile web add dsh-llm-trace-plugin
-```
-
-Pin an exact version (recommended: the latest, `0.4.2`):
-
-```sh
-dsh plugin --profile web add dsh-llm-trace-plugin@0.4.2
-```
-
-Then update or remove it by **package name**:
-
-```sh
+dsh plugin --profile web add dsh-llm-trace-plugin     # append @<version> to pin a version
 dsh plugin --profile web update dsh-llm-trace-plugin
 dsh plugin --profile web remove dsh-llm-trace-plugin
 ```
 
-### Installing from a source checkout (git or `link:`)
-
-The repository ships TypeScript source, **not** a committed `dist/` — a git-spec install or a local `link:` checkout gets only source, and this plugin declares no `prepare` script, so nothing builds it for you automatically. (That is deliberate: a `prepare` script on a git dependency requires an explicit `allowBuilds` approval from pnpm ≥10 before it may run, i.e. "permission to execute this package's code on your machine at install time" — worth avoiding for a plugin most users install from npm.) Build once yourself, from the checkout, before installing:
+**From a source checkout** (`link:` or a git spec) you get source only: `dist/` is not committed and nothing builds it for you. Build first, and rebuild after every update that pulls new commits:
 
 ```sh
-cd /path/to/dsh-llm-trace-plugin
-pnpm install
-pnpm run build      # produces dist/host/** and dist/client.js
-```
-
-Then install the checkout the same way as any local plugin:
-
-```sh
+cd /path/to/dsh-llm-trace-plugin && pnpm install && pnpm run build
 dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
-# or, from a git remote pinned to a branch/tag/commit:
-dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v0.4.2
+# or: dsh plugin --profile web add git+https://github.com/lastorder/dsh-llm-trace-plugin.git#v<version>
 ```
 
-A git-spec install still fetches source only — rebuild (`pnpm run build`) after every `update` that pulls in new commits, since nothing runs it for you.
+- **Restart `dsh web` (or DSH) after installing or updating.** The plugin manager applies a new version at once, but an older version's `fetch` wrapper can stay loaded — and keep recording duplicates — until a restart.
+- It must be an installed package, not a dynamic Cordis plugin: dynamic plugins run in an isolated realm that cannot reach the process's real `fetch`.
+- The package was renamed from `dsh-llm-wire-trace-plugin`. If you installed it under that name, remove it first: `dsh plugin --profile web remove dsh-llm-wire-trace-plugin`.
 
-Notes:
+## What gets captured
 
-- `dsh plugin` forwards to pnpm and then reconciles `dsh.profile.bundles` in `$DSH_HOME/profiles/web/package.json` from the *installed* state, so a git spec registers under this package's real name, `dsh-llm-trace-plugin`.
-- **Restart `dsh web` after installing.** An installed package is not a dev checkout, so there is no client-plugin HMR watcher.
-- The package name changed from `dsh-llm-wire-trace-plugin` to `dsh-llm-trace-plugin`. If you installed it under the old name, remove that first: `dsh plugin --profile web remove dsh-llm-wire-trace-plugin`.
+A request is recorded when **either** its `user-agent` starts with `deepseek-harness/` (stamped on every provider request the harness issues) **or** it is issued inside a model call (`llm/stream`) — the second catches providers that rewrite their own user-agent. Everything else (`web_fetch`, `web_search`, MCP transports, …) passes through untouched and unrecorded.
+
+Each record holds the method, URL, headers, full request and response bodies, HTTP status, timing, model and provider, plus the session, turn, step and purpose of the call (see [Turn and step coordinates](#turn-and-step-coordinates)). Credentials are redacted — see [Privacy](#privacy).
+
+## How it works
+
+- On start, the plugin wraps `globalThis.fetch`; stopping or uninstalling restores the original.
+- The provider adapter gets the original, unread response back, so its streaming, timing and error handling are unaffected. A clone is read in the background to capture the body — including streams the adapter aborts after its last event.
+- Request bodies are captured in whatever form they reach `fetch` (string, bytes, `Blob`, stream, `Request`). A form that can't be copied without consuming it (`FormData`, async iterables) is sent untouched and flagged in the record.
+- A transport error is recorded and rethrown unchanged.
+
+Module structure and design rationale: [`docs/architecture.md`](docs/architecture.md).
+
+## The Wire Trace tab
+
+Open the **Wire Trace** tab in any session. Its labels and notices follow DSH's language setting (Settings → General → Language).
+
+### Call list
+
+- The list shows **only the current session's calls**. Filtering happens on the host, so other sessions' bodies never reach the browser. Subagents are separate sessions and don't appear in the parent's list.
+- Rows are grouped under sticky per-turn headers. Each row starts with its coordinate: `T1·S0`, a background-call label (session title, compaction), or *unattributed*.
+- Calls that can't be tied to a session are hidden, and the list footer says how many there are. If the first load finds nothing for this session but unattributed records exist, the tab falls back to showing all records (at most once per opening) and says why.
+- The toolbar shows matching records over all records held, plus turn and background-call counts; click it for the details.
+- New calls appear and streaming ones refresh on their own (the tab polls every 3 s while visible).
+- **Clear** deletes only the current session's records. To wipe everything, use **Clear all history** on the [management panel](#management-panel).
+
+### Request and Response
+
+The detail pane shows the call's model, status, start time, duration, HTTP status, method and URL, a coordinate strip (turn / step / provider / session), and three tabs: **Request**, **Response** and **Compare**.
+
+Bodies render as a `jq`-style JSON tree in DSH's theme colours. Fold the whole document one level at a time with the depth stepper (`−` / `+`), or a single node with its row's `+` / `-`. Fully expanded, the view is valid JSON.
+
+A streamed (`text/event-stream`) response is **merged by default**: its delta fragments are reassembled into the shape that provider's non-streamed response would have had.
+
+- **Anthropic Messages** → a `/v1/messages` message: text, thinking and `tool_use` blocks, with tool input parsed.
+- **OpenAI Responses** → a `/v1/responses` response: `message`, `reasoning` and `function_call` output items.
+- **OpenAI / DeepSeek Chat Completions** → a `chat.completion`: content, `reasoning_content` and tool calls, with arguments parsed into `argumentsJson`.
+
+The format is detected per frame. Frames that fit none of these (errors, `[DONE]`, unknown events) are kept verbatim under `unrecognized`. **Show raw SSE** switches to the literal frame sequence, one object per frame.
+
+### Compare
+
+**Compare** shows what changed in the request body relative to another call — the usual question when consecutive calls send nearly identical, very large requests.
+
+- The default baseline is the previous call of the same kind (same session, same purpose); background calls in between are skipped. Pick any other call under **Compare against** (grouped by turn; the baseline row is tagged `Base`); **Reset to previous** goes back. Compare stays open as you select other rows, so you can step through a turn.
+- Changes are grouped by top-level key (`messages`, `tools`, …) with counts. Edited strings are highlighted in place; multi-line text such as a system prompt is shown as a line diff. Unchanged top-level fields are listed collapsed. Key order does not count as a change.
+- **Copy** copies the change list as plain text. Both bodies must be valid JSON; if one was truncated, the tab says which side.
+
+### Copy, download and curl
+
+- Hover any row of the JSON tree for a **Copy** pill. It copies that value: a string without quotes, an object or array (even folded) as formatted JSON.
+- **Copy** copies the whole request or response half, headers included, as JSON. **Download** saves the full record as `llm-wire-trace-<id>.json`.
+- **Copy as curl** copies a ready-to-run, shell-safe `curl` command. Stored credentials are redacted, so the credential header is rebuilt:
+  - from `DSH_CURL_KEY` in DSH's environment, if set; otherwise, for `api.deepseek.com` / `api.anthropic.com`, from that provider's own credential (`DEEPSEEK_API_KEY` / `ANTHROPIC_API_KEY`). The key is inlined — and is then on your clipboard.
+  - if nothing is found, the command references `"$DSH_CURL_KEY"`, so one `export DSH_CURL_KEY=...` in your shell makes every copied command runnable.
+
+  The header's scheme (`Bearer <key>` or a bare key) is preserved, and the tab tells you which case applied.
+
+### Turn and step coordinates
+
+The wire barely carries any of this, so it is attached by observing two harness channels:
+
+- **Session, provider, model and purpose** come from the `llm/stream` event around each model call, bound to that call's async context — concurrent calls never mix, even a background title request in the same session.
+- **Turn and step** come from `session/event`: the step open when a call starts is that call's step.
+- Background calls (`session-title`, `compaction`) get no turn or step. A call that didn't go through the harness's model API is marked unattributed (its session, if any, comes from the `x-deepseek-harness-session-id` header) — never guessed.
+- This needs the `sessions` and `llm` services. Without them capture still works, just without coordinates.
+
+## Persistence
+
+Records are saved to disk so they survive restarts; the tab shows live and saved records as one list.
+
+- **Location**: `traceDir`, default `$DSH_HOME/llm-wire-trace/records` (falls back to `~/.dsh/llm-wire-trace/records`).
+- **Format**: compact, append-only segment files — `<start-ms>-<random>.dat` holding brotli-compressed records, plus a small `.idx` JSONL index per segment. They are not meant to be opened by hand; browse records in the Wire Trace tab.
+- **Small on disk**: consecutive requests in a conversation repeat almost the whole history, so each request body is stored as a delta against the previous request of the same session (common prefix and suffix), then compressed. On real traffic, a 1.6 MB request typically takes 3–30 KB. Bodies are still reconstructed byte-for-byte, so curl replay and the merged SSE view stay exact.
+- **Retention**: a disk budget, `maxDiskMB` (default 1024, i.e. 1 GB). When it is exceeded, the oldest segments are deleted whole. At typical usage that is tens of thousands of calls, versus 300 records before.
+- **Not saved**: requests with no body that were not made inside a model call, such as the periodic `GET /models` polling (they used to crowd real calls out of the old 300-record cap). They still appear live in the tab until restart.
+- **Fast reads**: an in-memory index of all saved records (metadata only) is loaded at startup, so the list, session filter and counts never scan the disk. Opening a record reads and decompresses just that record.
+- **Memory**: only in-flight and recent unsaved records are held in memory (at most 100); a record leaves memory once it is safely on disk.
+- **Clearing**: the tab's **Clear** removes the current session's records (segments are rewritten without them); **Clear all history** on the management panel deletes everything.
+- **Upgrading**: on first start, records from earlier versions (the old `*.json` files in the trace directory) are imported into the new format automatically, and the old files are removed.
+- **Several DSH processes** sharing one `$DSH_HOME` are safe: each writes its own segment files.
+- **`persist: false`** keeps everything in memory only (the last 100 records); nothing is written to disk.
 
 ## Configuration
 
-The host row lives in [`cordis.patch.yml`](cordis.patch.yml) and takes these optional keys, validated by this plugin's own runtime schema (`Config`, exported from the host entry point) so a typo'd key or an out-of-range value is rejected at activation rather than silently ignored:
-
-| Key | Default | Meaning |
+| Option | Default | Meaning |
 |---|---|---|
-| `maxRecords` | `200` | In-memory ring size; only the most recent N records are held live. Bodies are held in memory too, so lower this if you routinely send very large requests. |
-| `maxBodyChars` | `8000000` | Per-field character cap before a body is truncated. Sized to hold a full 1M-token context (~4M characters) with 2x headroom; a body cut mid-JSON cannot be parsed, so the viewer can only show it as text. |
-| `persist` | `true` | Write records to disk so they survive a restart. Set `false` for memory only. |
-| `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Where record files are stored. |
-| `maxPersistedRecords` | `300` | Retained record files; the oldest are deleted past this. |
-| `historyPageLimit` | `50` | Max record files read to build one list page from disk. |
-| `prettyBodyLimit` | `500000` | Above this size, the readability copy of a body is not written to disk. |
+| `persist` | `true` | Save records to disk. `false` keeps only the last 100 records in memory. |
+| `maxDiskMB` | `1024` | Disk budget in MB (minimum 16). Past it, the oldest segments are deleted. |
+| `traceDir` | `$DSH_HOME/llm-wire-trace/records` | Storage directory (falls back to `~/.dsh/llm-wire-trace/records`). |
+
+Edit them on DSH's Plugins page (this plugin's [management panel](#management-panel)), or in the profile's `cordis.patch.yml`, in the `config:` block of this plugin's row:
 
 ```yaml
 - insert:
     - id: llm-wire-trace
       name: dsh-llm-trace-plugin
       config:
-        maxRecords: 500
-        maxBodyChars: 2000000
-        maxPersistedRecords: 5000
+        maxDiskMB: 4096
 ```
 
-### The plugin management page
+Options from earlier versions (`maxRecords`, `maxBodyChars`, `maxPersistedRecords`, `historyPageLimit`, `prettyBodyLimit`) are ignored, and are dropped the next time settings are saved from the management panel. Each captured body is capped at a fixed 8,000,000 characters — enough for a 1M-token context — which is no longer configurable.
 
-Every key above is also editable from DSH's own Plugins page (Settings → Plugins → `dsh-llm-trace-plugin`), which this plugin populates through the `plugins.bundle.config` Slot. That panel shows:
+### Management panel
 
-- **Local cache**: how many records are currently held in memory, and (when `persist` is on) how many are persisted on disk, against `maxPersistedRecords`.
-- **A capture-gap warning**, when the host reports a provider whose model calls produced no captured request at all — the finding described under ["Noticing it"](#noticing-it).
-- **Clear all history**: a page-wide wipe of every session's records, memory and disk — distinct from the Wire Trace tab's own `Clear` button, which is scoped to the session it was opened from (see [Filtering by session](#filtering-by-session)).
-- **Every parameter in the table above**, pre-filled with the value currently in effect.
+On DSH's Plugins page (Settings → Plugins → `dsh-llm-trace-plugin`), this plugin's panel shows:
 
-Editing a field there writes it straight back into the profile's own patch document — through the same Loader machinery the `configEditor` service and `dsh plugin configure` use — and the change applies live, without a restart. If the running host exposes no such writer service (a non-Cordis embedding, or one with no `configEditor` plugin loaded), the panel falls back to a read-only report of the values in effect, and says so, rather than pretending a write would work.
+- **Storage usage**: records kept, disk used against the budget (with a small usage bar), and the time of the oldest record.
+- **Clear all history**: deletes every session's records, in memory and on disk.
+- **The three settings**, pre-filled with the values in effect. Changes are saved to the profile and apply without a restart.
+- **A capture-gap warning** when a provider's model calls produced no captured request — see [Known limitation](#known-limitation).
 
-If the `config` route itself cannot be reached at all — overwhelmingly because the running host process is still on an older build of this plugin that predates this route (installing or updating a plugin does not hot-reload host code; `dsh web` must be restarted, see [Install](#install)) — the panel shows each field's documented default instead of an error, with a short note that these are defaults rather than the values actually in effect. The Local cache stats and Clear all history button are unaffected, since they use the older, already-existing `stats`/`clear` routes.
+If the host has no service for writing plugin config, the settings are shown read-only. If the panel says it is showing defaults, the running host is still an older build of this plugin — restart `dsh web`.
 
-## Persistence
+## Privacy
 
-The in-memory ring dies with the process, which is backwards for a debugging tool: the traces you most want are the ones from the run that just crashed. So records are also written to disk.
-
-**There is no "live vs history" mode to choose.** The list always merges both: memory supplies liveness (in-flight `streaming` calls, which have no final file yet), disk supplies depth (everything older than the small ring, and everything from before the last restart). Records near the head exist in both, so they are keyed by id and the in-memory copy wins — it is the same record, but the one still being mutated as its body streams in. Where a record happens to be stored is an implementation detail, and the viewer deliberately does not expose it.
-
-### One file per record, and why
-
-Every record is a single self-contained JSON file, written once and never rewritten:
-
-```
-$DSH_HOME/llm-wire-trace/records/<startedAt-ms>-<intra-ms ordinal>-<random>.json
-```
-
-That one choice removes concurrency control entirely. The obvious alternative — one appended JSONL file — is safe for the *appends* (line-sized writes land intact) but **not** for the periodic rewrite that enforces the retention cap: two harness processes compacting one file can drop each other's records. With a file per record there is nothing to compact:
-
-- **Writing** is `write temp` + `rename`, atomic on POSIX. A reader sees a complete file or no file, never a half-written one.
-- **Retention** is `unlink` of the oldest names. Two processes racing to delete the same file is harmless — the loser gets `ENOENT`, ignored. No lock, no per-process files, no merge-on-read.
-- **A hard kill** leaves at worst an orphan `.tmp` file, swept at next start. There is no truncated trailing line to detect and skip, and a torn file is skipped rather than failing the whole load.
-
-Verified by four processes writing 600 records into one directory concurrently with retention sweeps racing throughout: zero corrupt files, zero id collisions, zero temp leftovers, and the cap landed exactly.
-
-The filename carries the timestamp so ordering and retention are pure **name** operations — listing the newest page is a `readdir` + sort + slice that opens no files. Only records actually shown get read.
-
-> The record id doubles as the filename, so it is a sortable string rather than the old per-process counter (`w1`, `w2`, …). A counter would make two harness processes collide on the same filename and silently overwrite each other's records — reintroducing as data loss the very problem this layout removes.
->
-> The millisecond alone is not a sufficient key: a burst can start many calls inside one millisecond, and a purely random suffix would then order them **arbitrarily** — losing real ordering exactly when calls are densest (observed, and fixed, during testing). The intra-ms ordinal restores order within a millisecond; the random tail keeps names unique across processes, which a counter alone cannot do. Files written before the ordinal existed are still read, so upgrading keeps your existing history.
-
-### Readable on disk
-
-Files are written indented, and each body is stored twice: the verbatim `bodyText` from the wire, plus a parsed `bodyJson` beside it. `bodyText` alone is a JSON *string*, so on disk it is one long escaped line (`\"role\":\"user\"`) that no editor renders usefully — the parsed copy lets `messages`, tool definitions, and the response object expand as real nested JSON.
-
-`bodyJson` is a derived convenience copy, never the source of truth: reading always re-derives it from `bodyText`, so a stale or hand-edited parse on disk cannot change what the viewer shows. It is omitted where it would add nothing — a truncated body, a non-container value, or an SSE response (a frame sequence, never one JSON value, matching the capture-time rule). The cost is roughly double the body bytes.
-
-> **Upgrading from 0.1.2.** That release capped bodies at 200k characters, which a real agent request exceeds, so it stored them cut mid-JSON — the viewer could only show such a body as raw text. Records already written that way stay truncated (the missing bytes were never captured); calls made after upgrading are stored whole.
-
-### Disk footprint
-
-Bodies are sized for a 1M-token context, so a record can be large. Two things keep the directory bounded: the 300-record cap, and `prettyBodyLimit` — past 500k characters the parsed readability copy is skipped, since no editor renders a multi-megabyte body usefully anyway and writing it would double the bytes for nothing. The viewer is unaffected either way: it re-parses from `bodyText`.
-
-The cap is enforced at startup and then amortized — a directory listing per record would cost more than writing the record — so up to 50 records can pile past it before the next trim in a long session. On start, the cap is applied exactly: a directory that had drifted past it (one live case held 380 files against a cap of 300, oldest two days old, because every session wrote fewer than 50 records and the write counter resets on each boot) is trimmed back before the plugin serves anything.
-
-In practice a typical request (a few hundred thousand characters) lands around 250MB across 300 records. The worst case — 300 consecutive full 1M-token requests — is roughly 1.3GB. Lower `maxPersistedRecords`, `maxBodyChars`, or both if that matters on your machine.
-
-### The cost, stated plainly
-
-There is no index, so building a history page costs one file read per record *on that page* (bounded by `historyPageLimit`), not per record retained. Those reads run in concurrent batches and yield to the event loop between batches, because this plugin's routes share a process — and so an event loop — with the harness's own web UI. A list read parses only the fields a row displays and never touches body text, which is the bulk of a record. A filtered history scan stops at a bounded budget and the viewer says so rather than implying it showed everything.
-
-This is the deliberate trade: a bounded per-page cost in exchange for never reintroducing shared mutable state.
-
-### Startup
-
-Nothing is preloaded into the ring on `apply`: the list already merges memory and disk, so a restart opens on the recent past regardless. (Preloading was in fact what made an earlier live/history toggle show identical content in both modes — the ring had been filled with the very history the other mode read.)
-
-The Wire Trace tab is mounted only while it is the active tab, so an unopened tab reads nothing at all. Opening it paints the live in-memory ring first and folds the on-disk history in behind that, saying so while the history is still in flight. From then on the tab polls the ring every 3s (never re-scanning the disk) — that polling is what makes a finished call appear and a still-streaming one refresh, so it is always on rather than a toggle, and a hidden tab skips it.
-
-Capture starts immediately, and a slow or failing disk cannot delay the fetch patch or fail a request. Persistence errors are counted and reported via `GET /llm-wire-trace/stats`, never thrown into the capture path.
-
-### Privacy: bodies are stored verbatim
-
-Credential headers are redacted on disk exactly as in memory — `authorization`, `proxy-authorization`, `x-api-key` (Anthropic), `api-key` (Azure OpenAI), `x-goog-api-key` (Google), `x-dsh-auth-token` (the harness's own account credential, which rides every Messages call), `cookie`, and `set-cookie`. A credential riding the URL's own query string (e.g. Google Gemini's `?key=`) is redacted the same way before the URL ever reaches memory or disk — see `REDACTED_QUERY_PARAMS` in `constants.ts`. **Request and response bodies are not** — they are stored as captured, so your prompts, code, and any file contents in context land in plaintext files under `traceDir`. That is inherent to persisting full bodies, and is a deliberate choice for a local debugging tool. The levers are `persist: false`, a smaller `maxPersistedRecords`, or a lower `maxBodyChars`.
-
-Clearing (either the Wire Trace tab's session-scoped `Clear`, or the management page's cross-session `Clear all history`) deletes the matching persisted copies too — otherwise "clear" would visibly un-clear itself on the next restart.
-
-## Why this must be an installed package, not a dynamic Cordis plugin
-
-A dynamic Cordis Host package's code runs inside an isolated `node:vm` realm. That realm's `globalThis` is **not** the process's real `globalThis`, and its `fetch` is hard-wired to a trap that throws, redirecting authors to `ctx.web` — by design, a dynamic package cannot reach, let alone replace, the real `fetch` that `@deepseek-ai/dsh-llm-deepseek` and `@deepseek-ai/dsh-llm-pi-ai` resolve at call time. Only code loaded as an ordinary module in the real process — an installed package, like this one — shares that real `globalThis`.
-
-## How it works
-
-1. On `apply`, replace `globalThis.fetch` with a wrapper, keeping the original reference. `ctx.effect` ties the disposer (which restores the original reference) to the plugin's fiber, so a stop, uninstall, or failed reactivation cannot leave a dangling patched `fetch`. That swap waits for nothing: this plugin deliberately declares no `inject`, because a Cordis fiber with injected services stays inactive until every one of them exists — and a provider plugin that reads the fetch slot at module-evaluation time is only reachable if the wrapper is already installed when that module body runs (see ["Known limitation"](#known-limitation)). Each service this plugin uses is instead reached per use, so a late web server delays only the plugin's own routes, never the capture.
-2. Every call is admitted by one of two independent signals: an outgoing `user-agent` header starting with `deepseek-harness/` — the value `attributionHeaders()` stamps on *every* harness-issued provider request (see `@deepseek-ai/dsh-llm`'s `APP_IDENTITY`) — **or** the request being issued inside an active `llm/stream` call, the async context this plugin already binds for attribution (see `call-context.ts`). Anything else (the `web_fetch` tool, `web_search`, MCP transports, …) passes through completely untouched: not recorded, not cloned, same arguments, same return value. The second signal exists because the user-agent is not a contract this plugin can impose: a provider plugin that builds its own agent identity rewrites that header at the fetch layer — the last layer it still controls once the harness has merged its attribution in — and a request sent from inside a model call is provider traffic whatever it calls itself.
-3. For a matched call, the real `fetch` runs first. The **original, unread** `response` goes back to the adapter exactly as it would have otherwise — its SSE parsing, timing, and error handling are completely unaffected.
-4. A `response.clone()` is mirrored in the background (never `await`-ed on the hot path) to capture the response body without disturbing the original stream the adapter is reading. The mirror is read chunk by chunk, not with `text()`: every streamed call ends with the adapter aborting its own request (`dsh-llm-deepseek` aborts its consumer controller in a `finally`) against a socket that outlives the last event it consumed, and `text()` resolves only on a clean close — so it would reject and discard a body it had already received in full.
-5. Each admitted request is credited to the model call it belongs to, and each `llm/stream` call reports when it settles — so a model call that produced no captured request at all becomes a number under `GET /llm-wire-trace/stats`'s `coverage`, a one-line host warning, and a notice on the plugin management page, instead of a silently empty trace. See ["Noticing it"](#noticing-it).
-
-Both shipped adapters (`dsh-llm-deepseek`, `dsh-llm-pi-ai`) call the bare `fetch` identifier with no local import, so they resolve whatever `globalThis.fetch` is at call time — which is what makes this patch effective regardless of module load order **for them**. It is not a property this plugin can impose on a third-party provider plugin: one that snapshots `globalThis.fetch` at module-evaluation time and injects the copy into its SDK is invisible here, because its requests never enter the wrapper at all. Bundle order is the remaining lever — the Loader composes the entry list by applying each bundle's patch layer in `dsh.profile.bundles` order and imports an entry's module when that entry starts, so listing this plugin **before** such a provider is what puts the wrapper in place before that provider's module body reads the slot. Note where such a plugin lands by default: DSH's own plugin manager appends each newly installed bundle to the end of the list, which is exactly the wrong end. See ["Known limitation"](#known-limitation).
-
-## Safety properties
-
-The wrapper is written to hold these properties:
-
-- A non-provider call passes straight through: not recorded, not cloned, body fully intact for its own caller.
-- A provider call's caller still reads the complete, unmodified response body — the mirror never contends with it.
-- The **request** body is captured whatever shape it reaches `fetch` in: a string, a byte buffer (`Uint8Array`/`Buffer`/`ArrayBuffer`), `URLSearchParams`, a `Blob`, a `ReadableStream` (teed — one half is sent, the other mirrored), or the body of a `Request` passed as `fetch`'s first argument (read from a `clone()`). The copy handed to the real `fetch` is never consumed. A shape that cannot be mirrored without consuming it (`FormData`, an async iterable) is sent untouched and flagged in the record's `recorderError`; the viewer then says nothing was recorded instead of calling the empty body "not JSON".
-- A streamed body whose call the adapter aborts is still stored: every chunk the mirror received is kept, so an SSE response is captured whole instead of being thrown away by a `text()` that will never see a clean close.
-- A transport failure (the underlying `fetch` throws) is recorded and **rethrown unchanged** — never swallowed.
-- Every credential header is redacted before it is stored or displayed: `authorization` and `proxy-authorization` become `Bearer ***redacted***`, while bare-key headers (`x-api-key`, `api-key`, `x-goog-api-key`, `x-dsh-auth-token`, `cookie`, `set-cookie`) become `***redacted***` with no invented scheme. No other header is touched.
-- A credential riding the URL's own query string (`?key=`, `?access_token=`, and similar — see `REDACTED_QUERY_PARAMS` in `constants.ts`) is redacted the same way, case-insensitively, before the URL is stored, displayed, or used to build a curl command. Every other query parameter, and the path, are left untouched.
-- The destructive `clear` route is `POST`-only and rejects a cross-origin request (`Sec-Fetch-Site`), so a page open elsewhere in your browser cannot wipe your trace history.
-- Re-activating the plugin cannot double-wrap an already-patched `fetch` (it throws loudly instead); stopping restores the exact original reference.
-
-## What it captures
-
-Each record:
-
-```
-{
-  id,                            // '<ms>-<ordinal>-<random>'; doubles as the storage filename
-  startedAt, endedAt, durationMs,
-  status: 'ok' | 'http-error' | 'transport-error' | 'streaming',
-  model,                          // best-effort, read from the parsed request body
-  sessionId,                      // owning session, or null when unattributable
-  turn, step,                     // harness coordinates; null when not applicable
-  purpose,                        // 'session-title' | 'compaction' | null
-  provider, requestedModel,       // resolved harness route
-  attributed,                     // whether this call came through ctx.llm at all
-  request:  { method, url, headers /* redacted */, bodyText, bodyJson, bodyTruncated },
-  response: { status, statusText, headers, contentType, bodyText, bodyJson, bodyTruncated } | null,
-  error: { name, message } | null,
-}
-```
-
-- `bodyText` is always the raw string (SSE frames verbatim, or a JSON error body). `bodyJson` is a best-effort parse for the JSON view; SSE bodies are never JSON-parsed as a whole (they're a frame sequence, not one JSON value).
-- `sessionId` / `turn` / `step` / `purpose` are **not read off the wire** — the wire barely carries them. They are attached by observing two harness channels; see [Harness coordinates](#harness-coordinates-turn--step).
-- Body fields are capped and the ring buffer holds only the most recent records; both are configurable (see [Configuration](#configuration)). Records also outlive the process on disk — see [Persistence](#persistence).
-
-## The viewer
-
-A `jq`-shaped JSON view: the brackets, commas, and indentation `jq .` would print, syntax-coloured from the product's own shiki palette so it tracks the light/dark theme for free. Keys, strings, numbers, booleans, and `null` each get their own colour. Unlike preformatted text, every line is a real row, so containers stay foldable.
-
-Folding works two ways, and they compose:
-
-- **A global depth stepper** (`−` / `+` in the toolbar) opens or closes the whole document one level at a time, with the current level shown beside it as `深度 2/5`. `+` stops once the deepest nesting present is reached.
-- **A per-row `+` / `-`** in the gutter folds one individual container, for when you want a single branch open without expanding its whole level.
-
-Using the global stepper resets the baseline and clears any per-row folds, so the depth readout always describes what you actually see.
-
-A folded container collapses to a one-line placeholder that keeps its trailing comma, e.g. `"messages": [ … 12 items ],`. Fully expanded, the view is valid JSON: it round-trips through `JSON.parse` to exactly the captured value.
-
-Three tabs: Request, Response and Compare. Above them the detail pane shows the selected call's identity (model, status, start time, duration, HTTP status, method and URL) and its coordinate strip; the tab bar carries the per-record actions (copy as curl, copy, download), and the fold-depth stepper and the SSE toggle sit one row below, only on the two body tabs. Request always shows the parsed body. Response adapts to the content type: a JSON body is shown as-is, and an `event-stream` body is, by default, *reassembled* — its scattered delta fragments merged back into one complete, readable structure — and shown through the same JSON view (see below).
-
-> The tab's language follows DSH's own Settings → General → Language switch (the `@deepseek-ai/dsh-client-locale` service), so every button, tooltip, and notice renders in Chinese or English to match. This plugin registers its dictionaries under the `llm-wire-trace` namespace; a future language pack targeting this plugin can extend that namespace through the locale service's own `addLanguage` extension point.
-
-### Compare: what changed in the request body
-
-Consecutive calls in a turn send almost the same request, so the usual question is *what did the harness change this time?* — which two 200 KB JSON trees answer badly. The **Compare** tab answers it directly.
-
-- **The default baseline is the previous call of the same kind**: the nearest older row in the same session with the same purpose. A background `session-title` / `compaction` call that ran in between is skipped (its body is unrelated), and is itself compared with the previous call of its own purpose. The first call of its kind has no default baseline, and the tab says so.
-- **Pick any other call as the baseline.** The `Compare against` dropdown lists every other row, grouped by turn — compare a step with the start of its turn, or turn N with turn N−1. The baseline row is tagged `Base` in the list. A pick lasts until you select another record (then the default applies again); `Reset to previous` returns to it at once. Selecting another row while Compare is open keeps Compare open, so you can walk a turn step by step.
-- **A structural diff, grouped by top-level key.** `messages`, `tools`, `temperature`, … each get a section with change counts (`+2 ~1`) and, for arrays, the length change (`4 → 6 items`). An appended message is an addition; an edited message shows only the field that changed (`[0].content`); a changed string is highlighted in place, and a multi-line one (a system prompt) is shown as a line diff with unchanged stretches folded. Long values expand on click. Object key order is not a change. The index of a removed item is its position in the baseline (the tab says so).
-- **Unchanged top-level fields are listed, collapsed**, so you can also see what stayed the same.
-- **`Copy` copies the change list as plain text**, one change per line.
-
-Both bodies must parse as JSON. A body cut by `maxBodyChars` cannot, and the tab names which side it is rather than guessing. Nothing here alters the stored bodies: the diff is computed in the browser from the same verbatim records.
-
-### Harness coordinates (turn / step)
-
-The wire tells you *what bytes were sent*. It does not tell you **which turn of the conversation this was, which step within that turn, or whether the user ever asked for this call at all**. Those are the questions a reader actually has, and almost none of that reaches the wire: `dsh-llm-deepseek` sends only a session-id header, and `dsh-llm-pi-ai` sends nothing.
-
-So this plugin *attaches* them, using two ordinary, public plugin extension points. **No dsh source is modified.** Both channels are strictly observational.
-
-**1. `llm/stream` — which call is this?**
-A waterfall around every model call, whose `options` carry `sessionId`, `provider`, `model`, and `purpose`. The listener pulls the wrapped stream inside an `AsyncLocalStorage.run` **on every pull**, so the adapter's `fetch` observes exactly its own call's identity. It yields the chunks it receives, in order, and changes nothing else.
-
-> Wrapping only the *construction* of the stream would capture nothing: an async generator's body runs on the consumer's tick, so the context would already be gone by the time the adapter's `fetch` ran. This is verified behaviour, not an assumption.
-
-**2. `session/event` — which turn and step?**
-The loop appends `step/start` immediately *before* a model call and `step/end` immediately *after* it, so the step open when a call begins is that call's step. Between steps the plugin reports `null` rather than the step that just closed.
-
-### Why this is exact, not a guess
-
-Each call rides its own async-context branch, so **concurrent calls never contaminate each other** — including the case that defeats naive time-window correlation: a background `session-title` request firing on the *same session* while a turn is live. A purposed call (`session-title`, `compaction`) is deliberately given **no turn/step at all**, because it is not part of the conversation loop even when it overlaps one.
-
-A call that never went through `ctx.llm` is recorded with `attributed: false` and null coordinates — reported as unattributed, never given a plausible-looking owner.
-
-### What you see
-
-- Each row leads with its coordinate: `T1·S0`, or a purpose label (后台辅助调用), or 无归属.
-- Rows are grouped under sticky per-turn headers showing that turn's call and step counts.
-- The selected record shows a coordinate strip (Turn / Step / Provider / Session) above the body.
-- The toolbar summarises the store, not the screen: `matched / all` plus `· N turn · N 辅助` — matching records under the current filter (this session by default) over every record held, memory and disk. Clicking the numbers expands the full explanation, including how many matching records are not drawn because one page holds at most 100 rows.
-
-### Requirements
-
-Needs the `sessions` and `llm` services. Both are optional: without them capture still works, just without coordinates.
-
-## Filtering by session
-
-The tab always shows the current session's calls — there is no toggle to switch to every session's records inside the tab itself; see [the management page](#the-plugin-management-page) for a cross-session view (its "Local cache" count) and a cross-session wipe.
-
-The filter matches the record's `sessionId`, which comes from the `llm/stream` context described above (falling back to the `x-deepseek-harness-session-id` header when a call did not go through `ctx.llm`). Because the primary source is the harness call itself rather than the wire, **this works for every provider, including pi-ai routes that put nothing on the wire at all.** Filtering happens on the host side, so other sessions' request and response bodies are never sent to the browser.
-
-Two consequences worth knowing:
-
-- **Not every call is attributable.** A request that never went through `ctx.llm` has no session. Those records are hidden under the filter, but never silently: the list footer reports how many exist.
-- **Subagents are separate sessions.** A subagent's LLM calls carry its own session id, so they do not appear in the parent session's filtered view.
-
-**Clear** is scoped by the same filter — it deletes only the current session's records (memory and disk). To clear every session's history at once, use the plugin management page's **Clear all history** button instead.
-
-As a safety net, if the first load finds nothing attributable to this session while unattributed records exist, the tab falls back automatically to showing every record and says why. This fires at most once per mount.
-
-### Response: merged SSE, and the raw wire text underneath
-
-A raw SSE stream is close to unreadable directly: one reply is typically split across dozens to hundreds of frames, each carrying only a character or two of text. So by default this plugin *reassembles* an `event-stream` response before showing it — folding every delta fragment back into **the exact shape that provider's own non-streamed response would have had**, then rendering that structure through the exact same JSON tree Request uses (same folding, same copy/download). Reusing the official shape is deliberate: a reader who already knows what a normal Anthropic or OpenAI response looks like needs no new vocabulary to read the merged result.
-
-One small adapter module per provider shape (`sse-merge/anthropic.ts`, `sse-merge/openai-responses.ts`, `sse-merge/openai-chat-completions.ts`) is offered every frame in turn; whichever one recognizes a frame's shape folds it in. Adding a fourth provider shape means adding one more adapter file — nothing else changes. Three shapes are recognized today, auto-detected per frame so a stream never has to be told which provider it came from:
-
-**OpenAI/DeepSeek Chat Completions** (an object with a top-level `choices` array) reassembles into `chatCompletion`, shaped like the SDK's own `ChatCompletion`:
-
-```json
-{
-  "anthropic": null,
-  "responses": null,
-  "chatCompletion": {
-    "id": "chatcmpl-...",
-    "object": "chat.completion",
-    "model": "deepseek-...",
-    "choices": [
-      {
-        "index": 0,
-        "message": {
-          "role": "assistant",
-          "content": "the complete reply text, concatenated from every delta.content fragment",
-          "reasoning_content": "the complete reasoning text, if the provider sent one (DeepSeek's own extension)",
-          "tool_calls": [
-            { "id": "call_1", "type": "function", "function": { "name": "search", "arguments": "{\"q\":\"...\"}" }, "argumentsJson": { "q": "..." } }
-          ]
-        },
-        "finish_reason": "stop"
-      }
-    ],
-    "usage": { }
-  },
-  "frameCount": 137,
-  "recognizedFrameCount": 135,
-  "sawDone": true,
-  "unrecognized": []
-}
-```
-
-Content and reasoning-content fragments are concatenated in wire order; a tool call's fragmented `function.arguments` is concatenated the same way and then parsed once as a whole into the (non-standard, but almost always what a reader wants next) `argumentsJson` convenience field — never a per-fragment partial parse.
-
-**Anthropic Messages API** (framed by `event:` type — `message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`) reassembles into `anthropic`, shaped like a non-streamed `POST /v1/messages` response:
-
-```json
-{
-  "anthropic": {
-    "id": "msg_...",
-    "type": "message",
-    "role": "assistant",
-    "model": "claude-...",
-    "content": [
-      { "type": "text", "text": "the complete reply text, concatenated from every text_delta fragment" },
-      { "type": "thinking", "thinking": "the complete extended-thinking text, if the model used it", "signature": "..." },
-      { "type": "tool_use", "id": "toolu_...", "name": "bash", "input": { "command": "..." }, "inputJsonText": "{\"command\":\"...\"}" }
-    ],
-    "stop_reason": "tool_use",
-    "stop_sequence": null,
-    "usage": { }
-  },
-  "responses": null,
-  "chatCompletion": null,
-  "frameCount": 19,
-  "recognizedFrameCount": 17,
-  "sawDone": true,
-  "unrecognized": []
-}
-```
-
-Each content block's `text` / `thinking` / `partial_json` fragments are concatenated in wire order, addressed by the block's own index; a `tool_use` block's fragmented `partial_json` is parsed once, as a whole, into `input` (the official field), with the raw accumulated text kept alongside as `inputJsonText` for when parsing fails. `message_start`'s top-level fields (id, model, role, usage, …) are captured, and anything `message_delta` adds (including provider-specific extras) is folded in alongside them — so a real record's `copilot_usage` or similar extension still shows up, just as an extra field beside the official ones.
-
-**OpenAI Responses API** (also framed by `event:` type, but a different set of names — `response.created` / `response.output_item.added` / `response.output_text.delta` / `response.function_call_arguments.delta` / `response.reasoning_text.delta` / `response.reasoning_summary_text.delta` / … / `response.completed`) reassembles into `responses`, shaped like a non-streamed `POST /v1/responses` response:
-
-```json
-{
-  "anthropic": null,
-  "responses": {
-    "id": "resp_...",
-    "object": "response",
-    "model": "gpt-5...",
-    "status": "completed",
-    "output": [
-      { "type": "reasoning", "id": "rs_...", "summary": [ { "type": "summary_text", "text": "..." } ], "content": null },
-      { "type": "message", "id": "msg_...", "role": "assistant", "content": [ { "type": "output_text", "text": "the complete reply text" } ] },
-      { "type": "function_call", "id": "fc_...", "call_id": "call_...", "name": "search", "arguments": "{\"q\":\"...\"}", "argumentsJson": { "q": "..." } }
-    ],
-    "usage": { }
-  },
-  "chatCompletion": null,
-  "frameCount": 11,
-  "recognizedFrameCount": 11,
-  "sawDone": true,
-  "unrecognized": []
-}
-```
-
-Each output item is addressed by its own `output_index` and reassembled into the matching official item shape (`message` / `reasoning` / `function_call`). A `reasoning` item's `summary[]` (from `response.reasoning_summary_text.delta`) and `content[]` (from `response.reasoning_text.delta`) are two independent, official fields — which one actually fills in depends on model/account, and only the one the provider actually sent is populated; the other stays `null`/`[]` rather than being invented. A `function_call`'s `arguments` is concatenated in wire order and parsed once, as a whole, into the `argumentsJson` convenience field; `response.output_item.done` additionally supplies a fallback whole-value read for any field this plugin's delta handling might have missed, so a call still comes through complete either way.
-
-Nothing recognizable is guessed at: a frame that fits none of these three shapes — an error event, an unrecognized `event:` type, the `[DONE]` sentinel, an unparseable payload — is never forced into any of them, and lands verbatim in `unrecognized` instead, so nothing this plugin doesn't understand is ever silently dropped.
-
-A toggle (`Show raw SSE` / `Show merged view` — the label always names what clicking it switches TO, not what is currently shown) switches to the literal frame sequence on the wire — one object per SSE frame, keyed by its own SSE field names, exactly as captured — for when the raw bytes themselves are what you need:
-
-```json
-[
-  { "comment": "keep-alive" },
-  { "data": { "id": "chatcmpl-1", "choices": [ ] } },
-  { "event": "message", "id": "42", "data": { } },
-  { "data": "[DONE]" }
-]
-```
-
-`data:` holds the parsed JSON when the payload is parseable and the raw string otherwise, so sentinels like `[DONE]` stay visible rather than being dropped; `event:` / `id:` / `retry:` sit alongside it, and comment lines (`: keep-alive`) become `comment`. Repeated `data:` lines within one frame are joined with newlines first, as the SSE spec requires. Nothing is discarded — a malformed payload is kept verbatim as a string. Only each frame's `data:` payload is re-indented there; frame structure is left completely untouched.
-
-### Copy as curl
-
-The copy-curl button (`复制 curl`) asks the host for a ready-to-run `curl` command reconstructed from the record (`GET /llm-wire-trace/curl?id=`) and copies it. Every argument is single-quoted with the standard POSIX `'\''` escape, so the command is safe to paste into bash/zsh/sh as-is, including bodies containing quotes, `$(...)`, and backticks.
-
-Whichever credential header the record carried is always the redacted placeholder — this plugin never keeps a real secret at rest — so that header is rebuilt fresh for the curl command, one of two ways:
-
-- **A real value was resolved**, checked in this order:
-  1. `DSH_CURL_KEY` in the process environment — a manual, plugin-owned, provider-neutral override that works for **any** request regardless of which provider or host it went to. Checked first so an explicit override always wins.
-  2. For a host with a known conventional key — `https://api.deepseek.com` (`DEEPSEEK_API_KEY`) and `https://api.anthropic.com` (`ANTHROPIC_API_KEY`) — the same way that provider's own adapter resolves it: `ctx.credentials` first, then the ambient environment variable.
-
-  Either way, the key is inlined directly, single-quoted like every other header — paste and run, no editing needed.
-- **Nothing was found by either path**: the header references `$DSH_CURL_KEY` — double-quoted so the shell expands the variable at run time, and always this one name regardless of which provider or host the record is for. `export DSH_CURL_KEY=...` once, and the copied command then runs as-is for **any** record; this is the case the feature is mainly for.
-
-The header's original scheme is preserved either way: `authorization` is rebuilt as `Bearer <key>`, while a bare-key header such as Anthropic's `x-api-key` is rebuilt as the key alone. Sending a bare key behind a `Bearer` prefix (or the reverse) would be rejected by the provider, which would make the copied command look broken rather than the credential look missing.
-
-The client tells you which of the two happened after each copy. Inlining a real secret means **it is now on your clipboard** (and possibly in shell history once pasted) — worth knowing before sharing a screen or pasting into a chat. The `$DSH_CURL_KEY` case avoids that by design, since the secret value never leaves your shell's environment.
-
-### Copy and download
-
-Copy (`复制`) puts the complete record half — the whole `request` or `response` object, headers included — on the clipboard as formatted JSON, matching what the view shows. Download (`下载`) exports the complete record, both halves, as `llm-wire-trace-<id>.json`.
-
-To copy a single field instead, hover its row in the JSON tree: a `Copy` pill appears right after the value (not at the far edge of the pane), and focusing it with the keyboard shows it too. It copies that node's value — a string raw, without quotes; a number, boolean or `null` as written; an object or array (even one folded away) as formatted JSON — and turns into a green `✓ Copied` for about a second and a half, so a copy never looks like nothing happened.
-
-### Independent scrolling: a shell CSS quirk this plugin corrects
-
-The left record list and the right detail pane are meant to scroll independently, but the shell's own `ConversationRoot` CSS gets in the way: for any open, non-blank session (`data-phase="active"` — i.e. always, for us) it sets the ancestor it calls `viewArea` to `flex:1 0 auto; min-height:auto`. That's intentional for Chat — it lets the message list grow past the visible area so the *whole page* scrolls with a sticky composer pinned at the bottom — but the same rule reaches every `conversation.view` entry, including this one, and breaks a two-pane layout: with no bounded height to overflow against, the root grows to fit its content and the whole page scrolls as one.
-
-`viewArea` has no stable selector of its own (a build-hashed CSS-module class), so this plugin's stylesheet targets it structurally, through two attributes the framework itself always adds and treats as stable: every slot's `SlotOutlet` wrapper carries `data-slot="<slot key>"`, which makes `viewArea` exactly `div:has(>[data-slot="conversation.view"])` regardless of its own class name. Scoping that with `:has(.wt-root)` re-asserts `min-height:0; overflow:hidden; flex:1 1 0` only when *this* tab is the one currently mounted inside it — Chat, Trajectory, and any other tab's instance of the same ancestor are untouched.
+- **Bodies are stored in full.** Prompts, code and any file contents in context are saved as captured under `traceDir` — compressed, not encrypted. That is deliberate for a local debugging tool; use `persist: false` or **Clear** if it matters.
+- **Credential headers are redacted** before anything is stored or shown: `authorization` and `proxy-authorization` become `Bearer ***redacted***`; `x-api-key`, `api-key`, `x-goog-api-key`, `x-dsh-auth-token`, `cookie` and `set-cookie` become `***redacted***`. No other header is touched.
+- **Credential query parameters** in the URL (`key`, `api_key`, `access_token`, `token`, `secret`, `signature`, … — see `REDACTED_QUERY_PARAMS` in [`src/host/constants.ts`](src/host/constants.ts)) are redacted the same way, case-insensitively.
+- The clear endpoint accepts only same-origin `POST` requests, so another web page cannot wipe your history.
 
 ## Known limitation
 
-This plugin depends on the implementation detail that every current provider adapter calls the bare, unimported `fetch`. Every failure mode below has the same shape: a model call's request never enters that wrapper, so there is no record, no error, and nothing on disk to inspect. Three ways it happens:
+Capture only sees requests that go through the patched `globalThis.fetch`. The bundled adapters (`dsh-llm-deepseek`, `dsh-llm-pi-ai`) look up `fetch` at request time, so they are always captured. A provider is invisible — no record, no error — if it:
 
-1. **A provider with its own HTTP client.** An adapter that uses an SDK-bundled transport (its own `undici` instance, a preconfigured client) instead of the global `fetch` never reaches the wrapper.
-2. **A provider that snapshots the fetch slot.** A provider plugin can read `globalThis.fetch` once, at module-evaluation time, keep it in a module-level constant, and inject that copy into its SDK. `@jiesou/dsh-opencode-zen-free-provider` does exactly this — `const zenNativeFetch = globalThis.fetch`, later passed as `fetch:` into every model stream — so if that snapshot is taken before this plugin's `apply()` installs its wrapper, every model call it makes goes straight to the original `fetch`, forever. Bundle order is what decides that: the Loader composes the entry list by applying each bundle's patch layer in `dsh.profile.bundles` order, and an entry's module is imported when that entry starts, so this plugin must be listed **before** such a provider. Move it up in that list and restart the host — and check the position after installing anything else, because DSH's plugin manager appends new bundles to the end.
-3. **The slot being replaced.** Node's built-in `fetch` and npm's `undici` package share the same global dispatcher slot (`Symbol.for('undici.globalDispatcher.*')`), so merely `import('undici')` **anywhere else in the process** — another plugin, a future adapter, a transitive dependency — can silently replace `globalThis.fetch` or its dispatcher *after* this plugin has installed its wrapper. The reverse ordering has the same effect: whichever wrapper is installed last owns the slot, and the other's capture goes dark.
+1. **uses its own HTTP client**, such as a bundled `undici` instance, instead of the global `fetch`;
+2. **snapshots `globalThis.fetch` when its module is imported** and hands that copy to its SDK — `@jiesou/dsh-opencode-zen-free-provider` does this. If the snapshot is taken before this plugin installs its wrapper, none of its calls are seen. **Fix: list this plugin before such a provider in `dsh.profile.bundles`** (in the profile's `package.json`, e.g. `$DSH_HOME/profiles/web/package.json`) and restart DSH. Check again after installing other plugins: DSH's plugin manager appends new bundles to the end of that list;
+3. **runs alongside something else that replaces `globalThis.fetch`** or the global `undici` dispatcher. Whichever patch is installed last wins, so don't combine this plugin with another fetch-patching plugin.
 
-Two consequences worth stating plainly:
+**Noticing it**: per provider, the plugin counts model calls that produced no captured request. When that happens, the management panel shows a capture-gap warning, the host logs one warning per provider, and `GET /llm-wire-trace/stats` reports it under `coverage` (`untracedCalls`). These counters cover the current process only.
 
-- **Do not install this plugin alongside another plugin that also patches `globalThis.fetch`.** There is no reliable way for either plugin to detect the other — the existing "already patched" guard (`installFetchPatch`'s `PATCH_MARK` symbol) only catches this *same* plugin trying to reinstall itself, not a different implementation wrapping the same global.
-- **The user-agent is not the admission contract.** A request is admitted by the harness `deepseek-harness/` user-agent *or* by being issued inside an `llm/stream` call, precisely because a provider may rewrite that header. Admission is therefore never what loses a request — only the wrapper never being reached is.
-
-### Noticing it
-
-`GET /llm-wire-trace/stats` reports a `coverage` object with one row per provider, counting both sides of the question:
-
-```json
-{"since": 1792374023811, "providers": [
-  {"provider": "opencode-zen-free-provider", "calls": 0, "attributedCalls": 0,
-   "modelCalls": 12, "untracedCalls": 12, "lastSeenAt": 1792375125343}
-]}
-```
-
-- `calls` / `attributedCalls` count the wire records that WERE captured.
-- `modelCalls` / `untracedCalls` count the model calls the harness itself started (one per `llm/stream`), and how many of those settled with no captured request at all.
-
-`untracedCalls > 0` is the diagnosis none of the failure modes above can hide behind: a provider that made model calls with nothing to show for them either bypasses the wrapper or never went to the wire. Rows are sorted with untraced calls first, so the row worth reading is the top one. The host also logs one `console.warn` per provider the first time it happens, and the plugin management page shows the same finding inline. A provider with `modelCalls: 0` and `calls: 0` is simply one this plugin has seen nothing from — neither traffic nor a model call — which is a different statement from `calls: 0` next to a non-zero `modelCalls`.
-
-These counters are intentionally process-lifetime only — a live health signal, not history, and not reset by clearing the trace.
-
-Harness coordinates (turn / step) have a separate dependency: they come from the `llm/stream` and `session/event` channels, not from fetch. So a call that never goes through `ctx.llm` can be captured yet not attributed (recorded as `attributed: false`), while an adapter that bypasses the bare `fetch` loses both the capture and the coordinates. Both are reported as the gaps they are, never filled in by guessing.
-
-Because of this, treat this plugin as belonging to a debugging profile rather than a permanent installation, and be deliberate about what else in that same profile also touches `fetch`.
-
-## Repository layout
-
-Source is TypeScript, organized by concern; `dist/` holds the compiled, plain-JavaScript output that is actually installed and loaded — see [Development](#development) below.
-
-```
-src/host/                    host half (Node ESM, compiled 1:1 by tsc)
-  index.ts                   apply(ctx, config) — wires everything together
-  config.ts                   PluginConfig + its runtime Config schema, and resolveEffectiveConfig (no Cordis dependency, unit-tested)
-  constants.ts                shared constants (user-agent prefix, header name, defaults)
-  http-utils.ts               header redaction, request description, JSON/body clipping
-  call-context.ts             AsyncLocalStorage binding for llm/stream (turn/step/purpose/provider), plus each call's captured-request receipt
-  step-tracker.ts              turn/step tracking from session/event
-  coverage.ts                  per-provider capture-health counters — records captured AND model calls that captured nothing — exposed via stats()
-  fetch-patch.ts               the globalThis.fetch patch itself (admission: harness user-agent or an active llm/stream call)
-  curl.ts                      curl-command rendering + credential resolution
-  store.ts                     in-memory ring merged with the durable archive
-  page-grouping.ts             list-page grouping (turns, auxiliary, unattributed)
-  routes.ts                    HTTP route handlers (list/stats/get/curl/clear/config)
-  persistence/                 durable, file-per-record store
-    naming.ts                  file-name generation and trace-dir resolution
-    codec.ts                   record ⇄ persisted-JSON conversions
-    archive.ts                 the actual file I/O (save/list/get/sweep/clear, optionally session-scoped)
-    constants.ts
-src/client/                  browser half (bundled by esbuild into one classic script)
-  entry.ts                    window.__ModuleLoader__.load({ id, factory }) wrapper; the one file binding strings.ts to DSH's ctx.locale service
-  wire-trace-view.ts           the WireTraceView component (state + rendering)
-  plugin-manage-view.ts        the plugin management page panel (cache stats, capture-gap warning, clear-all, every Config parameter)
-  view-model.ts                pure list/detail logic behind the view (no DOM, unit-tested)
-  strings.ts                   bilingual (zh/en) locale dictionaries for every user-visible string, registered with ctx.locale
-  json-view.ts                 the collapsible JSON tree component
-  compare-view.ts              the Compare tab: baseline picker and the grouped diff (React; hand-verified)
-  body-diff.ts                 pure structural diff of two request bodies (no DOM, unit-tested)
-  json-model.ts                 pure JSON-flattening data model (no DOM)
-  format.ts                     labels/formatters (turn badge, session label, timestamps); takes the active-locale t as a parameter
-  sse.ts                        raw SSE frame parsing/pretty-printing
-  sse-merge/                     per-provider adapters that merge SSE deltas into that provider's own non-streamed shape
-    shared.ts                    shared adapter interface + JSON-parse helper
-    anthropic.ts                  Anthropic Messages API adapter
-    openai-responses.ts           OpenAI Responses API adapter
-    openai-chat-completions.ts    OpenAI/DeepSeek Chat Completions adapter
-    index.ts                      dispatches frames to every adapter, assembles the unified result
-  api-client.ts                  fetch wrappers for this plugin's own routes
-  styles.ts                      the tab's CSS, plus the management panel's
-  constants.ts
-src/shared/
-  record-shape.ts             type-only record shapes shared by both halves
-dist/                        compiled output — what actually ships and loads
-  host/**                     tsc output, one file per source module
-  client.js                    esbuild bundle of src/client/**, single IIFE
-cordis.patch.yml             the host composition row (dsh.bundle.patch)
-package.json                 dsh.bundle + dsh.client declarations
-test/                        node:test suites mirroring src/host/** and the DOM-free src/client/*.ts
-AGENTS.md                     self-verification flow, module boundaries, and hard constraints for agents/contributors
-docs/plugin-development.md   how this codebase uses the DSH/Cordis plugin framework
-docs/architecture.md         why this codebase's own modules are split the way they are
-```
+Treat this plugin as part of a debugging profile, and be deliberate about anything else in that profile that touches `fetch`.
 
 ## Development
 
 ```sh
 pnpm install
-pnpm run build       # tsc -> dist/host/** (+ .d.ts), esbuild -> dist/client.js
+pnpm run build       # tsc -> dist/host/**, esbuild -> dist/client.js
 pnpm run typecheck   # host + client, no emit
-pnpm run test        # tsc -> .test-build, node --test
+pnpm run test        # node:test suites under test/
 pnpm run lint        # oxlint over src/ and test/
-pnpm run verify       # build + typecheck + test + lint — the full self-check before calling a change done
+pnpm run verify      # build + typecheck + test + lint — the full self-check
 ```
 
-Requires **Node >= 22.6** (the test script uses glob patterns as test-runner arguments, which the runner gained in 22.6) and builds with **TypeScript 7**, the native compiler.
+Requires **Node >= 22.6** and builds with TypeScript 7. `dist/` is a gitignored build artifact (only the npm package ships one), so run `pnpm run build` after every source change and restart `dsh web` to load it.
 
-`dist/` is **not** committed to the repository — it is a build artifact, gitignored like any other, produced by `pnpm run build` and produced fresh at publish time by the `prepublishOnly` script (so `npm publish` always ships a build matching the exact source at that commit). Only the *published npm package* carries a prebuilt `dist/`; a git checkout or `link:` install never does. See "[Installing from a source checkout](#installing-from-a-source-checkout-git-or-link)" above for what that means for those install paths.
-
-For local development, run `pnpm run build` after every source change (needed for the plugin to run at all from this checkout — there is no committed `dist/` to fall back on), then reinstall the `link:.` checkout (or just restart `dsh web`, since a linked package's `dist/` is not covered by the client-plugin HMR watcher).
-
-### Tests
-
-`test/` mirrors `src/host/**`, `src/shared/**`, and the DOM-free client modules (`body-diff.ts`, `constants.ts`, `format.ts`, `json-model.ts`, `sse.ts`, `strings.ts`, `view-model.ts`, `sse-merge/**`) one file at a time, using Node's built-in test runner (`node:test`) — no test framework dependency. Coverage includes the in-memory store merged with a fake archive, real temp-directory file I/O for the persistence layer, `AsyncLocalStorage` context binding for turn/step attribution, every SSE-merge adapter against both synthetic fixtures and the exact shape of a bug this project fixed once (a `message` item's own id being misread as a tool-call id), and the viewer's own list/detail logic — the merge of the racing memory and history reads, the one-shot session-filter fallback, turn grouping, and body selection.
-
-Deliberately not unit-tested: `src/host/index.ts` / `src/client/entry.ts` (pure Cordis/`ModuleLoader` glue, covered by `build`+`typecheck` succeeding) and the DOM/React-dependent client modules (`api-client.ts`, `styles.ts`, `json-view.ts`, `compare-view.ts`, `wire-trace-view.ts`), verified instead by the "fake React + fake `ModuleLoader` + real `dist/client.js`" pattern this project's development used throughout.
-
-See [`AGENTS.md`](AGENTS.md) for the exact self-verification flow a change must complete before it's done, the module boundaries the test layout depends on, and the hard constraints (no `prepare` script, `dist/` stays a gitignored build artifact, bodies stay verbatim) that protect this project's deliberate design choices.
-
-See [`docs/plugin-development.md`](docs/plugin-development.md) for a short walkthrough of how this codebase uses the DSH/Cordis plugin framework itself — services, events, Slots, and the one thing (patching `fetch`) that only an installed package can do. See [`docs/architecture.md`](docs/architecture.md) for why this codebase's own modules are split the way they are and how data flows between them.
+- [`docs/architecture.md`](docs/architecture.md) — module structure, data flow and design rationale.
+- [`docs/plugin-development.md`](docs/plugin-development.md) — how this plugin uses DSH/Cordis services, events and Slots.
+- [`AGENTS.md`](AGENTS.md) — the verification flow, module boundaries and hard constraints every change must respect.
 
 ## License
 

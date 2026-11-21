@@ -1,29 +1,26 @@
 /**
  * `PluginManageView`: this plugin's own content inside DSH's "Plugins"
  * management page (the `plugins.bundle.config` Slot, keyed by this package's
- * npm name — see `entry.ts`). Two things live here, because neither fits
- * anywhere else in this plugin's own Wire Trace tab:
+ * npm name — see `entry.ts`). Two blocks:
  *
- *   - Local cache stats (the in-memory ring count, and the persisted count
- *     when disk storage is on) plus a "Clear all history" button that wipes
- *     every session's records at once — the Wire Trace tab's own "Clear"
- *     button is scoped to the session it is opened from (see
- *     `wire-trace-view.ts`), so a page-wide wipe needs its own home.
- *   - Every {@link PluginConfig} parameter, read from and written through the
- *     `config` route (`GET`/`POST /llm-wire-trace/config`), which itself
- *     degrades to a read-only report when the host exposes no profile-config
- *     writer service (`editable: false`) — see the module doc on that route
- *     in `routes.ts` for why writes can only ever target this plugin's own
- *     row.
+ *   - Local storage: how many records are saved, how much disk they use
+ *     against the budget, the oldest one, and a "Clear all history" button
+ *     (the Wire Trace tab's own "Clear" is scoped to its session, so a
+ *     page-wide wipe needs its own home). A capture-gap warning appears here
+ *     when a provider's model calls reached no captured request.
+ *   - Settings: the three {@link PluginConfig} fields, read from and written
+ *     through the `config` route, which degrades to a read-only report when
+ *     the host exposes no profile-config writer service (`editable: false`).
  *
  * Written against the same minimal React-like interface as
- * `wire-trace-view.ts`, for the same classic-script reason (see that file's
- * doc comment).
+ * `wire-trace-view.ts`, for the same classic-script reason.
  *
  * @module dsh-llm-trace-plugin/client/plugin-manage-view
  */
 
 import { apiGet, apiPost } from './api-client.js'
+import { fmtBytes, fmtDateTime } from './format.js'
+import { fmtCount } from './json-model.js'
 import type { ViewContext, WireTraceReact } from './wire-trace-view.js'
 
 /** How a config field's draft text is interpreted and sent. */
@@ -37,38 +34,26 @@ export interface ConfigFieldSpec {
 /**
  * Every editable {@link PluginConfig} field, in the order the panel renders
  * them. Mirrors `CONFIG_FIELDS` in `src/host/config.ts` — duplicated rather
- * than imported for the same classic-script/no-cross-boundary-import reason
- * `ROUTE`/`PACKAGE_NAME` are duplicated in `constants.ts`; pinned by
- * `test/client/plugin-manage-view.test.ts`.
+ * than imported for the same no-cross-boundary-import reason `ROUTE` is
+ * duplicated in `constants.ts`; pinned by `test/client/plugin-manage-view.test.ts`.
  */
 export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
-  { key: 'maxRecords', type: 'number' },
-  { key: 'maxBodyChars', type: 'number' },
   { key: 'persist', type: 'boolean' },
+  { key: 'maxDiskMB', type: 'number' },
   { key: 'traceDir', type: 'string' },
-  { key: 'maxPersistedRecords', type: 'number' },
-  { key: 'historyPageLimit', type: 'number' },
-  { key: 'prettyBodyLimit', type: 'number' },
 ]
 
 /**
- * Each field's documented default, as the draft text it would render —
- * shown when the `config` route cannot be read at all (an older host build
- * with no such route, a network hiccup, anything), so the panel always has
- * SOMETHING concrete to show instead of an error with no further action.
- * Mirrors the defaults `src/host/config.ts`'s `Config` schema declares;
- * pinned alongside `CONFIG_FIELDS` by `test/client/plugin-manage-view.test.ts`.
- * `traceDir` has no fixed default (it depends on `$DSH_HOME`), so its row
- * shows blank here — the field's hint already explains what blank means.
+ * Each field's documented default, as draft text — shown when the `config`
+ * route cannot be read at all, so the panel always shows something concrete.
+ * Pinned against `src/host/config.ts`'s `resolveEffectiveConfig` by the same
+ * test. `traceDir` depends on `$DSH_HOME`, so it shows blank (its hint says
+ * what blank means).
  */
 export const CONFIG_FIELD_DEFAULTS: Readonly<Record<string, string>> = {
-  maxRecords: '200',
-  maxBodyChars: '8000000',
   persist: 'true',
+  maxDiskMB: '1024',
   traceDir: '',
-  maxPersistedRecords: '300',
-  historyPageLimit: '50',
-  prettyBodyLimit: '500000',
 }
 
 /** The owner props DSH's Plugins page renders `plugins.bundle.config` with. */
@@ -90,13 +75,9 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
     const [statsTick, setStatsTick] = React.useState(0)
 
     const [configState, setConfigState] = React.useState<{ editable: boolean, values: Record<string, unknown> } | null>(null)
-    // True whenever `GET config` could not be read at all, for ANY reason —
-    // an older host build with no such route (installing/updating a plugin
-    // does not hot-reload host code; see the README's "Install" notes on
-    // restarting `dsh web`), a network hiccup, anything. Rather than
-    // surfacing that failure as an error with no action the reader can take,
-    // the panel falls back to each field's documented default
-    // (`CONFIG_FIELD_DEFAULTS`) so there is always something concrete shown.
+    // True whenever `GET config` could not be read at all (an older host
+    // build, a network hiccup): the panel then shows each field's default
+    // rather than an error the reader can do nothing about.
     const [configUsingDefaults, setConfigUsingDefaults] = React.useState(false)
     const [configTick, setConfigTick] = React.useState(0)
     const [drafts, setDrafts] = React.useState<Record<string, string>>({})
@@ -114,6 +95,13 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
       )
       return () => { alive = false }
     }, [statsTick])
+
+    // While an earlier version's records are being imported the numbers move,
+    // so follow them until the import is done.
+    React.useEffect(() => {
+      if (stats === null || !(Number(stats.legacyPending) > 0)) return undefined
+      return ctx.interval(() => setStatsTick((n: number) => n + 1), 1500)
+    }, [stats])
 
     React.useEffect(() => {
       let alive = true
@@ -142,8 +130,17 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
 
     if (props.view !== 'page') return null
 
-    /** Parse one field's draft text and `POST` it; empty text unsets the field (reverts to default). */
+    /** The value currently in effect for a field, as draft text. */
+    const savedText = (key: string): string => {
+      const value = configState === null ? undefined : configState.values[key]
+      return value === undefined || value === null ? '' : String(value)
+    }
+
+    /** Parse one field's draft and `POST` it; empty text unsets the field (back to its default). */
     function saveField(field: ConfigFieldSpec, raw: string | boolean): void {
+      // Leaving a field without changing it must not write anything — least of
+      // all the resolved default directory as an explicit setting.
+      if (field.type !== 'boolean' && String(raw) === savedText(field.key)) return
       let value: unknown
       if (field.type === 'boolean') {
         value = raw as boolean
@@ -160,7 +157,7 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
           value = parsed
         }
       } else {
-        value = raw === '' ? null : raw
+        value = String(raw).trim() === '' ? null : String(raw).trim()
       }
       setSavingField(field.key)
       setFieldNotice(null)
@@ -169,6 +166,8 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
           setSavingField(null)
           setFieldNotice({ field: field.key, kind: 'ok', text: t('manage.fieldSaved') })
           setConfigTick((n: number) => n + 1)
+          // A new budget or directory changes what the storage block reports.
+          setStatsTick((n: number) => n + 1)
         },
         (reason: any) => {
           setSavingField(null)
@@ -197,23 +196,38 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
       )
     }
 
-    const statsLine = stats === null
+    // ---- storage block ---------------------------------------------------
+    const persisted = stats !== null && stats.persistence === true
+    const retained = persisted ? Number(stats.retained) || 0 : 0
+    const used = persisted ? Number(stats.diskBytes) || 0 : 0
+    const budget = persisted ? Number(stats.maxDiskBytes) || 0 : 0
+    const ratio = budget > 0 ? Math.min(1, used / budget) : 0
+
+    const summary = stats === null
       ? t('manage.statsLoading')
-      : (stats.persistence
-        ? t('manage.statsLine', { memory: stats.memory, retained: stats.retained ?? 0, maxRecords: stats.maxRecords ?? '—' })
-        : t('manage.statsLineNoPersist', { memory: stats.memory }))
+      : (!persisted
+        ? t('manage.memoryOnlyLine', { memory: fmtCount(Number(stats.memory) || 0) })
+        : (retained === 0
+          ? t('manage.storageEmpty')
+          : t('manage.storageLine', { retained: fmtCount(retained), oldest: fmtDateTime(stats.oldestAt) })))
+
+    const usage = !persisted || budget <= 0 ? null : h('div', { className: 'wt-usage', key: 'usage', title: t('manage.storageUsageTitle') }, [
+      h('div', { className: 'wt-usage-bar', key: 'bar', 'data-high': ratio >= 0.9 ? '1' : '0' }, [
+        h('div', { className: 'wt-usage-fill', key: 'fill', style: { width: (ratio * 100).toFixed(1) + '%' } }),
+      ]),
+      h('span', { className: 'wt-usage-text', key: 'text' }, t('manage.storageUsage', { used: fmtBytes(used), budget: fmtBytes(budget) })),
+    ])
+
+    const legacy = stats !== null && Number(stats.legacyPending) > 0
+      ? h('div', { className: 'wt-jnotice', key: 'legacy' }, t('manage.legacyPending', { count: fmtCount(Number(stats.legacyPending)) }))
+      : null
 
     /**
-     * The one coverage row worth showing: a provider whose model calls produced
-     * NO captured request. The host's `coverage` is ordered with untraced calls
-     * first, but this scans rather than indexing, so an older host build (whose
-     * rows carry no `untracedCalls` at all) simply shows nothing instead of
-     * rendering `undefined`.
-     *
-     * This is the difference between a trace that is empty because nothing was
-     * captured and one that is empty because the provider's transport never
-     * reached the fetch patch — the distinction this page could not previously
-     * make at all; see the README's "Known limitation".
+     * A provider whose model calls produced NO captured request: the
+     * difference between a trace that is empty because nothing happened and
+     * one that is empty because the provider's transport never reached the
+     * fetch patch (see the README's "Known limitation"). Scans rather than
+     * indexes, so an older host build simply shows nothing.
      */
     const untracedProvider = stats === null || stats.coverage === undefined || !Array.isArray(stats.coverage.providers)
       ? null
@@ -226,27 +240,36 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
         modelCalls: untracedProvider.modelCalls,
       }))
 
+    // ---- settings block --------------------------------------------------
     const fieldRows = CONFIG_FIELDS.map((field) => {
       const draft = drafts[field.key] ?? ''
       const disabled = configUsingDefaults || configState === null || configState.editable === false || savingField === field.key
-      const input = field.type === 'boolean'
-        ? h('input', {
-          key: 'input',
-          type: 'checkbox',
-          checked: draft === 'true',
-          disabled,
-          onChange: (event: any) => {
-            const checked = !!(event && event.target && event.target.checked)
-            setDrafts((prev: Record<string, string>) => ({ ...prev, [field.key]: String(checked) }))
-            saveField(field, checked)
-          },
-        })
-        : h('input', {
-          key: 'input',
+      let input: any
+      if (field.type === 'boolean') {
+        input = h('label', { className: 'wt-switch', key: 'input', 'data-on': draft === 'true' ? '1' : '0', 'data-disabled': disabled ? '1' : '0' }, [
+          h('input', {
+            key: 'box',
+            type: 'checkbox',
+            checked: draft === 'true',
+            disabled,
+            onChange: (event: any) => {
+              const checked = !!(event && event.target && event.target.checked)
+              setDrafts((prev: Record<string, string>) => ({ ...prev, [field.key]: String(checked) }))
+              saveField(field, checked)
+            },
+          }),
+          h('span', { className: 'wt-switch-track', key: 'track', 'aria-hidden': 'true' }),
+        ])
+      } else {
+        const box = h('input', {
+          key: 'box',
           type: field.type === 'number' ? 'number' : 'text',
           className: 'wt-mfield-input',
           value: draft,
           disabled,
+          spellCheck: false,
+          min: field.key === 'maxDiskMB' ? 16 : undefined,
+          step: field.key === 'maxDiskMB' ? 128 : undefined,
           onChange: (event: any) => {
             const value = event && event.target ? event.target.value : ''
             setDrafts((prev: Record<string, string>) => ({ ...prev, [field.key]: value }))
@@ -256,41 +279,55 @@ export function createPluginManageView(React: WireTraceReact, ctx: ViewContext) 
             if (event && event.key === 'Enter' && event.target && typeof event.target.blur === 'function') event.target.blur()
           },
         })
+        input = field.key === 'maxDiskMB'
+          ? h('span', { className: 'wt-mfield-unit', key: 'input' }, [box, h('span', { key: 'u' }, t('manage.field.maxDiskMB.unit'))])
+          : box
+      }
       const notice = fieldNotice !== null && fieldNotice.field === field.key ? fieldNotice : null
-      return h('div', { className: 'wt-mfield', key: field.key }, [
-        h('label', { className: 'wt-mfield-label', key: 'l' }, t(`manage.field.${field.key}.label`)),
+      return h('div', { className: 'wt-mfield', key: field.key, 'data-k': field.type }, [
+        h('div', { className: 'wt-mfield-text', key: 'text' }, [
+          h('div', { className: 'wt-mfield-label', key: 'l' }, t(`manage.field.${field.key}.label`)),
+          h('div', { className: 'wt-mfield-hint', key: 'h' }, t(`manage.field.${field.key}.hint`)),
+          notice === null ? null : h('div', { className: 'wt-mfield-notice', 'data-k': notice.kind, key: 'n' }, notice.text),
+        ].filter(Boolean)),
         input,
-        h('div', { className: 'wt-mfield-hint', key: 'h' }, t(`manage.field.${field.key}.hint`)),
-        notice === null ? null : h('div', { className: 'wt-mfield-notice', 'data-k': notice.kind, key: 'n' }, notice.text),
-      ].filter(Boolean))
+      ])
     })
 
+    const settingsNotice = configUsingDefaults
+      ? h('div', { className: 'wt-jnotice', key: 'defaults' }, t('manage.fieldsUsingDefaults'))
+      : (configState === null
+        ? h('div', { className: 'wt-jnotice', key: 'loading' }, t('manage.fieldsLoading'))
+        : (configState.editable === false
+          ? h('div', { className: 'wt-jnotice', key: 'ro' }, t('manage.fieldsReadOnlyNotice'))
+          : null))
+
     return h('div', { className: 'wt-manage' }, [
-      h('div', { className: 'wt-manage-stats', key: 'stats' }, [
-        h('span', { className: 'wt-manage-stats-label', key: 'l' }, t('manage.statsLabel')),
-        h('span', { className: 'wt-manage-stats-line', key: 'v' }, statsLine),
-        h('button', {
-          className: 'wt-btn',
-          key: 'clear',
-          title: t('manage.clearAllTitle'),
-          disabled: clearBusy,
-          onClick: clearAll,
-        }, t('manage.clearAllButton')),
-      ]),
-      statsError === null ? null : h('div', { className: 'wt-err', key: 'stats-err' }, t('manage.statsError', { message: statsError })),
-      captureWarning,
-      clearNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'clear-notice' }, clearNotice),
-      h('div', { className: 'wt-manage-fields', key: 'fields' }, [
-        h('div', { className: 'wt-manage-fields-label', key: 'label' }, t('manage.fieldsLabel')),
-        configUsingDefaults
-          ? h('div', { className: 'wt-jnotice', key: 'defaults' }, t('manage.fieldsUsingDefaults'))
-          : (configState === null
-            ? h('div', { className: 'wt-jnotice', key: 'loading' }, t('manage.fieldsLoading'))
-            : (configState.editable === false
-              ? h('div', { className: 'wt-jnotice', key: 'ro' }, t('manage.fieldsReadOnlyNotice'))
-              : null)),
+      h('section', { className: 'wt-msection', key: 'storage' }, [
+        h('div', { className: 'wt-msection-head', key: 'head' }, [
+          h('span', { className: 'wt-msection-title', key: 't' }, t('manage.statsLabel')),
+          h('button', {
+            className: 'wt-btn wt-btn-danger',
+            key: 'clear',
+            title: t('manage.clearAllTitle'),
+            disabled: clearBusy,
+            onClick: clearAll,
+          }, t('manage.clearAllButton')),
+        ]),
+        h('div', { className: 'wt-msummary', key: 'summary' }, summary),
+        usage,
+        legacy,
+        statsError === null ? null : h('div', { className: 'wt-err', key: 'stats-err' }, t('manage.statsError', { message: statsError })),
+        captureWarning,
+        clearNotice === null ? null : h('div', { className: 'wt-jnotice', key: 'clear-notice' }, clearNotice),
+      ].filter(Boolean)),
+      h('section', { className: 'wt-msection', key: 'settings' }, [
+        h('div', { className: 'wt-msection-head', key: 'head' }, [
+          h('span', { className: 'wt-msection-title', key: 't' }, t('manage.fieldsLabel')),
+        ]),
+        settingsNotice,
         ...fieldRows,
       ].filter(Boolean)),
-    ].filter(Boolean))
+    ])
   }
 }

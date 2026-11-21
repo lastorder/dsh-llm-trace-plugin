@@ -5,77 +5,65 @@
  *
  * Split out of `index.ts` deliberately: this module has no Cordis dependency
  * at all (it is plain `@deepseek-ai/schemastery` usage plus arithmetic), so
- * it is directly unit-testable the same way `persistence/naming.ts` is —
- * unlike `index.ts`, which stays Cordis glue only (see `docs/architecture.md`).
+ * it is directly unit-testable — unlike `index.ts`, which stays Cordis glue
+ * only (see `docs/architecture.md`).
  *
  * @module dsh-llm-trace-plugin/host/config
  */
 
 import z from '@deepseek-ai/schemastery'
-import { DEFAULT_MAX_BODY_CHARS, DEFAULT_MAX_RECORDS, LIST_PAGE_CEILING } from './constants.js'
-import { DEFAULT_MAX_PERSISTED, DEFAULT_PAGE_LIMIT, DEFAULT_PRETTY_BODY_LIMIT } from './persistence/constants.js'
+import { DEFAULT_MAX_DISK_MB, MIN_MAX_DISK_MB } from './persistence/constants.js'
 import { resolveTraceDir } from './persistence/naming.js'
 
-/** User-facing plugin configuration; every field is optional and defaults as documented below. */
+/** User-facing plugin configuration; every field is optional. */
 export interface PluginConfig {
-  /** In-memory ring-buffer size: how many recent records stay resident regardless of persistence. */
-  maxRecords?: number
-  /** Per-field character cap on a captured request/response body before truncation. */
-  maxBodyChars?: number
-  /** Write records to disk under `traceDir`. `false` keeps a pure in-memory ring with nothing written to disk. */
+  /** Write records to disk under `traceDir`. `false` keeps the most recent records in memory only. */
   persist?: boolean
+  /** Disk budget in megabytes; the oldest records are deleted beyond it. */
+  maxDiskMB?: number
   /** Directory records are persisted under. Defaults to `$DSH_HOME/llm-wire-trace/records` (or `~/.dsh/llm-wire-trace/records`). */
   traceDir?: string
-  /** Retained record files on disk before the oldest are swept. */
-  maxPersistedRecords?: number
-  /** Files read per archive listing page. */
-  historyPageLimit?: number
-  /** Above this body size, the pretty-printed on-disk readability copy is not written. */
-  prettyBodyLimit?: number
 }
+
+/**
+ * Options earlier versions accepted. Their values are ignored; a config save
+ * from the management page drops them so the profile does not keep carrying
+ * settings that no longer do anything.
+ */
+export const LEGACY_CONFIG_FIELDS = [
+  'maxRecords',
+  'maxBodyChars',
+  'maxPersistedRecords',
+  'historyPageLimit',
+  'prettyBodyLimit',
+] as const
 
 /**
  * Runtime schema for {@link PluginConfig}, validated by Cordis at activation
  * and readable through the `Config` Inspect provider (`Config.listConfigs`).
- * Every field carries the same default this module's own fallbacks already
- * applied, so declaring this schema changes no runtime behavior — it only
- * makes every parameter discoverable and editable through DSH's own plugin
- * configuration surfaces instead of requiring a reader to open this source.
+ * Unknown keys (including {@link LEGACY_CONFIG_FIELDS}) pass through
+ * untouched, so an older profile config still activates.
  */
 export const Config: z<PluginConfig> = z.object({
-  maxRecords: z.number().step(1).min(1).default(DEFAULT_MAX_RECORDS)
-    .description('In-memory ring-buffer size: how many recent records stay resident regardless of persistence.'),
-  maxBodyChars: z.number().step(1).min(1).default(DEFAULT_MAX_BODY_CHARS)
-    .description('Per-field character cap on a captured request/response body before truncation.'),
   persist: z.boolean().default(true)
-    .description('Write records to disk under traceDir. Disable for a pure in-memory ring with nothing written to disk.'),
+    .description('Write records to disk under traceDir. Disable to keep the most recent records in memory only.'),
+  maxDiskMB: z.number().step(1).min(MIN_MAX_DISK_MB).default(DEFAULT_MAX_DISK_MB)
+    .description('Disk budget in megabytes. Beyond it the oldest records are deleted.'),
   traceDir: z.string()
     .description('Directory records are persisted under. Defaults to $DSH_HOME/llm-wire-trace/records (or ~/.dsh/llm-wire-trace/records).'),
-  maxPersistedRecords: z.number().step(1).min(1).default(DEFAULT_MAX_PERSISTED)
-    .description('Retained record files on disk before the oldest are swept.'),
-  historyPageLimit: z.number().step(1).min(1).max(LIST_PAGE_CEILING).default(DEFAULT_PAGE_LIMIT)
-    .description('Files read per archive listing page.'),
-  prettyBodyLimit: z.number().step(1).min(1).default(DEFAULT_PRETTY_BODY_LIMIT)
-    .description('Above this body size, the pretty-printed on-disk readability copy is not written.'),
 })
 
 /** Every {@link PluginConfig} field, fully resolved to the value actually in effect. */
 export interface ResolvedPluginConfig {
-  maxRecords: number
-  maxBodyChars: number
   persist: boolean
+  maxDiskMB: number
   traceDir: string
-  maxPersistedRecords: number
-  historyPageLimit: number
-  prettyBodyLimit: number
 }
 
 /**
  * Resolve a (possibly partial, possibly absent) config to the values the rest
- * of the host half uses. Mirrors the fallbacks `index.ts`/`store.ts`/
- * `persistence/archive.ts` already apply individually, collected in one place
- * so a reader (and the `config` route's `GET`) can see the effective values
- * without re-deriving them per module.
+ * of the host half uses, in one place, so `index.ts` and the `config` route's
+ * `GET` agree on what "the config currently in effect" means.
  * @param config - raw plugin config, or undefined for an unconfigured plugin.
  * @param env - environment to resolve `traceDir`'s default against; defaults to `process.env`.
  */
@@ -84,24 +72,19 @@ export function resolveEffectiveConfig(
   env?: Record<string, string | undefined>,
 ): ResolvedPluginConfig {
   const settings = config ?? {}
+  const budget = typeof settings.maxDiskMB === 'number' && Number.isFinite(settings.maxDiskMB)
+    ? Math.max(MIN_MAX_DISK_MB, Math.floor(settings.maxDiskMB))
+    : DEFAULT_MAX_DISK_MB
   return {
-    maxRecords: settings.maxRecords || DEFAULT_MAX_RECORDS,
-    maxBodyChars: settings.maxBodyChars || DEFAULT_MAX_BODY_CHARS,
     persist: settings.persist !== false,
+    maxDiskMB: budget,
     traceDir: resolveTraceDir(settings.traceDir, env),
-    maxPersistedRecords: settings.maxPersistedRecords ?? DEFAULT_MAX_PERSISTED,
-    historyPageLimit: settings.historyPageLimit ?? DEFAULT_PAGE_LIMIT,
-    prettyBodyLimit: settings.prettyBodyLimit ?? DEFAULT_PRETTY_BODY_LIMIT,
   }
 }
 
 /** Every editable field name, in the order the management UI renders them. */
 export const CONFIG_FIELDS = [
-  'maxRecords',
-  'maxBodyChars',
   'persist',
+  'maxDiskMB',
   'traceDir',
-  'maxPersistedRecords',
-  'historyPageLimit',
-  'prettyBodyLimit',
 ] as const satisfies readonly (keyof PluginConfig)[]

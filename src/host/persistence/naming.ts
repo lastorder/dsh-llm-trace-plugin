@@ -1,7 +1,7 @@
 /**
- * Storage naming and directory resolution: turning a `startedAt` timestamp
- * into a globally unique, chronologically sortable file name, and resolving
- * where those files live.
+ * Storage naming and directory resolution: record ids, segment file names,
+ * recognizing files from earlier versions, and resolving where it all lives.
+ * No I/O.
  *
  * @module dsh-llm-trace-plugin/host/persistence/naming
  */
@@ -11,9 +11,9 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /**
- * Intra-millisecond ordering state for `buildRecordName`. Module-level
- * because ordering only has to hold within one process: across processes the
- * random tail guarantees uniqueness, and two processes' records interleave by
+ * Intra-millisecond ordering state for `buildRecordId`. Module-level because
+ * ordering only has to hold within one process: across processes the random
+ * tail guarantees uniqueness, and two processes' records interleave by
  * timestamp anyway.
  */
 let lastStampMs = -1
@@ -35,33 +35,17 @@ export function resolveTraceDir(explicit?: string, env?: Record<string, string |
 }
 
 /**
- * Build the storage name for a record.
+ * Build a record id: `<13-digit ms>-<4-hex intra-ms counter>-<8-hex random>`.
  *
- * The name must be globally unique AND sort chronologically, because it is
- * the only ordering key the archive has — nothing is read to sort a page.
- *
- * Uniqueness matters more than it looks: an in-memory id built from a
- * per-process counter would let two harness processes collide on the same
- * name and silently overwrite each other's records — reintroducing, as data
- * loss, the very cross-process problem the file-per-record layout removes.
- *
- * The name has three parts, in sort-significant order:
- *
- *   <13-digit ms> - <4-hex intra-ms counter> - <8-hex random>
- *
- * The millisecond alone is not enough: a burst can start many calls inside
- * one millisecond, and a purely random suffix would then order them
- * ARBITRARILY — losing real ordering exactly when calls are densest. The
- * counter restores order within a millisecond; the random tail keeps names
- * unique across processes, which a counter alone cannot do.
- *
- * Zero-padding keeps plain lexicographic sort equal to chronological sort,
- * which is what lets retention and paging work on names alone.
+ * The id must be globally unique AND sort chronologically: the viewer orders
+ * rows that started in the same millisecond by id. The counter keeps a burst
+ * of calls inside one millisecond in order; the random tail keeps ids unique
+ * across processes, which a counter alone cannot do. Zero-padding keeps plain
+ * lexicographic order equal to chronological order.
  *
  * @param startedAt - epoch milliseconds the call began.
- * @returns the file name, including extension.
  */
-export function buildRecordName(startedAt: number): string {
+export function buildRecordId(startedAt: number): string {
   const ms = Math.max(0, Math.floor(startedAt))
   if (ms === lastStampMs) {
     // Saturate rather than wrap: wrapping would sort a later record earlier.
@@ -72,10 +56,37 @@ export function buildRecordName(startedAt: number): string {
   }
   const stamp = String(ms).padStart(13, '0')
   const ordinal = intraMs.toString(16).padStart(4, '0')
-  return `${stamp}-${ordinal}-${randomBytes(4).toString('hex')}.json`
+  return `${stamp}-${ordinal}-${randomBytes(4).toString('hex')}`
 }
 
-/** Recover the record id (the name without extension) from a file name. */
-export function idFromName(name: string): string {
-  return name.slice(0, -'.json'.length)
+/** A segment's data and index files share this stem: `<13-digit start ms>-<8-hex random>`. */
+export const SEGMENT_FILE = /^(\d{13})-([0-9a-f]{8})\.(dat|idx)$/
+
+export type SegmentFileKind = 'dat' | 'idx'
+
+/**
+ * Build a new segment's file stem. The start time leads so sorting stems is
+ * sorting segments by age, which is the order retention deletes them in; the
+ * random tail keeps two processes (or two segments in one millisecond) apart.
+ */
+export function buildSegmentStem(startMs: number): string {
+  const stamp = String(Math.max(0, Math.floor(startMs))).padStart(13, '0')
+  return `${stamp}-${randomBytes(4).toString('hex')}`
 }
+
+/** Recognize a segment file, or null for anything else in the directory. */
+export function parseSegmentFile(name: string): { stem: string, kind: SegmentFileKind, startMs: number } | null {
+  const match = SEGMENT_FILE.exec(name)
+  if (match === null) return null
+  return { stem: `${match[1]}-${match[2]}`, kind: match[3] as SegmentFileKind, startMs: Number(match[1]) }
+}
+
+/**
+ * One record per JSON file: the layout every version before 0.6.0 wrote. Only
+ * read to import them once (see archive.ts). The optional middle group
+ * matches files written before ids carried the intra-ms counter.
+ */
+export const LEGACY_RECORD_FILE = /^(\d{13,})-(?:[0-9a-f]{4}-)?[0-9a-f]{6,}\.json$/
+
+/** Temp files that version's atomic write could strand on a crash. */
+export const LEGACY_TEMP_FILE = /\.json\.[0-9a-f]+\.tmp$/
