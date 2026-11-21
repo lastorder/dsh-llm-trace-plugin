@@ -99,7 +99,7 @@ dsh plugin --profile web add link:/path/to/dsh-llm-trace-plugin
 
 ## 持久化
 
-记录会保存到磁盘，重启后依然存在；标签页把实时记录和已保存的记录合并成一个列表展示。
+记录会保存到磁盘，重启后依然存在；标签页把实时记录和已保存的记录合并成一个列表展示。设计与文件格式详见 [`docs/persistence.zh.md`](docs/persistence.zh.md)。
 
 - **位置**：`traceDir`，默认为 `$DSH_HOME/llm-wire-trace/records`（取不到时为 `~/.dsh/llm-wire-trace/records`）。
 - **格式**：紧凑的、只追加写入的段文件——`<start-ms>-<random>.dat` 存放 brotli 压缩后的记录，每个段另有一个小的 `.idx` JSONL 索引。这些文件不是给人直接打开看的，请在 Wire Trace 标签页里浏览。

@@ -44,7 +44,7 @@ index.ts（apply）把以上所有模块组装进 ctx.effect()/ctx.on()，并把
 - **`call-context.ts`** / **`step-tracker.ts`** 是*归属*层：回答"这次调用属于哪个 turn/session/purpose"，与 HTTP、存储完全无关。`call-context.ts` 还携带每次调用的可变回执——补丁在它名下抓到了多少个请求——并在流结束时上报一个 `SettledCall`，这正是 store 能统计出"某次模型调用完全没有产生抓包"的原因。`step-tracker.ts` 尤其干净——零 Cordis、零 Node 依赖，就是一个基于 `Map` 的状态机，测试方式和任何普通 TypeScript 模块一样。
 - **`config.ts`** 承载 `PluginConfig`（面向用户的形状）、它的运行时 `Config` schema（`@deepseek-ai/schemastery`，不依赖 Cordis），以及 `resolveEffectiveConfig`——唯一应用每个字段默认值的地方，因此 `index.ts` 的 `apply`、`config` 路由的 `GET`，以及这个文件自己的测试，对"当前生效的配置"达成一致。它独立于 `index.ts` 存在，原因与 `persistence/constants.ts` 一样：默认值的改动和 Cordis 接线的改动是两个不同的关注点，放在同一个文件里会让其中一个改动的测试意外跑到另一个改动的代码路径上。
 - **`store.ts`** 是编排层：一个小的内存环与可选的持久化 `archive` 实时合并。它依赖 `fetch-patch.ts`（构造包裹后的 `fetch`）和 `persistence/`（持久化/恢复），但对 HTTP 一无所知。一条记录结束后交给 archive 一次，archive 一收下它就离开内存环，所以内存环里只有进行中的调用、archive 没有收下的记录，以及关闭持久化时的全部（有上限的）历史。列表把内存环和 archive 的内存索引合并，从不读磁盘。它还会从两侧喂给 **`coverage.ts`**：每条被 push 的记录的提供方/主机信息，以及每次已结束的模型调用（`recordModelCall`，由胶水代码在 `llm/stream` 上的观察者调用）携带的"这次调用到底抓到东西没有"。`coverage.ts` 是一对小巧、无依赖的计数器，同时回答"自本进程启动以来，各提供方分别产生了多少次调用"和"有多少次模型调用什么都没抓到"——它是一个健康信号，不是记录本身的一部分，只读地经由 `stats()` 暴露出去。它存在的原因是：fetch 补丁的覆盖率既取决于 `globalThis.fetch` 是否始终是生效引用，也取决于流量是否真的进入了补丁——某个提供方的槽位被换掉、或者它的 SDK 手里握着补丁之前的槽位快照，这两种情况从抓包这一侧看都是隐形的，但"未抓包的模型调用数不为零"是这类提供方藏不住的（参见 README 的"已知限制"一节）。`store.ts` 自己的 `clear()` 接受一个可选的 `sessionId`，把内存环与 archive 的清空都限定到一个 session——Wire Trace 标签页自己的「清空」按钮会传入它，插件管理页的「清除全部历史记录」按钮则不传。`clear()` 刻意不重置覆盖率计数器。
-- **`persistence/`** 自己又拆成三份——"存什么"、"文件叫什么"和"I/O 怎么做"会因为不同的原因改动：
+- **`persistence/`** 自己又拆成三份——"存什么"、"文件叫什么"和"I/O 怎么做"会因为不同的原因改动（文件格式、算法和限制详见 [`persistence.zh.md`](persistence.zh.md)）：
   - `naming.ts` —— 记录 id（`<毫秒>-<毫秒内序号>-<随机数>`，跨进程唯一且按时间可排序）、段文件名，以及识别 0.6.0 之前版本写下的"一条记录一个 JSON 文件"（不涉及 I/O）。
   - `codec.ts` —— 决定写什么：`shouldPersist`（在任何模型调用之外发出、又没有请求体的请求，例如 `GET /models` 轮询，属于杂务，只留在内存里）、一条记录自包含的 JSON payload、列表行据以构建的索引行，以及请求体增量（`planDelta`/`applyDelta`：与同一 session、同一用途、同一端点的上一次请求的公共前缀和后缀——连续的 agent 请求会重复整段历史，所以 97–99% 的内容是共享的）。不涉及 I/O，也不做压缩；每个 body 都会还原成与抓到时完全相同的字符串。
   - `archive.ts` —— 全部 I/O，建立在上面两者之上。记录追加写入*段*：一个装着 brotli 压缩 payload 的 `.dat` 文件，加一个指向其中位置的 `.idx` JSONL 文件，每段一对，只由创建它的进程写入。启动时把 `.idx` 加载成内存索引（并每隔几秒重新扫描其他进程写的段），所以列表、session 过滤和计数都不碰磁盘；`get` 是一次定位读取加一次解压，沿着最长 32 环的增量链还原，最近还原过的 body 会被缓存。增量链从不跨段，这让保留策略很简单：磁盘预算（`maxDiskMB`）靠按"最旧内容优先"整段删除来执行。限定 session 的 `clear` 会重写包含该 session 的段（其他记录的压缩 payload 原样拷贝——增量只在同一 session 内成链，所以保留下来的记录不会丢掉它的 base）；不限定的则删除所有段。首次启动时，它把旧版的逐条记录文件经由正常写入路径导入，然后删除它们。所有修改都经过同一个进程内队列；跨进程之间没有共享的可变文件，某个写入者的段被别的进程删掉时，它只需另起一个新段。
@@ -100,5 +100,6 @@ plugin-manage-view.ts ──渲染（缓存统计、清除全部、每一项 Con
 ## 接下来看什么
 
 - [`plugin-development.zh.md`](plugin-development.zh.md) —— 同一份代码库里 DSH/Cordis 相关的那一侧（服务、事件、Slot，以及为什么 `fetch` 补丁必须是已安装的包）。
+- [`persistence.zh.md`](persistence.zh.md) —— 记录存储在磁盘上的设计与数据格式。
 - [`AGENTS.md`](../AGENTS.md)（英文） —— 一次改动必须走完的自验证流程，以及它强制执行的模块边界/硬性约束。
 - [主 README，"How it works"](../README.zh.md#工作原理) —— 这些模块实现的运行时行为，与它们如何被拆分无关。

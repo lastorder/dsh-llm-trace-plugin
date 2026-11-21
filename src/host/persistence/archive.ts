@@ -85,6 +85,12 @@ export interface ArchiveOptions {
   /** Import record files written by versions before 0.6.0. Defaults to true. */
   migrateLegacy?: boolean
   onError?: (error: Error) => void
+  /**
+   * Test seam: how a segment's files are measured while following another
+   * process's segment. Lets a test write a record between the two measurements
+   * to pin the order they are taken in (see `scan`). Defaults to `fs.stat`.
+   */
+  statFile?: (path: string) => Promise<{ size: number }>
 }
 
 export interface ArchiveListQuery {
@@ -201,6 +207,7 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
   const maxDiskBytes = settings.maxDiskBytes ?? DEFAULT_MAX_DISK_MB * 1024 * 1024
   const targetBytes = segmentTargetBytes(maxDiskBytes)
   const onError = typeof settings.onError === 'function' ? settings.onError : () => {}
+  const statFile = settings.statFile ?? stat
 
   const entries = new Map<string, Entry>()
   /** Every entry, oldest first. */
@@ -349,10 +356,15 @@ export function createRecordArchive(options?: ArchiveOptions): RecordArchive {
         let segment = segments.get(stem)
         if (segment !== undefined && segment.own) continue
         try {
-          const [dataStat, idxStat] = await Promise.all([
-            stat(join(dir, `${stem}.dat`)),
-            stat(join(dir, `${stem}.idx`)),
-          ])
+          // The index FIRST, then the data. A payload is always appended
+          // before its index line, so a data file measured after the index is
+          // at least as large as every line that index shows. Measured the
+          // other way round, a record another process appends in between
+          // yields an index line whose payload lies beyond the measured data
+          // size; that line would be skipped and the read position moved past
+          // it, so the record would never appear until the next start.
+          const idxStat = await statFile(join(dir, `${stem}.idx`))
+          const dataStat = await statFile(join(dir, `${stem}.dat`))
           if (segment === undefined) {
             segment = { stem, startMs: slot.startMs, dataBytes: 0, idxBytes: 0, idxRead: 0, lastAt: slot.startMs, own: false }
             segments.set(stem, segment)

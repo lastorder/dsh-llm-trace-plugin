@@ -399,6 +399,42 @@ test('two processes on one directory: each writes its own segment and sees the o
   })
 })
 
+test('following another process: a record appended between measuring the index and the data is not lost', async () => {
+  await withTempDir(async (dir) => {
+    const writer = createRecordArchive({ dir })
+    const first = step(1000, 'a', 5)
+    const second = step(1001, 'a', 6)
+    await writer.save(first)
+    // The first time the follower measures the writer's segment, the writer
+    // appends another record right after that measurement returns.
+    let fired = false
+    const follower = createRecordArchive({
+      dir,
+      statFile: async (path) => {
+        const measured = await stat(path)
+        if (!fired && /\.(dat|idx)$/.test(path)) {
+          fired = true
+          await writer.save(second)
+        }
+        return measured
+      },
+    })
+    try {
+      await follower.open()
+      assert.equal(fired, true)
+      // Whatever the first pass saw, the record must show up once asked for;
+      // measuring the data before the index would skip its index line for good.
+      const found = await follower.get(second.id)
+      assert.ok(found !== null, 'the record appended mid-scan never appeared')
+      assert.equal(found!.request.bodyText, second.request.bodyText)
+      assert.equal((await follower.list()).total, 2)
+    } finally {
+      await writer.close()
+      await follower.close()
+    }
+  })
+})
+
 test('stats reports records, disk use against the budget, and the oldest record', async () => {
   await withTempDir(async (dir) => {
     const archive = createRecordArchive({ dir, maxDiskBytes: 32 * 1024 * 1024 })

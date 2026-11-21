@@ -102,7 +102,7 @@ The wire barely carries any of this, so it is attached by observing two harness 
 
 ## Persistence
 
-Records are saved to disk so they survive restarts; the tab shows live and saved records as one list.
+Records are saved to disk so they survive restarts; the tab shows live and saved records as one list. Design and file format: [`docs/persistence.md`](docs/persistence.md).
 
 - **Location**: `traceDir`, default `$DSH_HOME/llm-wire-trace/records` (falls back to `~/.dsh/llm-wire-trace/records`).
 - **Format**: compact, append-only segment files — `<start-ms>-<random>.dat` holding brotli-compressed records, plus a small `.idx` JSONL index per segment. They are not meant to be opened by hand; browse records in the Wire Trace tab.
