@@ -35,7 +35,7 @@ Per [Package and install a plugin](https://deepseek-harness.github.io/deepseek-h
     - id: llm-wire-trace
       name: dsh-llm-trace-plugin
       # config:
-      #   maxRecords: 200
+      #   maxDiskMB: 1024
 ```
 
 `name` here is the **package name** — Node resolution finds the installed code — not a file path. A user installs it with `dsh plugin --profile <name> add dsh-llm-trace-plugin` (or `link:.` for local development, or a git spec); see the README's [Install](../README.md#install) section for every supported form.
@@ -74,7 +74,7 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   Note which context each part uses: the route handler still reads `credentials`, `configEditor` and `fiber.entry` off the OUTER `ctx`, because `ctx.fiber` must be *this plugin's own* Loader entry for a config write to target its own row — the injected child fiber has none of its own.
 
 - **`ctx.get(name)`** is the other way to reach a service, for an optional one whose absence should degrade gracefully rather than block. It is only meaningful when the read happens at use time (as this plugin's `getCredentials`/`getConfigEditor` callbacks do): a check made while `apply()` runs, such as `if (ctx.get('sessions') !== undefined)`, answers for that instant — and with no `inject` gating `apply()`, that instant is now earlier than the services it asks about.
-- **`ctx.effect(fn, label?)`** registers a side effect with an automatic disposer, so stopping or updating the plugin cleanly undoes it. This plugin uses it for the `fetch` patch, and for the HTTP route inside its `webServer` injection:
+- **`ctx.effect(fn, label?)`** registers a side effect with an automatic disposer, so stopping or updating the plugin cleanly undoes it. This plugin uses it for the `fetch` patch (whose disposer also *disarms* the wrapper: if something wrapped `fetch` on top of it, it cannot be unlinked from that chain, so it turns into a plain pass-through instead of recording on behalf of a dead instance), for closing the archive (finishing queued writes, releasing the segment's file handles), and for the HTTP route inside its `webServer` injection:
 
   ```ts
   // src/host/index.ts
@@ -136,13 +136,13 @@ Three more things combine to make "every `PluginConfig` parameter is editable fr
 import z from '@deepseek-ai/schemastery'
 
 export interface PluginConfig {
-  maxRecords?: number
+  maxDiskMB?: number
   // ...
 }
 
 export const Config: z<PluginConfig> = z.object({
-  maxRecords: z.number().step(1).min(1).default(200)
-    .description('In-memory ring-buffer size: how many recent records stay resident regardless of persistence.'),
+  maxDiskMB: z.number().step(1).min(16).default(1024)
+    .description('Disk budget in megabytes. Beyond it the oldest records are deleted.'),
   // ...
 })
 ```

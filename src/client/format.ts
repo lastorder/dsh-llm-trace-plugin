@@ -123,3 +123,28 @@ export function stringify(value: unknown): string {
     return 'unable to render JSON: ' + String((error && error.message) || error)
   }
 }
+
+/** A byte count in the largest unit that keeps it readable: `512 KB`, `230 MB`, `1.5 GB`. */
+export function fmtBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '-'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  // One decimal only where it carries information (1.5 GB), never for bytes.
+  const text = unit === 0 || value >= 100 || Number.isInteger(value) ? String(Math.round(value)) : value.toFixed(1)
+  return text + ' ' + units[unit]
+}
+
+/** A local date and time to the minute, `MM-DD HH:mm`, or `YYYY-MM-DD HH:mm` outside the current year. */
+export function fmtDateTime(ms: number | null | undefined, now: number = Date.now()): string {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '-'
+  const d = new Date(ms)
+  const p = (n: number) => (n < 10 ? '0' + n : String(n))
+  const day = p(d.getMonth() + 1) + '-' + p(d.getDate())
+  const year = d.getFullYear() === new Date(now).getFullYear() ? '' : d.getFullYear() + '-'
+  return year + day + ' ' + p(d.getHours()) + ':' + p(d.getMinutes())
+}

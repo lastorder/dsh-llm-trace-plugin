@@ -52,7 +52,7 @@ test('the two SSE toggle labels are distinct in both locales', () => {
 test('every manage.field.* config field declares both a label and a hint, in both locales', () => {
   // Mirrors `CONFIG_FIELDS` in `src/host/config.ts`; the management panel
   // renders one row per field and reads exactly these keys.
-  const fields = ['maxRecords', 'maxBodyChars', 'persist', 'traceDir', 'maxPersistedRecords', 'historyPageLimit', 'prettyBodyLimit']
+  const fields = ['persist', 'maxDiskMB', 'traceDir']
   for (const dict of [zh, en]) {
     for (const field of fields) {
       assert.ok(typeof dict[`manage.field.${field}.label`] === 'string', `missing manage.field.${field}.label`)
@@ -61,12 +61,21 @@ test('every manage.field.* config field declares both a label and a hint, in bot
   }
 })
 
-test('manage.statsLine/statsLineNoPersist carry their placeholders in both locales', () => {
+test('the storage summary strings carry their placeholders in both locales', () => {
   for (const dict of [zh, en]) {
-    assert.ok(dict['manage.statsLine'].includes('{memory}'))
-    assert.ok(dict['manage.statsLine'].includes('{retained}'))
-    assert.ok(dict['manage.statsLine'].includes('{maxRecords}'))
-    assert.ok(dict['manage.statsLineNoPersist'].includes('{memory}'))
+    assert.ok(dict['manage.storageLine'].includes('{retained}'))
+    assert.ok(dict['manage.storageLine'].includes('{oldest}'))
+    assert.ok(dict['manage.storageUsage'].includes('{used}') && dict['manage.storageUsage'].includes('{budget}'))
+    assert.ok(dict['manage.memoryOnlyLine'].includes('{memory}'))
+    assert.ok(dict['manage.legacyPending'].includes('{count}'))
+  }
+})
+
+test('no manage.field.* key survives for an option that no longer exists', () => {
+  for (const dict of [zh, en]) {
+    for (const legacy of ['maxRecords', 'maxBodyChars', 'maxPersistedRecords', 'historyPageLimit', 'prettyBodyLimit']) {
+      assert.ok(!Object.keys(dict).some((key) => key.startsWith(`manage.field.${legacy}.`)), `stale manage.field.${legacy}`)
+    }
   }
 })
 
@@ -114,13 +123,14 @@ test('badge title templates carry their coordinates in both locales', () => {
   }
 })
 
-test('notice.truncatedBody reports both lengths and names the knob, in both locales', () => {
+test('notice.truncatedBody reports both lengths and the fixed capture cap, in both locales', () => {
   for (const dict of [zh, en]) {
     const notice = dict['notice.truncatedBody']
     assert.ok(notice.includes('{totalChars}'))
     assert.ok(notice.includes('{keptChars}'))
-    // It must also name the knob, or the reader has no action to take.
-    assert.ok(notice.includes('maxBodyChars'))
+    // The cap is no longer configurable, so name it instead of a knob.
+    assert.ok(!notice.includes('maxBodyChars'))
+    assert.ok(/8,000,000|800 万/.test(notice))
   }
 })
 

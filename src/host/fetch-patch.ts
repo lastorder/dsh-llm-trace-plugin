@@ -43,7 +43,7 @@
 import { USER_AGENT_PREFIX, SESSION_HEADER } from './constants.js'
 import { clip, deferBodyCapture, describeRequest, describeUnmirroredBody, outgoingUserAgent, redactedHeaders, tryParseJson } from './http-utils.js'
 import { callContext } from './call-context.js'
-import { buildRecordName } from './persistence/naming.js'
+import { buildRecordId } from './persistence/naming.js'
 import type { WireRecord } from '../shared/record-shape.js'
 
 export interface FetchPatchDeps {
@@ -206,7 +206,7 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
       // the storage file name. A per-process counter (`w1`, `w2`, ...) would
       // make two harness processes collide on the same file and silently
       // overwrite each other's records.
-      id: buildRecordName(startedAt).slice(0, -'.json'.length),
+      id: buildRecordId(startedAt),
       startedAt,
       endedAt: null,
       durationMs: null,
@@ -238,14 +238,14 @@ export function wrapFetch(real: typeof fetch, deps: FetchPatchDeps): typeof fetc
         // Left null ON PURPOSE, and hydrated on read by `store.get()`.
         //
         // A parsed body is several times the size of its source text, and the
-        // ring holds up to `maxRecords` of them — so storing it here meant the
+        // ring holds up to `MEMORY_RING_SIZE` of them — so storing it here meant the
         // process could sit on gigabytes that nothing on the list path ever
         // reads (`summarizeRecord` touches no body field) and that the
         // persistence codec re-derives from `bodyText` anyway.
         //
         // `bodyText` is the single source of truth; see the note on
         // `WireRecord.bodyJson`. The archive path already worked exactly this
-        // way (`fromPersisted`), so live and restored records stay identical
+        // way (`withParsedBodies`), so live and restored records stay identical
         // to every consumer.
         bodyJson: null,
       },
@@ -339,6 +339,15 @@ const PATCH_MARK = Symbol.for('dsh-llm-trace-plugin/patched')
  * the exact previous `fetch` reference. Idempotent: a second install while one
  * is already active throws loudly instead of silently double-wrapping.
  *
+ * The disposer also DISARMS the wrapper, which then forwards every call
+ * straight to the previous `fetch` without recording anything. Restoring the
+ * slot alone is not enough: when something else wrapped `fetch` on top of
+ * ours after we installed, ours is buried inside that chain and cannot be
+ * unlinked — and a provider SDK may hold our wrapper from an import-time
+ * snapshot. Without disarming, a plugin reloaded in place (an update, or a
+ * config change) left the old instance recording every call a second time,
+ * as unattributed duplicates written by code that was supposed to be gone.
+ *
  * @param buildWrapped - given the real `fetch`, returns the wrapped replacement.
  */
 export function installFetchPatch(buildWrapped: (real: typeof fetch) => typeof fetch): () => void {
@@ -347,10 +356,15 @@ export function installFetchPatch(buildWrapped: (real: typeof fetch) => typeof f
     throw new Error('llm-wire-trace: fetch is already patched by another instance of this plugin')
   }
   const original = globalThis.fetch
-  const patched = buildWrapped(original)
+  const wrapped = buildWrapped(original)
+  let armed = true
+  const patched = (function fetch(this: unknown, ...args: Parameters<typeof globalThis.fetch>) {
+    return armed ? wrapped.apply(this, args) : original.apply(this, args)
+  }) as typeof fetch
   globalThis.fetch = patched
   marked[PATCH_MARK] = true
   return () => {
+    armed = false
     if (globalThis.fetch === patched) globalThis.fetch = original
     delete marked[PATCH_MARK]
   }

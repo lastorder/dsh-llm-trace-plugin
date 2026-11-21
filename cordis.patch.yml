@@ -6,10 +6,9 @@
     - id: llm-wire-trace
       name: dsh-llm-trace-plugin
       # config:
-      #   maxRecords: 200        # in-memory ring-buffer size
-      #   maxBodyChars: 8000000  # per-field character cap before truncation
-      #   persist: true          # false = pure in-memory ring, nothing on disk
-      #   maxPersistedRecords: 300
+      #   persist: true      # false = keep the latest records in memory only, nothing on disk
+      #   maxDiskMB: 1024    # disk budget; the oldest records are deleted beyond it
+      #   traceDir: ...      # default $DSH_HOME/llm-wire-trace/records
       #
       # The route path (/llm-wire-trace) is NOT configurable: it is part of the
       # host/client contract, and only the host ever read the old `routePrefix`

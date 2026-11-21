@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  fmtBytes,
+  fmtDateTime,
   fmtDuration,
   fmtTime,
   purposeLabel,
@@ -156,4 +158,29 @@ test('stringify: never throws, even for a value JSON.stringify cannot serialize 
   circular.self = circular
   const result = stringify(circular)
   assert.match(result, /unable to render JSON/)
+})
+
+test('fmtBytes: picks the readable unit and keeps one decimal only where it matters', () => {
+  assert.equal(fmtBytes(0), '0 B')
+  assert.equal(fmtBytes(512), '512 B')
+  assert.equal(fmtBytes(1024), '1 KB')
+  assert.equal(fmtBytes(1536), '1.5 KB')
+  assert.equal(fmtBytes(230 * 1024 * 1024), '230 MB')
+  assert.equal(fmtBytes(1024 * 1024 * 1024), '1 GB')
+  assert.equal(fmtBytes(1.5 * 1024 * 1024 * 1024), '1.5 GB')
+  assert.equal(fmtBytes(150.4 * 1024 * 1024), '150 MB')
+})
+
+test('fmtBytes: a missing or invalid count renders as a dash', () => {
+  assert.equal(fmtBytes(null), '-')
+  assert.equal(fmtBytes(undefined), '-')
+  assert.equal(fmtBytes(-1), '-')
+  assert.equal(fmtBytes(Number.NaN), '-')
+})
+
+test('fmtDateTime: month-day and minutes, with the year only when it differs from now', () => {
+  const at = new Date(2026, 10, 15, 9, 5).getTime()
+  assert.equal(fmtDateTime(at, new Date(2026, 11, 1).getTime()), '11-15 09:05')
+  assert.equal(fmtDateTime(at, new Date(2027, 0, 1).getTime()), '2026-11-15 09:05')
+  assert.equal(fmtDateTime(null), '-')
 })

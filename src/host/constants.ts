@@ -104,7 +104,16 @@ export const REDACTED_QUERY_PARAMS = new Set([
  */
 export const SESSION_HEADER = 'x-deepseek-harness-session-id'
 
-export const DEFAULT_MAX_RECORDS = 200
+/**
+ * Records held in memory at most.
+ *
+ * With persistence on, a record leaves memory as soon as it is safely on
+ * disk, so this ring only ever holds calls still in flight, housekeeping
+ * requests that are never persisted, and anything whose write failed. With
+ * persistence off it is the whole history. Each record can carry a
+ * multi-megabyte body, so this bounds the plugin's memory, not the history.
+ */
+export const MEMORY_RING_SIZE = 100
 
 /**
  * Per-field body cap.
@@ -122,6 +131,3 @@ export const DEFAULT_MAX_BODY_CHARS = 8_000_000
 
 /** Page size ceiling for a list request, so one call cannot ask for the world. */
 export const LIST_PAGE_CEILING = 300
-
-/** How long a cached archive page read stays valid; see store.ts `listArchive`. */
-export const ARCHIVE_CACHE_TTL_MS = 1000

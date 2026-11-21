@@ -35,7 +35,7 @@
     - id: llm-wire-trace
       name: dsh-llm-trace-plugin
       # config:
-      #   maxRecords: 200
+      #   maxDiskMB: 1024
 ```
 
 这里的 `name` 是**包名**——由 Node 的模块解析找到已安装的代码——而不是文件路径。用户用 `dsh plugin --profile <name> add dsh-llm-trace-plugin` 安装它（本地开发用 `link:.`，或者一个 git spec 也行）；每种支持的安装方式见 README 的 [安装](../README.zh.md#安装) 一节。
@@ -74,7 +74,7 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   注意每一部分用的是哪个 context：路由处理器依然从**外层** `ctx` 读取 `credentials`、`configEditor` 和 `fiber.entry`，因为写配置时必须让 `ctx.fiber` 指向*本插件自己*的 Loader entry——被注入出来的那个子 fiber 没有自己的 entry。
 
 - **`ctx.get(name)`** 是获取服务的另一种方式，适合那些"缺失时应当优雅降级、而不是阻塞加载"的可选服务。它只在使用时读取才有意义（本插件的 `getCredentials`/`getConfigEditor` 回调就是这么做的）：在 `apply()` 执行期间做一次 `if (ctx.get('sessions') !== undefined)` 这样的判断，回答的只是那一瞬间的状态——而在不再用 `inject` 闸住 `apply()` 之后，这一瞬间比它所询问的那些服务更早。
-- **`ctx.effect(fn, label?)`** 注册一个带自动销毁器的副作用，插件停止或更新时会被干净地撤销。本插件用它管理 `fetch` 补丁，以及在 `webServer` 注入里注册的 HTTP 路由：
+- **`ctx.effect(fn, label?)`** 注册一个带自动销毁器的副作用，插件停止或更新时会被干净地撤销。本插件用它管理 `fetch` 补丁（它的销毁器还会*解除*包装函数：如果有别人在它之上又包了一层 `fetch`，它无法从那条链里摘掉，于是改为单纯透传，不再替一个已经销毁的实例记录）、关闭 archive（写完排队中的记录、释放段文件句柄），以及在 `webServer` 注入里注册的 HTTP 路由：
 
   ```ts
   // src/host/index.ts
@@ -136,13 +136,13 @@ function apply(ctx) {
 import z from '@deepseek-ai/schemastery'
 
 export interface PluginConfig {
-  maxRecords?: number
+  maxDiskMB?: number
   // ...
 }
 
 export const Config: z<PluginConfig> = z.object({
-  maxRecords: z.number().step(1).min(1).default(200)
-    .description('内存环形缓冲区大小：无论是否持久化，内存中保留的最近记录条数。'),
+  maxDiskMB: z.number().step(1).min(16).default(1024)
+    .description('磁盘空间上限（MB），超出后删除最旧的记录。'),
   // ...
 })
 ```

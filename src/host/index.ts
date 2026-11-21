@@ -48,7 +48,7 @@ import { Config, resolveEffectiveConfig, type PluginConfig } from './config.js'
 
 export { createStepTracker } from './step-tracker.js'
 export { createWireTraceStore } from './store.js'
-export { buildRecordName, createRecordArchive } from './persistence/index.js'
+export { buildRecordId, createRecordArchive } from './persistence/index.js'
 export { Config, resolveEffectiveConfig, type PluginConfig, type ResolvedPluginConfig } from './config.js'
 
 /**
@@ -106,26 +106,23 @@ export const name = 'llm-trace-plugin'
  * reached through `ctx.inject([...])` where it is actually needed.
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
-  const settings = config ?? {}
+  const settings = resolveEffectiveConfig(config)
 
   // Durable half. On by default — surviving a restart is the entire point —
-  // but fully switchable off with `persist: false`, which returns the plugin
-  // to a pure in-memory ring that writes nothing to disk.
+  // but fully switchable off with `persist: false`, which keeps the most
+  // recent records in memory only and writes nothing to disk.
   //
-  // NOTE: request and response bodies are stored VERBATIM, so prompts, code,
-  // and any file contents in context land in plaintext files under this
-  // directory. That is inherent to persisting full bodies; `persist: false`
-  // or a shorter `maxPersistedRecords` are the levers.
+  // NOTE: request and response bodies are stored in full (compressed, not
+  // encrypted), so prompts, code, and any file contents in context end up
+  // under this directory. That is inherent to persisting full bodies;
+  // `persist: false` or a smaller `maxDiskMB` are the levers.
   const archive = settings.persist === false ? null : createRecordArchive({
     dir: settings.traceDir,
-    maxRecords: settings.maxPersistedRecords,
-    pageLimit: settings.historyPageLimit,
-    prettyBodyLimit: settings.prettyBodyLimit,
+    maxDiskBytes: settings.maxDiskMB * 1024 * 1024,
     onError: (error) => console.warn('llm-wire-trace: persistence error:', error.message),
   })
 
   const store = createWireTraceStore({
-    ...settings,
     archive,
     // A model call that reaches NO captured request is the one failure this
     // plugin cannot see from the fetch side: the request never entered the
@@ -148,21 +145,13 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   // `name` above.
   ctx.effect(() => installFetchPatch((real) => store.wrapFetch(real)), 'llm-wire-trace: fetch patch')
 
-  // Deliberately NOT loading disk records into the in-memory ring. The list
-  // already merges memory and disk, so preloading would only duplicate what
-  // the merge provides — and it was what made an earlier "live vs history"
-  // toggle show identical content in both modes.
+  // Load the archive's index in the background now, so the first list is
+  // instant; it also enforces the disk budget and imports record files left
+  // by versions before 0.6.0. Closing on dispose finishes pending writes and
+  // releases the segment's file handles before a reload opens a new one.
   if (archive !== null) {
-    void archive.sweepTemp().catch(() => {})
-    // Retention is amortized while running — `save()` sweeps only every
-    // SWEEP_INTERVAL writes, because a readdir per record would dominate the
-    // cost of writing one — and that counter starts at zero on every boot. So
-    // a session that writes fewer than SWEEP_INTERVAL records would never trim
-    // at all, and a trace directory that had drifted past `maxPersistedRecords`
-    // (a live one held 380 files against a cap of 300, the oldest two days old)
-    // would stay past it indefinitely. Enforce the cap once here, where the
-    // cost is one readdir against a process that is still starting up.
-    void archive.sweep().catch(() => {})
+    void archive.open()
+    ctx.effect(() => () => { void archive.close() }, 'llm-wire-trace: archive')
   }
 
   // ------------------------------------------------------------------
